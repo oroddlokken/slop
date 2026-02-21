@@ -166,9 +166,14 @@ render_changes() {
 render_usage() {
   [ "$CLAUDE_STATUSLINE_USAGE" = "0" ] && return
 
-  local script_dir usage_json
+  local script_dir usage_json py
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  usage_json=$("$script_dir/get_usage.py" 2>/dev/null)
+  # get_usage.py needs Python 3.10+; find one explicitly to avoid macOS system 3.9
+  py=python3
+  for p in python3.14 python3.13 python3.12 python3.11 python3.10; do
+    command -v "$p" >/dev/null 2>&1 && py="$p" && break
+  done
+  usage_json=$("$py" "$script_dir/get_usage.py" 2>/dev/null)
   [ -z "$usage_json" ] && return
 
   local s_pct w_pct s_reset parts=""
