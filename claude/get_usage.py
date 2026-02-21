@@ -172,18 +172,24 @@ def parse_usage_output(text: str) -> dict[str, Any]:
     """
     data: dict[str, Any] = {}
 
-    # PTY mangles text: "Current" -> "rrent", "Resets" -> "Rese s"
-    # (terminal escape sequences eat letters like t, C, etc.)
+    # PTY mangles text: "Current" -> "rrent", "Resets" -> "Rese s",
+    # "2am" -> "2 m" (terminal escape sequences eat letters like t, C, a)
+    # Bound each section so regexes can't leak across sections.
+    _week_start = re.search(r"week", text, re.IGNORECASE)
+    _session_text = text[: _week_start.start()] if _week_start else text
 
     # --- Current session ---
-    if (m := re.search(r"session.+?(\d+)%\s*used", text, re.DOTALL | re.IGNORECASE)):
+    if (m := re.search(r"session.+?(\d+)%\s*used", _session_text, re.DOTALL | re.IGNORECASE)):
         data["session_percent"] = int(m.group(1))
 
+    # Match mangled am/pm: "am" may become " m", "pm" may become " m"
     if (m := re.search(
-        r"session.*?Rese[\w\s]*?(\d+(?::\d+)?)\s*(am|pm)",
-        text, re.DOTALL | re.IGNORECASE,
+        r"Rese[\w\s]*?(\d+(?::\d+)?)\s*([ap]?\s*m)",
+        _session_text, re.DOTALL | re.IGNORECASE,
     )):
-        hour, minute = _parse_time(m.group(1), m.group(2).lower())
+        ampm_raw = re.sub(r"\s", "", m.group(2)).lower()
+        ampm = "pm" if ampm_raw.startswith("p") else "am"
+        hour, minute = _parse_time(m.group(1), ampm)
         now = datetime.now(tz=timezone.utc).astimezone()
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:

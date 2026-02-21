@@ -3,20 +3,23 @@
 # Receives JSON via stdin, outputs a formatted status line to stdout.
 #
 # Toggle sections via environment variables (1=enabled, 0=disabled):
-#   CLAUDE_STATUSLINE_HOSTNAME  — green hostname
-#   CLAUDE_STATUSLINE_DIR       — blue project directory
-#   CLAUDE_STATUSLINE_GIT       — branch + indicators
-#   CLAUDE_STATUSLINE_DOGCAT    — dcat issue tracker counts
-#   CLAUDE_STATUSLINE_CHANGES   — lines added/removed
-#   CLAUDE_STATUSLINE_SESSION   — model, context window %
-#   CLAUDE_STATUSLINE_USAGE     — Claude usage (session/week % with reset countdowns)
-#   CLAUDE_STATUSLINE_SONNET    — Sonnet usage % with reset countdown
-#   CLAUDE_STATUSLINE_SONNET_THRESHOLD — hide Sonnet section below this % (default 25)
-#   CLAUDE_STATUSLINE_EXTRA     — Extra usage spent/limit
-#   CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — only show Extra when S% >= this (default 60)
-#   CLAUDE_STATUSLINE_COST      — session cost
+#   CLAUDE_STATUSLINE_TIMESTAMP               — HH:MM invocation timestamp
+#   CLAUDE_STATUSLINE_HOSTNAME                — green hostname
+#   CLAUDE_STATUSLINE_DIR                     — blue project directory
+#   CLAUDE_STATUSLINE_GIT                     — branch + indicators
+#   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
+#   CLAUDE_STATUSLINE_CHANGES                 — lines added/removed
+#   CLAUDE_STATUSLINE_SESSION                 — model, context window %
+#   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with reset countdowns)
+#     CLAUDE_STATUSLINE_SONNET                — Sonnet usage % with reset countdown
+#     CLAUDE_STATUSLINE_SONNET_THRESHOLD      — hide Sonnet section below this % (default 25)
+#     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit
+#     CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — only show Extra when S% >= this (default 60)
+#     CLAUDE_STATUSLINE_TTL                   — time until next usage fetch
+#   CLAUDE_STATUSLINE_COST                    — session cost
 
 # --- Config defaults ---
+: "${CLAUDE_STATUSLINE_TIMESTAMP:=1}"
 : "${CLAUDE_STATUSLINE_HOSTNAME:=0}"
 : "${CLAUDE_STATUSLINE_DIR:=1}"
 : "${CLAUDE_STATUSLINE_GIT:=1}"
@@ -28,6 +31,7 @@
 : "${CLAUDE_STATUSLINE_SONNET_THRESHOLD:=25}"
 : "${CLAUDE_STATUSLINE_EXTRA:=1}"
 : "${CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD:=60}"
+: "${CLAUDE_STATUSLINE_TTL:=1}"
 : "${CLAUDE_STATUSLINE_COST:=1}"
 
 # --- Input parsing ---
@@ -67,6 +71,12 @@ parse_json() {
 }
 
 # --- Section renderers ---
+
+# Dim invocation timestamp (e.g. "22:10").
+render_timestamp() {
+  [ "$CLAUDE_STATUSLINE_TIMESTAMP" = "0" ] && return
+  printf '\033[0;90m%s\033[0m' "$(date +%H:%M)"
+}
 
 # Green hostname (e.g. "macbook").
 render_hostname() {
@@ -261,6 +271,34 @@ render_usage() {
     fi
   fi
 
+  # TTL: time until next usage fetch (cache is 600s)
+  if [ "$CLAUDE_STATUSLINE_TTL" != "0" ]; then
+    local last_upd meta_parts=""
+    last_upd=$(echo "$usage_json" | jq -r '.last_updated // empty')
+    if [ -n "$last_upd" ]; then
+      local now_epoch upd_epoch
+      now_epoch=$(date +%s)
+      local last_upd_clean
+      last_upd_clean=$(echo "$last_upd" | sed 's/\.[0-9]*//;s/[+-][0-9][0-9]:[0-9][0-9]$//')
+      upd_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$last_upd_clean" +%s 2>/dev/null) \
+        || upd_epoch=$(date -d "$last_upd" +%s 2>/dev/null)
+      if [ -n "$upd_epoch" ]; then
+        local cache_age ttl_s
+        cache_age=$(( now_epoch - upd_epoch ))
+        ttl_s=$(( 600 - cache_age ))
+        if [ "$ttl_s" -gt 0 ] 2>/dev/null; then
+          local ttl_m ttl_sec
+          ttl_m=$(( ttl_s / 60 ))
+          ttl_sec=$(( ttl_s % 60 ))
+          meta_parts="$(printf '\033[0;36mTTL:\033[0;90m%dm%ds\033[0m' "$ttl_m" "$ttl_sec")"
+        fi
+      fi
+    fi
+    if [ -n "$meta_parts" ]; then
+      parts="${parts:+$parts }$meta_parts"
+    fi
+  fi
+
   printf '\033[0;34m[\033[0m%s\033[0;34m]\033[0m' "$parts"
 }
 
@@ -342,6 +380,9 @@ main() {
   parse_json
 
   local parts="" section
+
+  section=$(render_timestamp)
+  [ -n "$section" ] && parts="$section"
 
   section=$(render_hostname)
   [ -n "$section" ] && parts="$section"
