@@ -4,7 +4,8 @@ Claude Code statusline with:
 
 * Hostname (disabled by default)
 * Current working directory
-* Git branch and status (stanged, unstaged, untracked files, ahead/behind)
+* Git branch and status (staged, unstaged, untracked files, ahead/behind)
+* Lines added/removed
 * Number of dogcat issues in review/progress
 * Current model and context usage
 * Rate limit status
