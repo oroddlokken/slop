@@ -11,13 +11,59 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-CACHE_FILE = Path.home() / ".cache" / "macsetup" / "claude" / "usage.json"
+CACHE_DIR = Path.home() / ".cache" / "macsetup" / "claude"
+CACHE_FILE = CACHE_DIR / "usage.json"
 CACHE_MAX_AGE = 600  # 10 minutes
 HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
+CLAUDE_DIR = Path.home() / ".claude"
+CLAUDE_JSON = Path.home() / ".claude.json"
+# Run /usage sessions from the cache dir (must be trusted in ~/.claude.json)
+USAGE_CWD = CACHE_DIR
+
+
+def ensure_trusted_workspace() -> None:
+    """Ensure USAGE_CWD is marked as trusted in ~/.claude.json.
+
+    Reads the global config, adds a minimal project entry with
+    hasTrustDialogAccepted=true for USAGE_CWD if missing, and writes back.
+    """
+    USAGE_CWD.mkdir(parents=True, exist_ok=True)
+    if not CLAUDE_JSON.exists():
+        return
+
+    try:
+        config = json.loads(CLAUDE_JSON.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    projects = config.get("projects", {})
+    cwd_key = str(USAGE_CWD)
+    entry = projects.get(cwd_key, {})
+    if entry.get("hasTrustDialogAccepted"):
+        return
+
+    entry.setdefault("allowedTools", [])
+    entry.setdefault("mcpContextUris", [])
+    entry.setdefault("mcpServers", {})
+    entry.setdefault("enabledMcpjsonServers", [])
+    entry.setdefault("disabledMcpjsonServers", [])
+    entry["hasTrustDialogAccepted"] = True
+    entry.setdefault("projectOnboardingSeenCount", 1)
+    entry.setdefault("hasClaudeMdExternalIncludesApproved", False)
+    entry.setdefault("hasClaudeMdExternalIncludesWarningShown", False)
+    entry.setdefault("hasCompletedProjectOnboarding", True)
+    projects[cwd_key] = entry
+    config["projects"] = projects
+
+    try:
+        CLAUDE_JSON.write_text(json.dumps(config, indent=2) + "\n")
+    except OSError:
+        pass
 
 
 def find_claude() -> str | None:
@@ -48,6 +94,7 @@ def find_claude() -> str | None:
         return "npx claude"
 
     return None
+
 
 
 def strip_ansi(text: str) -> str:
@@ -215,6 +262,9 @@ def _drain_pty(master: int, timeout: float = 0.2) -> bytes:
 def fetch_usage_via_pty() -> tuple[dict[str, Any], str]:
     """Spawn claude /usage in a PTY and parse the rendered output.
 
+    Uses --session-id with a known UUID so the session can be cleaned up
+    immediately, preventing clutter in the resume picker.
+
     Returns:
         Tuple of (parsed data dict with _meta timing, stripped raw text).
     """
@@ -222,12 +272,16 @@ def fetch_usage_via_pty() -> tuple[dict[str, Any], str]:
     if not claude_cmd:
         return {"error": "Claude not found"}, ""
 
+    ensure_trusted_workspace()
+
     master, slave = pty.openpty()
-    cmd = (
-        [claude_cmd, "/usage"]
-        if " " not in claude_cmd
-        else [*claude_cmd.split(), "/usage"]
+    cmd_parts = (
+        [claude_cmd] if " " not in claude_cmd else claude_cmd.split()
     )
+    session_id = str(uuid.uuid4())
+    cmd_parts += ["--session-id", session_id]
+    cmd_parts.append("/usage")
+    cmd = cmd_parts
 
     t_start = time.monotonic()
     proc = subprocess.Popen(
@@ -235,6 +289,7 @@ def fetch_usage_via_pty() -> tuple[dict[str, Any], str]:
         stdin=slave,
         stdout=slave,
         stderr=slave,
+        cwd=USAGE_CWD,
         preexec_fn=os.setsid,
         env={**os.environ, "TERM": "xterm-256color"},
     )
@@ -295,7 +350,14 @@ def fetch_usage_via_pty() -> tuple[dict[str, Any], str]:
         "fetch_duration_s": total_elapsed,
         "field_timings": seen_fields,
         "completed_early": done,
+        "session_id": session_id,
     }
+
+    # Clean up the throwaway session so it doesn't pollute the resume picker
+    cleaned = clean_session(session_id)
+    if cleaned:
+        data["_cleaned_session"] = cleaned
+
     return data, text
 
 
@@ -351,6 +413,61 @@ def clean_history() -> int:
         os.close(fd)
 
 
+def clean_session(session_id: str) -> list[str]:
+    """Remove all Claude artifacts for a given session ID.
+
+    Cleans up:
+      - debug/{session_id}.txt
+      - session-env/{session_id}/
+      - todos/{session_id}-*.json
+      - file-history/{session_id}/
+      - projects/*/{session_id}.jsonl
+      - projects/*/{session_id}/  (subagents, tool-results)
+
+    Returns:
+        List of paths that were removed.
+    """
+    removed: list[str] = []
+
+    # Simple file/dir patterns under ~/.claude/
+    for pattern, is_dir in [
+        (f"debug/{session_id}.txt", False),
+        (f"session-env/{session_id}", True),
+        (f"file-history/{session_id}", True),
+    ]:
+        p = CLAUDE_DIR / pattern
+        if is_dir and p.is_dir():
+            shutil.rmtree(p)
+            removed.append(str(p))
+        elif not is_dir and p.exists():
+            p.unlink()
+            removed.append(str(p))
+
+    # todos/{session_id}-*.json
+    todos_dir = CLAUDE_DIR / "todos"
+    if todos_dir.is_dir():
+        for f in todos_dir.glob(f"{session_id}-*.json"):
+            f.unlink()
+            removed.append(str(f))
+
+    # projects/*/{session_id}.jsonl and projects/*/{session_id}/
+    projects_dir = CLAUDE_DIR / "projects"
+    if projects_dir.is_dir():
+        for project in projects_dir.iterdir():
+            if not project.is_dir():
+                continue
+            session_file = project / f"{session_id}.jsonl"
+            if session_file.exists():
+                session_file.unlink()
+                removed.append(str(session_file))
+            session_sub = project / session_id
+            if session_sub.is_dir():
+                shutil.rmtree(session_sub)
+                removed.append(str(session_sub))
+
+    return removed
+
+
 def main() -> None:
     """Fetch and print Claude usage data, using cache when fresh."""
     raw_mode = "--raw" in sys.argv
@@ -373,16 +490,21 @@ def main() -> None:
         print(f"Error: {data['error']}", file=sys.stderr)
         sys.exit(1)
 
-    if not data:
+    if not any(k for k in data if not k.startswith("_")):
         print("Could not parse usage data", file=sys.stderr)
         print(f"Raw output:\n{raw}", file=sys.stderr)
         sys.exit(1)
 
     data["last_updated"] = datetime.now(tz=timezone.utc).astimezone().isoformat()
     write_cache(data)
-    removed = clean_history()
-    if removed:
-        data["_history_cleaned"] = removed
+
+    cleaned: dict[str, Any] = {}
+    history_removed = clean_history()
+    if history_removed:
+        cleaned["history_lines"] = history_removed
+    if cleaned:
+        data["_cleaned"] = cleaned
+
     print(json.dumps(data, indent=2))
 
 

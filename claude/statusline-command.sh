@@ -9,9 +9,12 @@
 #   CLAUDE_STATUSLINE_DOGCAT    — dcat issue tracker counts
 #   CLAUDE_STATUSLINE_CHANGES   — lines added/removed
 #   CLAUDE_STATUSLINE_SESSION   — model, context window %
-#   CLAUDE_STATUSLINE_USAGE     — Claude usage (session/week %)
+#   CLAUDE_STATUSLINE_USAGE     — Claude usage (session/week % with reset countdowns)
+#   CLAUDE_STATUSLINE_SONNET    — Sonnet usage % with reset countdown
+#   CLAUDE_STATUSLINE_SONNET_THRESHOLD — hide Sonnet section below this % (default 25)
+#   CLAUDE_STATUSLINE_EXTRA     — Extra usage spent/limit
+#   CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — only show Extra when S% >= this (default 60)
 #   CLAUDE_STATUSLINE_COST      — session cost
-#   CLAUDE_STATUSLINE_WEEKRESET — weekly quota reset countdown
 
 # --- Config defaults ---
 : "${CLAUDE_STATUSLINE_HOSTNAME:=0}"
@@ -21,8 +24,11 @@
 : "${CLAUDE_STATUSLINE_CHANGES:=1}"
 : "${CLAUDE_STATUSLINE_SESSION:=1}"
 : "${CLAUDE_STATUSLINE_USAGE:=1}"
+: "${CLAUDE_STATUSLINE_SONNET:=1}"
+: "${CLAUDE_STATUSLINE_SONNET_THRESHOLD:=25}"
+: "${CLAUDE_STATUSLINE_EXTRA:=1}"
+: "${CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD:=60}"
 : "${CLAUDE_STATUSLINE_COST:=1}"
-: "${CLAUDE_STATUSLINE_WEEKRESET:=1}"
 
 # --- Input parsing ---
 
@@ -164,7 +170,8 @@ render_changes() {
   printf '[\033[0;32m+%s\033[0m \033[0;31m-%s\033[0m]' "${lines_added:-0}" "${lines_removed:-0}"
 }
 
-# Claude usage: session %, session reset countdown, week %.
+# Claude usage: session %, week %, sonnet %, extra spend.
+# Each metric shows label:percent%(countdown) in a compact format.
 render_usage() {
   [ "$CLAUDE_STATUSLINE_USAGE" = "0" ] && return
 
@@ -178,70 +185,79 @@ render_usage() {
   usage_json=$("$py" "$script_dir/get_usage.py" 2>/dev/null)
   [ -z "$usage_json" ] && return
 
-  local s_pct w_pct s_reset parts=""
+  local s_pct w_pct so_pct parts=""
   s_pct=$(echo "$usage_json" | jq -r '.session_percent // empty')
   w_pct=$(echo "$usage_json" | jq -r '.week_percent // empty')
-  s_reset=$(echo "$usage_json" | jq -r '.session_reset // empty')
+  so_pct=$(echo "$usage_json" | jq -r '.sonnet_percent // empty')
 
   [ -z "$s_pct" ] && [ -z "$w_pct" ] && return
 
-  # Session percent
-  if [ -n "$s_pct" ]; then
-    parts="$(printf '\033[0;36mS:\033[0;93m%s%%\033[0m' "$s_pct")"
-  fi
+  # _usage_color: pick ANSI color code based on percent threshold
+  _usage_color() {
+    local pct="$1"
+    if [ "$pct" -ge 85 ] 2>/dev/null; then echo "31"
+    elif [ "$pct" -ge 65 ] 2>/dev/null; then echo "33"
+    else echo "32"; fi
+  }
 
-  # Session reset countdown
-  if [ -n "$s_reset" ]; then
-    local now_epoch reset_epoch diff_s hours mins countdown
+  # _usage_countdown: convert ISO reset time to compact countdown string
+  _usage_countdown() {
+    local reset_iso="$1"
+    [ -z "$reset_iso" ] && return
+    local now_epoch reset_epoch diff_s
     now_epoch=$(date +%s)
-    # macOS date -j for ISO parsing
-    reset_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$s_reset" +%s 2>/dev/null) \
-      || reset_epoch=$(date -d "$s_reset" +%s 2>/dev/null)
-    if [ -n "$reset_epoch" ] && [ "$reset_epoch" -gt "$now_epoch" ]; then
-      diff_s=$(( reset_epoch - now_epoch ))
-      hours=$(( diff_s / 3600 ))
-      mins=$(( (diff_s % 3600) / 60 ))
-      if [ "$hours" -gt 0 ]; then
-        countdown="${hours}h${mins}m"
-      else
-        countdown="${mins}m"
-      fi
-      parts="${parts} $(printf '\033[0;36mR:\033[0;90m%s\033[0m' "$countdown")"
+    reset_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$reset_iso" +%s 2>/dev/null) \
+      || reset_epoch=$(date -d "$reset_iso" +%s 2>/dev/null)
+    [ -z "$reset_epoch" ] || [ "$reset_epoch" -le "$now_epoch" ] && return
+    diff_s=$(( reset_epoch - now_epoch ))
+    if [ "$diff_s" -ge 86400 ]; then
+      printf '%dd%dh' $(( diff_s / 86400 )) $(( (diff_s % 86400) / 3600 ))
+    elif [ "$diff_s" -ge 3600 ]; then
+      printf '%dh%dm' $(( diff_s / 3600 )) $(( (diff_s % 3600) / 60 ))
+    else
+      printf '%dm' $(( diff_s / 60 ))
     fi
+  }
+
+  # _usage_section: render "Label:pct%(countdown)" with colored percent
+  _usage_section() {
+    local label="$1" pct="$2" reset_iso="$3"
+    [ -z "$pct" ] && return
+    local color countdown
+    color=$(_usage_color "$pct")
+    countdown=$(_usage_countdown "$reset_iso")
+    if [ -n "$countdown" ]; then
+      printf '\033[0;36m%s:\033[0;%sm%s%%\033[0;90m(%s)\033[0m' "$label" "$color" "$pct" "$countdown"
+    else
+      printf '\033[0;36m%s:\033[0;%sm%s%%\033[0m' "$label" "$color" "$pct"
+    fi
+  }
+
+  # Session
+  local section
+  section=$(_usage_section "S" "$s_pct" "$(echo "$usage_json" | jq -r '.session_reset // empty')")
+  [ -n "$section" ] && parts="$section"
+
+  # Week
+  section=$(_usage_section "W" "$w_pct" "$(echo "$usage_json" | jq -r '.week_reset // empty')")
+  [ -n "$section" ] && parts="${parts:+$parts }$section"
+
+  # Sonnet (hidden below threshold)
+  if [ "$CLAUDE_STATUSLINE_SONNET" != "0" ] && [ -n "$so_pct" ] && [ "$so_pct" -ge "$CLAUDE_STATUSLINE_SONNET_THRESHOLD" ] 2>/dev/null; then
+    section=$(_usage_section "So" "$so_pct" "$(echo "$usage_json" | jq -r '.sonnet_reset // empty')")
+    [ -n "$section" ] && parts="${parts:+$parts }$section"
   fi
 
-  # Week percent
-  if [ -n "$w_pct" ]; then
-    parts="${parts} $(printf '\033[0;36mW:\033[0;93m%s%%\033[0m' "$w_pct")"
-  fi
-
-  # Week reset countdown
-  if [ "$CLAUDE_STATUSLINE_WEEKRESET" != "0" ]; then
-    local w_reset
-    w_reset=$(echo "$usage_json" | jq -r '.week_reset // empty')
-    if [ -n "$w_reset" ]; then
-      local w_now_epoch w_reset_epoch w_diff_s w_hours w_mins w_countdown
-      w_now_epoch=$(date +%s)
-      w_reset_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$w_reset" +%s 2>/dev/null) \
-        || w_reset_epoch=$(date -d "$w_reset" +%s 2>/dev/null)
-      if [ -n "$w_reset_epoch" ] && [ "$w_reset_epoch" -gt "$w_now_epoch" ]; then
-        w_diff_s=$(( w_reset_epoch - w_now_epoch ))
-        if [ "$w_diff_s" -ge 86400 ]; then
-          local w_days
-          w_days=$(( w_diff_s / 86400 ))
-          w_hours=$(( (w_diff_s % 86400) / 3600 ))
-          w_countdown="${w_days}d${w_hours}h"
-        else
-          w_hours=$(( w_diff_s / 3600 ))
-          w_mins=$(( (w_diff_s % 3600) / 60 ))
-          if [ "$w_hours" -gt 0 ]; then
-            w_countdown="${w_hours}h${w_mins}m"
-          else
-            w_countdown="${w_mins}m"
-          fi
-        fi
-        parts="${parts} $(printf '\033[0;36mWR:\033[0;90m%s\033[0m' "$w_countdown")"
-      fi
+  # Extra usage spent/limit (only when session % >= threshold)
+  if [ "$CLAUDE_STATUSLINE_EXTRA" != "0" ] && [ -n "$s_pct" ] && [ "$s_pct" -ge "$CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD" ] 2>/dev/null; then
+    local e_spent e_limit
+    e_spent=$(echo "$usage_json" | jq -r '.extra_spent // empty')
+    e_limit=$(echo "$usage_json" | jq -r '.extra_limit // empty')
+    if [ -n "$e_spent" ] && [ -n "$e_limit" ]; then
+      local e_spent_fmt e_limit_fmt
+      e_spent_fmt=$(printf '%.2f' "$e_spent" | sed 's/\.00$//;s/\(\..[^0]\)0$/\1/;s/\.0$//')
+      e_limit_fmt=$(printf '%.2f' "$e_limit" | sed 's/\.00$//;s/\(\..[^0]\)0$/\1/;s/\.0$//')
+      parts="${parts:+$parts }$(printf '\033[0;36mE:\033[0;90m$%s/$%s\033[0m' "$e_spent_fmt" "$e_limit_fmt")"
     fi
   fi
 
@@ -298,10 +314,31 @@ render_cost() {
   printf '\033[0;34m[\033[0m\033[0;35m$%s\033[0m\033[0;34m]\033[0m' "$cost_fmt"
 }
 
+# --- Test mode ---
+
+# Generate mock JSON resembling a real Claude Code statusline event.
+# Uses the real cwd so git/dcat/usage sections work normally.
+mock_input() {
+  input=$(cat <<'MOCK'
+{
+  "workspace": { "current_dir": "MOCK_CWD" },
+  "model": { "display_name": "Opus 4.6" },
+  "context_window": { "used_percentage": 42.7, "context_window_size": 200000 },
+  "cost": { "total_cost_usd": 1.37, "total_lines_added": 128, "total_lines_removed": 34 }
+}
+MOCK
+)
+  input="${input//MOCK_CWD/$PWD}"
+}
+
 # --- Main ---
 
 main() {
-  read_input "$@"
+  if [ "$1" = "-t" ]; then
+    mock_input
+  else
+    read_input "$@"
+  fi
   parse_json
 
   local parts="" section
