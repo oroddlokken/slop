@@ -11,6 +11,7 @@
 #   CLAUDE_STATUSLINE_SESSION   — model, context window %
 #   CLAUDE_STATUSLINE_USAGE     — Claude usage (session/week %)
 #   CLAUDE_STATUSLINE_COST      — session cost
+#   CLAUDE_STATUSLINE_WEEKRESET — weekly quota reset countdown
 
 # --- Config defaults ---
 : "${CLAUDE_STATUSLINE_HOSTNAME:=0}"
@@ -21,6 +22,7 @@
 : "${CLAUDE_STATUSLINE_SESSION:=1}"
 : "${CLAUDE_STATUSLINE_USAGE:=1}"
 : "${CLAUDE_STATUSLINE_COST:=1}"
+: "${CLAUDE_STATUSLINE_WEEKRESET:=1}"
 
 # --- Input parsing ---
 
@@ -211,6 +213,36 @@ render_usage() {
   # Week percent
   if [ -n "$w_pct" ]; then
     parts="${parts} $(printf '\033[0;36mW:\033[0;93m%s%%\033[0m' "$w_pct")"
+  fi
+
+  # Week reset countdown
+  if [ "$CLAUDE_STATUSLINE_WEEKRESET" != "0" ]; then
+    local w_reset
+    w_reset=$(echo "$usage_json" | jq -r '.week_reset // empty')
+    if [ -n "$w_reset" ]; then
+      local w_now_epoch w_reset_epoch w_diff_s w_hours w_mins w_countdown
+      w_now_epoch=$(date +%s)
+      w_reset_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$w_reset" +%s 2>/dev/null) \
+        || w_reset_epoch=$(date -d "$w_reset" +%s 2>/dev/null)
+      if [ -n "$w_reset_epoch" ] && [ "$w_reset_epoch" -gt "$w_now_epoch" ]; then
+        w_diff_s=$(( w_reset_epoch - w_now_epoch ))
+        if [ "$w_diff_s" -ge 86400 ]; then
+          local w_days
+          w_days=$(( w_diff_s / 86400 ))
+          w_hours=$(( (w_diff_s % 86400) / 3600 ))
+          w_countdown="${w_days}d${w_hours}h"
+        else
+          w_hours=$(( w_diff_s / 3600 ))
+          w_mins=$(( (w_diff_s % 3600) / 60 ))
+          if [ "$w_hours" -gt 0 ]; then
+            w_countdown="${w_hours}h${w_mins}m"
+          else
+            w_countdown="${w_mins}m"
+          fi
+        fi
+        parts="${parts} $(printf '\033[0;36mWR:\033[0;90m%s\033[0m' "$w_countdown")"
+      fi
+    fi
   fi
 
   printf '\033[0;34m[\033[0m%s\033[0;34m]\033[0m' "$parts"
