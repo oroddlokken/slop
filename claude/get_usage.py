@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fetch Claude Code usage data, cached for 10 minutes."""
 
+import fcntl
 import json
 import os
 import pty
@@ -16,6 +17,7 @@ from typing import Any
 
 CACHE_FILE = Path.home() / ".cache" / "macsetup" / "claude" / "usage.json"
 CACHE_MAX_AGE = 600  # 10 minutes
+HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
 
 
 def find_claude() -> str | None:
@@ -315,6 +317,40 @@ def write_cache(data: dict[str, Any]) -> None:
         json.dump(data, f, indent=2)
 
 
+def clean_history() -> int:
+    """Remove /usage lines from Claude's history.jsonl.
+
+    Opens the file with an exclusive lock, filters in memory, then
+    truncates and rewrites.  The lock serialises concurrent get_usage.py
+    runs; the window where an unlocked Claude append could be lost is
+    reduced to the truncate+write (microseconds).
+
+    Returns:
+        Number of lines removed.
+    """
+    if not HISTORY_FILE.exists():
+        return 0
+
+    fd = os.open(str(HISTORY_FILE), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with os.fdopen(os.dup(fd), "r") as f:
+            lines = f.readlines()
+
+        kept = [l for l in lines if '"display":"/usage"' not in l]
+        removed = len(lines) - len(kept)
+
+        if removed:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, "".join(kept).encode())
+
+        return removed
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def main() -> None:
     """Fetch and print Claude usage data, using cache when fresh."""
     raw_mode = "--raw" in sys.argv
@@ -344,6 +380,9 @@ def main() -> None:
 
     data["last_updated"] = datetime.now(tz=timezone.utc).astimezone().isoformat()
     write_cache(data)
+    removed = clean_history()
+    if removed:
+        data["_history_cleaned"] = removed
     print(json.dumps(data, indent=2))
 
 
