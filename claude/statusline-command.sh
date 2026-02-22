@@ -51,7 +51,10 @@ parse_json() {
     cost=\(.cost.total_cost_usd // "")
     ctx_size=\(.context_window.context_window_size // "")
     lines_added=\(.cost.total_lines_added // "")
-    lines_removed=\(.cost.total_lines_removed // "")"
+    lines_removed=\(.cost.total_lines_removed // "")
+    cache_create=\(.context_window.current_usage.cache_creation_input_tokens // "")
+    cache_read=\(.context_window.current_usage.cache_read_input_tokens // "")
+    input_fresh=\(.context_window.current_usage.input_tokens // "")"
   ')"
   host=$(hostname -s)
   # Show repo-name/subdir when inside a git repo, otherwise just the basename.
@@ -76,9 +79,14 @@ parse_json() {
 # --- Section renderers ---
 
 # Dim invocation timestamp (e.g. "22:10").
+# Honour CLAUDE_STATUSLINE_TIMESTAMP_EPOCH to override wall clock (for replay).
 render_timestamp() {
   [ "$CLAUDE_STATUSLINE_TIMESTAMP" = "0" ] && return
-  printf '\033[0;90m%s\033[0m' "$(date +%H:%M)"
+  local ts
+  if [ -n "${CLAUDE_STATUSLINE_TIMESTAMP_EPOCH:-}" ]; then
+    ts=$(date -r "$CLAUDE_STATUSLINE_TIMESTAMP_EPOCH" +%H:%M 2>/dev/null) || ts=$(date -d "@$CLAUDE_STATUSLINE_TIMESTAMP_EPOCH" +%H:%M 2>/dev/null)
+  fi
+  printf '\033[0;90m%s\033[0m' "${ts:-$(date +%H:%M)}"
 }
 
 # Green hostname (e.g. "macbook").
@@ -348,6 +356,19 @@ render_session() {
     session_parts="${session_parts}, ${ctx}"
   fi
 
+  # Cache hit rate: cache_read / (input_fresh + cache_create + cache_read)
+  if [ -n "$cache_read" ] || [ -n "$cache_create" ]; then
+    local total_in ch_pct ch_color
+    total_in=$(( ${input_fresh:-0} + ${cache_create:-0} + ${cache_read:-0} ))
+    if [ "$total_in" -gt 0 ] 2>/dev/null; then
+      ch_pct=$(( ${cache_read:-0} * 100 / total_in ))
+      if [ "$ch_pct" -ge 90 ] 2>/dev/null; then ch_color="32"      # green
+      elif [ "$ch_pct" -ge 50 ] 2>/dev/null; then ch_color="33"    # yellow
+      else ch_color="31"; fi                                         # red
+      session_parts="${session_parts} $(printf '\033[0;90mCH:\033[0;%sm%s%%\033[0m' "$ch_color" "$ch_pct")"
+    fi
+  fi
+
   printf '\033[0;34m[\033[0m%s\033[0;34m]\033[0m' "$session_parts"
 }
 
@@ -369,7 +390,7 @@ mock_input() {
 {
   "workspace": { "current_dir": "MOCK_CWD" },
   "model": { "display_name": "Opus 4.6" },
-  "context_window": { "used_percentage": 42.7, "context_window_size": 200000 },
+  "context_window": { "used_percentage": 42.7, "context_window_size": 200000, "current_usage": { "input_tokens": 3, "cache_creation_input_tokens": 658, "cache_read_input_tokens": 60106 } },
   "cost": { "total_cost_usd": 1.37, "total_lines_added": 128, "total_lines_removed": 34 }
 }
 MOCK
