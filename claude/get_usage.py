@@ -7,17 +7,20 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 CACHE_DIR = Path.home() / ".cache" / "macsetup" / "claude"
 CACHE_FILE = CACHE_DIR / "usage.json"
+SAMPLES_FILE = CACHE_DIR / "usage-samples.jsonl"
+SAMPLES_MAX_LINES = 50
 CACHE_MAX_AGE = 600  # 10 minutes
 HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
 CLAUDE_DIR = Path.home() / ".claude"
@@ -193,7 +196,7 @@ def parse_usage_output(text: str) -> dict[str, Any]:
         now = datetime.now(tz=timezone.utc).astimezone()
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
-            target = target.replace(day=target.day + 1)
+            target += timedelta(days=1)
         data["session_reset"] = target.isoformat()
 
     # --- Current week (all models) ---
@@ -281,9 +284,7 @@ def fetch_usage_via_pty() -> tuple[dict[str, Any], str]:
     ensure_trusted_workspace()
 
     master, slave = pty.openpty()
-    cmd_parts = (
-        [claude_cmd] if " " not in claude_cmd else claude_cmd.split()
-    )
+    cmd_parts = shlex.split(claude_cmd)
     session_id = str(uuid.uuid4())
     cmd_parts += ["--session-id", session_id]
     cmd_parts.append("/usage")
@@ -474,14 +475,43 @@ def clean_session(session_id: str) -> list[str]:
     return removed
 
 
+def append_sample(data: dict[str, Any], correlation_id: str | None = None) -> None:
+    """Append usage data as a single JSON line to the samples file."""
+    SAMPLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    record = {**data}
+    if correlation_id:
+        record["correlation_id"] = correlation_id
+    with open(SAMPLES_FILE, "a") as f:
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def trim_samples(max_lines: int = SAMPLES_MAX_LINES) -> None:
+    """Trim the samples file to the last max_lines entries."""
+    try:
+        lines = SAMPLES_FILE.read_text().splitlines(keepends=True)
+        if len(lines) > max_lines:
+            SAMPLES_FILE.write_text("".join(lines[-max_lines:]))
+    except OSError:
+        pass
+
+
 def main() -> None:
     """Fetch and print Claude usage data, using cache when fresh."""
     raw_mode = "--raw" in sys.argv
     force = "--force" in sys.argv
+    append = "--append" in sys.argv
+    trim = "--trim" in sys.argv
+    correlation_id: str | None = None
+    if "--correlation-id" in sys.argv:
+        idx = sys.argv.index("--correlation-id")
+        if idx + 1 < len(sys.argv):
+            correlation_id = sys.argv[idx + 1]
 
     if not force:
         cached = read_cache()
         if cached:
+            if append:
+                append_sample(cached, correlation_id)
             print(json.dumps(cached, indent=2))
             return
 
@@ -503,6 +533,11 @@ def main() -> None:
 
     data["last_updated"] = datetime.now(tz=timezone.utc).astimezone().isoformat()
     write_cache(data)
+
+    if append:
+        append_sample(data, correlation_id)
+    if trim:
+        trim_samples()
 
     cleaned: dict[str, Any] = {}
     history_removed = clean_history()

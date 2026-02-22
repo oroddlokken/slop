@@ -16,6 +16,7 @@
 #     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit
 #     CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — only show Extra when S% >= this (default 60)
 #     CLAUDE_STATUSLINE_TTL                   — time until next usage fetch
+#   CLAUDE_STATUSLINE_USAGE_JSON              — pre-provided usage JSON (skips get_usage.py)
 #   CLAUDE_STATUSLINE_COST                    — session cost
 
 # --- Config defaults ---
@@ -43,13 +44,15 @@ read_input() {
 
 # Extract fields from JSON into global variables.
 parse_json() {
-  cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // empty')
-  model=$(echo "$input" | jq -r '.model.display_name // empty')
-  used=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-  cost=$(echo "$input" | jq -r '.cost.total_cost_usd // empty')
-  ctx_size=$(echo "$input" | jq -r '.context_window.context_window_size // empty')
-  lines_added=$(echo "$input" | jq -r '.cost.total_lines_added // empty')
-  lines_removed=$(echo "$input" | jq -r '.cost.total_lines_removed // empty')
+  eval "$(echo "$input" | jq -r '
+    @sh "cwd=\(.workspace.current_dir // .cwd // "")
+    model=\(.model.display_name // "")
+    used=\(.context_window.used_percentage // "")
+    cost=\(.cost.total_cost_usd // "")
+    ctx_size=\(.context_window.context_window_size // "")
+    lines_added=\(.cost.total_lines_added // "")
+    lines_removed=\(.cost.total_lines_removed // "")"
+  ')"
   host=$(hostname -s)
   # Show repo-name/subdir when inside a git repo, otherwise just the basename.
   local repo_root
@@ -121,7 +124,7 @@ render_git() {
   fi
 
   # $ stashed
-  [ -n "$stash_list" ] && indicators="${indicators}$(printf '\033[0;35m$\033[0m')"
+  [ -n "$stash_list" ] && indicators="${indicators}$(printf '\033[0;35m\$\033[0m')"
   # + staged (first char is M, A, R, C, D but not U or ?)
   echo "$files" | grep -q '^[MARCD]' && indicators="${indicators}$(printf '\033[0;32m+\033[0m')"
   # » renamed
@@ -185,14 +188,19 @@ render_changes() {
 render_usage() {
   [ "$CLAUDE_STATUSLINE_USAGE" = "0" ] && return
 
-  local script_dir usage_json py
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  # get_usage.py needs Python 3.10+; find one explicitly to avoid macOS system 3.9
-  py=python3
-  for p in python3.14 python3.13 python3.12 python3.11 python3.10; do
-    command -v "$p" >/dev/null 2>&1 && py="$p" && break
-  done
-  usage_json=$("$py" "$script_dir/get_usage.py" 2>/dev/null)
+  local usage_json
+  if [ -n "$CLAUDE_STATUSLINE_USAGE_JSON" ]; then
+    usage_json="$CLAUDE_STATUSLINE_USAGE_JSON"
+  else
+    local script_dir py
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # get_usage.py needs Python 3.10+; find one explicitly to avoid macOS system 3.9
+    py=python3
+    for p in python3.14 python3.13 python3.12 python3.11 python3.10; do
+      command -v "$p" >/dev/null 2>&1 && py="$p" && break
+    done
+    usage_json=$("$py" "$script_dir/get_usage.py" 2>/dev/null)
+  fi
   [ -z "$usage_json" ] && return
 
   local s_pct w_pct so_pct parts=""
@@ -400,7 +408,7 @@ main() {
   [ -n "$section" ] && parts="${parts:+$parts }$section"
 
   section=$(render_session)
-  parts="${parts:+$parts }$section"
+  [ -n "$section" ] && parts="${parts:+$parts }$section"
 
   section=$(render_usage)
   [ -n "$section" ] && parts="${parts:+$parts }$section"
