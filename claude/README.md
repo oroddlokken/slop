@@ -15,7 +15,7 @@
 * Sonnet-specific usage % with reset countdown (hidden below 25% by default)
 * Extra usage spend/limit (hidden when session usage < 60% by default)
 * TTL countdown until next usage data refresh
-* Active parallel sessions count (distinct sessions from last 15 min)
+* Active parallel projects count (distinct project folders from last 15 min)
 
 ![Claude Code statusline](claude.png)
 

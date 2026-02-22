@@ -322,15 +322,15 @@ render_usage() {
     fi
   fi
 
-  # Active sessions: distinct sessions from history in last 15 min (excluding self)
+  # Active projects: distinct project folders from history in last 15 min (excluding current)
   if [ "$CLAUDE_STATUSLINE_SESSIONS" != "0" ]; then
     local history_file="$HOME/.claude/history.jsonl"
     if [ -f "$history_file" ]; then
       local cutoff_ms sess_count
       cutoff_ms=$(( $(date +%s) * 1000 - 900000 ))
-      sess_count=$(tail -n 100 "$history_file" | jq -r --argjson cutoff "$cutoff_ms" --arg self "$cur_session_id" \
-        'select(.timestamp >= $cutoff) | .sessionId' 2>/dev/null \
-        | sort -u | grep -cv "^${cur_session_id}$" 2>/dev/null)
+      sess_count=$(tail -n 100 "$history_file" | jq -r --argjson cutoff "$cutoff_ms" --arg self "$cwd" \
+        'select(.timestamp >= $cutoff) | .project // empty' 2>/dev/null \
+        | sort -u | grep -cv "^${cwd}$" 2>/dev/null)
       if [ -n "$sess_count" ] && [ "$sess_count" -gt 0 ] 2>/dev/null; then
         local sess_color
         if [ "$sess_count" -ge 4 ] 2>/dev/null; then sess_color="31"
