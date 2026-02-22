@@ -187,25 +187,30 @@ def find_pricing(model: str, ts: datetime | None = None) -> dict[str, float] | N
     return None
 
 
+def _tiered_cost(count: int, base_rate: float, tiered_rate: float | None) -> float:
+    """Calculate cost for a single token type with per-type 200K tiering."""
+    if count > TIER_THRESHOLD and tiered_rate is not None:
+        below = min(count, TIER_THRESHOLD)
+        above = count - below
+        return below * base_rate + above * tiered_rate
+    return count * base_rate
+
+
 def calc_cost(tokens: TokenCounts, model: str, ts: datetime | None = None) -> float:
-    """Calculate cost for token counts using model-specific pricing."""
+    """Calculate cost for token counts using model-specific pricing.
+
+    The 200K tier is applied per token type independently: each type's count
+    is checked against the threshold separately.
+    """
     prices = find_pricing(model, ts)
     if not prices:
         return 0.0
 
-    def tiered(count: int, base_key: str) -> float:
-        base = prices.get(base_key, 0.0)
-        tiered_key = f"{base_key}_200k"
-        tiered_rate = prices.get(tiered_key)
-        if tiered_rate and count > TIER_THRESHOLD:
-            return (TIER_THRESHOLD * base) + ((count - TIER_THRESHOLD) * tiered_rate)
-        return count * base
-
     return (
-        tiered(tokens.input, "input")
-        + tiered(tokens.output, "output")
-        + tiered(tokens.cache_create, "cache_create")
-        + tiered(tokens.cache_read, "cache_read")
+        _tiered_cost(tokens.input, prices.get("input", 0.0), prices.get("input_200k"))
+        + _tiered_cost(tokens.output, prices.get("output", 0.0), prices.get("output_200k"))
+        + _tiered_cost(tokens.cache_create, prices.get("cache_create", 0.0), prices.get("cache_create_200k"))
+        + _tiered_cost(tokens.cache_read, prices.get("cache_read", 0.0), prices.get("cache_read_200k"))
     )
 
 

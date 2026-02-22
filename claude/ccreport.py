@@ -139,6 +139,8 @@ class UsageRecord:
     timestamp: datetime
     session_id: str
     project: str
+    cost_usd: float | None = None  # pre-calculated cost from Claude Code
+    dedup_key: str | None = None  # message_id:request_id for deduplication
 
 
 @dataclass
@@ -177,26 +179,38 @@ def find_pricing(model: str, ts: datetime | None = None) -> dict[str, float] | N
     return None
 
 
+def _tiered_cost(count: int, base_rate: float, tiered_rate: float | None) -> float:
+    """Calculate cost for a single token type with per-type 200K tiering."""
+    if count > TIER_THRESHOLD and tiered_rate is not None:
+        below = min(count, TIER_THRESHOLD)
+        above = count - below
+        return below * base_rate + above * tiered_rate
+    return count * base_rate
+
+
 def calc_cost(tokens: TokenCounts, model: str, ts: datetime | None = None) -> float:
-    """Calculate cost for token counts using model-specific pricing."""
+    """Calculate cost for token counts using model-specific pricing.
+
+    The 200K tier is applied per token type independently: each type's count
+    is checked against the threshold separately (matching ccusage behavior).
+    """
     prices = find_pricing(model, ts)
     if not prices:
         return 0.0
 
-    def tiered(count: int, base_key: str) -> float:
-        base = prices.get(base_key, 0.0)
-        tiered_key = f"{base_key}_200k"
-        tiered_rate = prices.get(tiered_key)
-        if tiered_rate and count > TIER_THRESHOLD:
-            return (TIER_THRESHOLD * base) + ((count - TIER_THRESHOLD) * tiered_rate)
-        return count * base
-
     return (
-        tiered(tokens.input, "input")
-        + tiered(tokens.output, "output")
-        + tiered(tokens.cache_create, "cache_create")
-        + tiered(tokens.cache_read, "cache_read")
+        _tiered_cost(tokens.input, prices.get("input", 0.0), prices.get("input_200k"))
+        + _tiered_cost(tokens.output, prices.get("output", 0.0), prices.get("output_200k"))
+        + _tiered_cost(tokens.cache_create, prices.get("cache_create", 0.0), prices.get("cache_create_200k"))
+        + _tiered_cost(tokens.cache_read, prices.get("cache_read", 0.0), prices.get("cache_read_200k"))
     )
+
+
+def record_cost(rec: UsageRecord) -> float:
+    """Return cost for a record: use pre-calculated costUSD if available, else compute."""
+    if rec.cost_usd is not None:
+        return rec.cost_usd
+    return calc_cost(rec.tokens, rec.model, rec.timestamp)
 
 
 def project_display_name(project_dir: str) -> str:
@@ -255,8 +269,15 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                     continue
 
                 message_id = msg.get("id", "")
-                if not message_id:
-                    continue
+                request_id = rec.get("requestId", "")
+
+                # Build composite dedup key (message_id:request_id).
+                # If either is missing, dedup_key is None → record is never
+                # considered a duplicate (matching ccusage behavior).
+                if message_id and request_id:
+                    dedup_key = f"{message_id}:{request_id}"
+                else:
+                    dedup_key = None
 
                 tokens = TokenCounts(
                     input=usage.get("input_tokens", 0),
@@ -273,6 +294,14 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                 except (ValueError, TypeError):
                     continue
 
+                # Pre-calculated cost from Claude Code (used in auto mode)
+                cost_usd = rec.get("costUSD")
+                if cost_usd is not None:
+                    try:
+                        cost_usd = float(cost_usd)
+                    except (ValueError, TypeError):
+                        cost_usd = None
+
                 records.append(UsageRecord(
                     message_id=message_id,
                     model=msg.get("model", "unknown"),
@@ -280,6 +309,8 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                     timestamp=ts,
                     session_id=rec.get("sessionId", path.stem),
                     project=project,
+                    cost_usd=cost_usd,
+                    dedup_key=dedup_key,
                 ))
     except (OSError, UnicodeDecodeError):
         pass
@@ -292,22 +323,29 @@ def load_all_records(
     until: datetime | None = None,
     project_filter: str | None = None,
 ) -> list[UsageRecord]:
-    """Load and deduplicate all usage records."""
+    """Load and deduplicate all usage records.
+
+    Deduplication uses a composite key of message_id + request_id
+    (matching ccusage).  First occurrence wins.  Records lacking either
+    ID are never deduplicated — they always pass through.
+    """
     files = discover_jsonl_files()
+    seen_keys: set[str] = set()
     all_records: list[UsageRecord] = []
-    seen_ids: set[str] = set()
 
     for path in files:
         for rec in parse_jsonl_file(path):
-            if rec.message_id in seen_ids:
-                continue
             if since and rec.timestamp < since:
                 continue
             if until and rec.timestamp > until:
                 continue
             if project_filter and project_filter.lower() not in rec.project.lower():
                 continue
-            seen_ids.add(rec.message_id)
+            # Dedup: first occurrence wins; records without dedup_key always pass
+            if rec.dedup_key is not None:
+                if rec.dedup_key in seen_keys:
+                    continue
+                seen_keys.add(rec.dedup_key)
             all_records.append(rec)
 
     all_records.sort(key=lambda r: r.timestamp)
@@ -395,14 +433,15 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
         day = rec.timestamp.astimezone().strftime("%Y-%m-%d")
         b = buckets[day]
         b.tokens += rec.tokens
-        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
-        b.models.add(rec.model)
+        b.cost += record_cost(rec)
+        if rec.model != "<synthetic>":
+            b.models.add(rec.model)
         b.count += 1
 
         if breakdown:
             mb = model_buckets[day][rec.model]
             mb.tokens += rec.tokens
-            mb.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
+            mb.cost += record_cost(rec)
             mb.count += 1
 
     table = Table(title=f"Daily Usage ({len(buckets)} days)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
@@ -458,8 +497,9 @@ def report_monthly(records: list[UsageRecord]) -> None:
         month = rec.timestamp.astimezone().strftime("%Y-%m")
         b = buckets[month]
         b.tokens += rec.tokens
-        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
-        b.models.add(rec.model)
+        b.cost += record_cost(rec)
+        if rec.model != "<synthetic>":
+            b.models.add(rec.model)
         b.count += 1
 
     table = Table(title=f"Monthly Usage ({len(buckets)} months)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
@@ -508,8 +548,9 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     for rec in records:
         b = buckets[rec.project]
         b.tokens += rec.tokens
-        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
-        b.models.add(rec.model)
+        b.cost += record_cost(rec)
+        if rec.model != "<synthetic>":
+            b.models.add(rec.model)
         b.count += 1
 
     sorted_projects = sorted(buckets, key=lambda p: buckets[p].cost, reverse=True)
@@ -580,8 +621,9 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         sid = rec.session_id
         b = buckets[sid]
         b.tokens += rec.tokens
-        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
-        b.models.add(rec.model)
+        b.cost += record_cost(rec)
+        if rec.model != "<synthetic>":
+            b.models.add(rec.model)
         b.count += 1
 
         meta = session_meta.setdefault(sid, {"project": rec.project, "first": rec.timestamp, "last": rec.timestamp})
@@ -691,7 +733,7 @@ def report_json(records: list[UsageRecord]) -> None:
             "cache_creation_tokens": rec.tokens.cache_create,
             "cache_read_tokens": rec.tokens.cache_read,
             "total_tokens": rec.tokens.total,
-            "cost_usd": round(calc_cost(rec.tokens, rec.model, rec.timestamp), 6),
+            "cost_usd": round(record_cost(rec), 6),
         })
     print(json.dumps(output, indent=2))
 
