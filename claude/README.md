@@ -9,11 +9,13 @@
 * Number of dogcat issues in review/progress
 * Lines added/removed
 * Current model and context usage with prompt cache hit rate (CH%)
+* I/O ratio — output/input token ratio for the session (e.g. 2.3x)
+* Cost estimation for the current Claude Code session
 * Rate limit status (session/week % with reset countdowns)
 * Sonnet-specific usage % with reset countdown (hidden below 25% by default)
 * Extra usage spend/limit (hidden when session usage < 60% by default)
 * TTL countdown until next usage data refresh
-* Cost estimation for the current Claude Code session
+* Active parallel sessions count (distinct sessions from last 15 min)
 
 ![Claude Code statusline](claude.png)
 

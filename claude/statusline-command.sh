@@ -9,15 +9,17 @@
 #   CLAUDE_STATUSLINE_GIT                     — branch + indicators
 #   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
 #   CLAUDE_STATUSLINE_CHANGES                 — lines added/removed
-#   CLAUDE_STATUSLINE_SESSION                 — model, context window %
+#   CLAUDE_STATUSLINE_SESSION                 — model, context window %, cache hit, I/O ratio
+#     CLAUDE_STATUSLINE_IO_RATIO             — output/input token ratio (e.g. 2.3x)
+#   CLAUDE_STATUSLINE_COST                    — session cost
 #   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with reset countdowns)
 #     CLAUDE_STATUSLINE_SONNET                — Sonnet usage % with reset countdown
 #     CLAUDE_STATUSLINE_SONNET_THRESHOLD      — hide Sonnet section below this % (default 25)
 #     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit
 #     CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — only show Extra when S% >= this (default 60)
 #     CLAUDE_STATUSLINE_TTL                   — time until next usage fetch
+#     CLAUDE_STATUSLINE_SESSIONS             — active sessions in last 15 min
 #   CLAUDE_STATUSLINE_USAGE_JSON              — pre-provided usage JSON (skips get_usage.py)
-#   CLAUDE_STATUSLINE_COST                    — session cost
 
 # --- Config defaults ---
 : "${CLAUDE_STATUSLINE_TIMESTAMP:=1}"
@@ -32,8 +34,10 @@
 : "${CLAUDE_STATUSLINE_SONNET_THRESHOLD:=25}"
 : "${CLAUDE_STATUSLINE_EXTRA:=1}"
 : "${CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD:=60}"
-: "${CLAUDE_STATUSLINE_TTL:=1}"
+: "${CLAUDE_STATUSLINE_IO_RATIO:=1}"
 : "${CLAUDE_STATUSLINE_COST:=1}"
+: "${CLAUDE_STATUSLINE_TTL:=1}"
+: "${CLAUDE_STATUSLINE_SESSIONS:=1}"
 
 # --- Input parsing ---
 
@@ -54,7 +58,10 @@ parse_json() {
     lines_removed=\(.cost.total_lines_removed // "")
     cache_create=\(.context_window.current_usage.cache_creation_input_tokens // "")
     cache_read=\(.context_window.current_usage.cache_read_input_tokens // "")
-    input_fresh=\(.context_window.current_usage.input_tokens // "")"
+    input_fresh=\(.context_window.current_usage.input_tokens // "")
+    total_in_tokens=\(.context_window.total_input_tokens // "")
+    total_out_tokens=\(.context_window.total_output_tokens // "")
+    cur_session_id=\(.session_id // "")"
   ')"
   host=$(hostname -s)
   # Show repo-name/subdir when inside a git repo, otherwise just the basename.
@@ -315,6 +322,25 @@ render_usage() {
     fi
   fi
 
+  # Active sessions: distinct sessions from history in last 15 min (excluding self)
+  if [ "$CLAUDE_STATUSLINE_SESSIONS" != "0" ]; then
+    local history_file="$HOME/.claude/history.jsonl"
+    if [ -f "$history_file" ]; then
+      local cutoff_ms sess_count
+      cutoff_ms=$(( $(date +%s) * 1000 - 900000 ))
+      sess_count=$(tail -n 100 "$history_file" | jq -r --argjson cutoff "$cutoff_ms" --arg self "$cur_session_id" \
+        'select(.timestamp >= $cutoff) | .sessionId' 2>/dev/null \
+        | sort -u | grep -cv "^${cur_session_id}$" 2>/dev/null)
+      if [ -n "$sess_count" ] && [ "$sess_count" -gt 0 ] 2>/dev/null; then
+        local sess_color
+        if [ "$sess_count" -ge 4 ] 2>/dev/null; then sess_color="31"
+        elif [ "$sess_count" -ge 2 ] 2>/dev/null; then sess_color="33"
+        else sess_color="90"; fi
+        parts="${parts:+$parts }$(printf '\033[0;90m+\033[0;%sm%s\033[0;90msess\033[0m' "$sess_color" "$sess_count")"
+      fi
+    fi
+  fi
+
   printf '\033[0;34m[\033[0m%s\033[0;34m]\033[0m' "$parts"
 }
 
@@ -369,6 +395,15 @@ render_session() {
     fi
   fi
 
+  # I/O ratio: total_output_tokens / total_input_tokens
+  if [ "$CLAUDE_STATUSLINE_IO_RATIO" != "0" ] && [ -n "$total_in_tokens" ] && [ -n "$total_out_tokens" ] && [ "$total_in_tokens" -gt 0 ] 2>/dev/null; then
+    local ratio whole frac
+    ratio=$(( (total_out_tokens * 10 + total_in_tokens / 2) / total_in_tokens ))
+    whole=$(( ratio / 10 ))
+    frac=$(( ratio % 10 ))
+    session_parts="${session_parts} $(printf '\033[0;90mI/O:\033[0;36m%s.%sx\033[0m' "$whole" "$frac")"
+  fi
+
   printf '\033[0;34m[\033[0m%s\033[0;34m]\033[0m' "$session_parts"
 }
 
@@ -388,9 +423,10 @@ render_cost() {
 mock_input() {
   input=$(cat <<'MOCK'
 {
+  "session_id": "mock-session-id",
   "workspace": { "current_dir": "MOCK_CWD" },
   "model": { "display_name": "Opus 4.6" },
-  "context_window": { "used_percentage": 42.7, "context_window_size": 200000, "current_usage": { "input_tokens": 3, "cache_creation_input_tokens": 658, "cache_read_input_tokens": 60106 } },
+  "context_window": { "used_percentage": 42.7, "context_window_size": 200000, "total_input_tokens": 16378, "total_output_tokens": 15177, "current_usage": { "input_tokens": 3, "cache_creation_input_tokens": 658, "cache_read_input_tokens": 60106 } },
   "cost": { "total_cost_usd": 1.37, "total_lines_added": 128, "total_lines_removed": 34 }
 }
 MOCK
@@ -431,10 +467,10 @@ main() {
   section=$(render_session)
   [ -n "$section" ] && parts="${parts:+$parts }$section"
 
-  section=$(render_usage)
+  section=$(render_cost)
   [ -n "$section" ] && parts="${parts:+$parts }$section"
 
-  section=$(render_cost)
+  section=$(render_usage)
   [ -n "$section" ] && parts="${parts:+$parts }$section"
 
   printf '%b\n' "$parts"
