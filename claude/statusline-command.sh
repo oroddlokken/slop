@@ -322,7 +322,11 @@ render_usage() {
     fi
   fi
 
+  local bracket
+  bracket=$(printf '\033[0;34m[\033[0m%s\033[0;34m]\033[0m' "$parts")
+
   # Active projects: distinct project folders from history in last 15 min (excluding current)
+  # Rendered outside the bracket.
   if [ "$CLAUDE_STATUSLINE_SESSIONS" != "0" ]; then
     local history_file="$HOME/.claude/history.jsonl"
     if [ -f "$history_file" ]; then
@@ -336,12 +340,12 @@ render_usage() {
         if [ "$sess_count" -ge 4 ] 2>/dev/null; then sess_color="31"
         elif [ "$sess_count" -ge 2 ] 2>/dev/null; then sess_color="33"
         else sess_color="90"; fi
-        parts="${parts:+$parts }$(printf '\033[0;90m+\033[0;%sm%s\033[0;90msess\033[0m' "$sess_color" "$sess_count")"
+        bracket="${bracket} $(printf '\033[0;90m+\033[0;%sm%s\033[0;90msess\033[0m' "$sess_color" "$sess_count")"
       fi
     fi
   fi
 
-  printf '\033[0;34m[\033[0m%s\033[0;34m]\033[0m' "$parts"
+  printf '%s' "$bracket"
 }
 
 # Session info: model name, context window %.
