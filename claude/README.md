@@ -35,6 +35,38 @@ Shows:
 
 Requires `jq` and the companion `get_usage.py` script. Run with `--force` / `-f` to bypass the cache.
 
+## CCReport — Claude Code Report
+
+Analyzes Claude Code token usage and costs from local JSONL session logs. Parses the session files in `~/.claude/projects/` and `~/.config/claude/projects/` to produce rich terminal reports.
+
+![CCReport](ccreport.png)
+
+Reports:
+
+* **Daily** — per-day token breakdown with optional per-model detail (`--breakdown`)
+* **Monthly** — aggregated by month
+* **Session** — top sessions ranked by cost, with project name, model mix, and averages
+
+Features:
+
+* Tiered pricing support (base vs 200K+ context rates)
+* Prompt cache token tracking (cache write and cache read)
+* Per-model cost calculation for Opus, Sonnet, and Haiku
+* Deduplication across session files
+* Filter by date range (`--since` / `--until`) and project (`--project`)
+* JSON output (`--json`) for programmatic use
+
+Run with no arguments to see all three reports, or pick one:
+
+```
+ccreport.py                          # all reports
+ccreport.py daily --breakdown        # daily with per-model detail
+ccreport.py session --limit 10       # top 10 sessions by cost
+ccreport.py daily --since 20260201 --project myapp
+```
+
+Requires `uv` (used as an inline script via `uv run --script`).
+
 ## Installation
 
 Tell your agent to read this repository and <https://code.claude.com/docs/en/statusline>, and ask it to help you integrate it into your workflow.
