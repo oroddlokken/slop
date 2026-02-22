@@ -16,73 +16,96 @@ from pathlib import Path
 
 import orjson
 
-# Per-token pricing for Claude models
+# Per-token pricing for Claude models (time-aware).
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4-6": {
-        "input": 5e-06,
-        "output": 25e-06,
-        "cache_create": 6.25e-06,
-        "cache_read": 0.5e-06,
-        "input_200k": 10e-06,
-        "output_200k": 37.5e-06,
-        "cache_create_200k": 12.5e-06,
-        "cache_read_200k": 1e-06,
+# Each period lists models introduced or whose pricing changed on that date.
+# Lookup walks periods in reverse to find the most recent entry for a model.
+LAST_CHECKED = "2026-02-22"
+
+PRICING_HISTORY: list[dict] = [
+    {
+        # Models available before Opus 4.6 / Sonnet 4.6 releases.
+        "effective": "2025-01-01",
+        "models": {
+            "claude-opus-4-5-20251101": {
+                "input": 5e-06,
+                "output": 25e-06,
+                "cache_create": 6.25e-06,
+                "cache_read": 0.5e-06,
+            },
+            "claude-sonnet-4-20250514": {
+                "input": 3e-06,
+                "output": 15e-06,
+                "cache_create": 3.75e-06,
+                "cache_read": 0.3e-06,
+                "input_200k": 6e-06,
+                "output_200k": 22.5e-06,
+                "cache_create_200k": 7.5e-06,
+                "cache_read_200k": 0.6e-06,
+            },
+            "claude-haiku-4-5-20251001": {
+                "input": 1e-06,
+                "output": 5e-06,
+                "cache_create": 1.25e-06,
+                "cache_read": 0.1e-06,
+            },
+            "claude-sonnet-4-5-20250929": {
+                "input": 3e-06,
+                "output": 15e-06,
+                "cache_create": 3.75e-06,
+                "cache_read": 0.3e-06,
+                "input_200k": 6e-06,
+                "output_200k": 22.5e-06,
+                "cache_create_200k": 7.5e-06,
+                "cache_read_200k": 0.6e-06,
+            },
+            "<synthetic>": {
+                "input": 0.0,
+                "output": 0.0,
+                "cache_create": 0.0,
+                "cache_read": 0.0,
+            },
+        },
     },
-    "claude-opus-4-5-20251101": {
-        "input": 5e-06,
-        "output": 25e-06,
-        "cache_create": 6.25e-06,
-        "cache_read": 0.5e-06,
+    {
+        # Claude Opus 4.6 released
+        "effective": "2026-02-05",
+        "models": {
+            "claude-opus-4-6": {
+                "input": 5e-06,
+                "output": 25e-06,
+                "cache_create": 6.25e-06,
+                "cache_read": 0.5e-06,
+                "input_200k": 10e-06,
+                "output_200k": 37.5e-06,
+                "cache_create_200k": 12.5e-06,
+                "cache_read_200k": 1e-06,
+            },
+        },
     },
-    "claude-sonnet-4-6": {
-        "input": 3e-06,
-        "output": 15e-06,
-        "cache_create": 3.75e-06,
-        "cache_read": 0.3e-06,
-        "input_200k": 6e-06,
-        "output_200k": 22.5e-06,
-        "cache_create_200k": 7.5e-06,
-        "cache_read_200k": 0.6e-06,
+    {
+        # Claude Sonnet 4.6 released
+        "effective": "2026-02-17",
+        "models": {
+            "claude-sonnet-4-6": {
+                "input": 3e-06,
+                "output": 15e-06,
+                "cache_create": 3.75e-06,
+                "cache_read": 0.3e-06,
+                "input_200k": 6e-06,
+                "output_200k": 22.5e-06,
+                "cache_create_200k": 7.5e-06,
+                "cache_read_200k": 0.6e-06,
+            },
+        },
     },
-    "claude-sonnet-4-20250514": {
-        "input": 3e-06,
-        "output": 15e-06,
-        "cache_create": 3.75e-06,
-        "cache_read": 0.3e-06,
-        "input_200k": 6e-06,
-        "output_200k": 22.5e-06,
-        "cache_create_200k": 7.5e-06,
-        "cache_read_200k": 0.6e-06,
-    },
-    "claude-haiku-4-5-20251001": {
-        "input": 1e-06,
-        "output": 5e-06,
-        "cache_create": 1.25e-06,
-        "cache_read": 0.1e-06,
-    },
-    "claude-sonnet-4-5-20250929": {
-        "input": 3e-06,
-        "output": 15e-06,
-        "cache_create": 3.75e-06,
-        "cache_read": 0.3e-06,
-        "input_200k": 6e-06,
-        "output_200k": 22.5e-06,
-        "cache_create_200k": 7.5e-06,
-        "cache_read_200k": 0.6e-06,
-    },
-    "<synthetic>": {
-        "input": 0.0,
-        "output": 0.0,
-        "cache_create": 0.0,
-        "cache_read": 0.0,
-    },
-}
+]
 
 # Aliases: map model IDs to their pricing key
 MODEL_ALIASES: dict[str, str] = {
     "claude-opus-4-5": "claude-opus-4-5-20251101",
     "claude-sonnet-4": "claude-sonnet-4-20250514",
+    "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
     "claude-haiku-4-5": "claude-haiku-4-5-20251001",
 }
 
@@ -126,23 +149,37 @@ class AggBucket:
     count: int = 0
 
 
-def find_pricing(model: str) -> dict[str, float] | None:
-    """Find pricing for a model, trying exact match then prefix/alias matching."""
-    if model in PRICING:
-        return PRICING[model]
-    resolved = MODEL_ALIASES.get(model)
-    if resolved and resolved in PRICING:
-        return PRICING[resolved]
-    # Substring match: e.g. "claude-opus-4-6" matches "claude-opus-4-6-20260101"
-    for key, prices in PRICING.items():
-        if key in model or model in key:
-            return prices
+def _parse_effective(date_str: str) -> datetime:
+    """Parse an effective date string to a timezone-aware datetime."""
+    return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def find_pricing(model: str, ts: datetime | None = None) -> dict[str, float] | None:
+    """Find pricing for a model at a given timestamp.
+
+    Walks PRICING_HISTORY in reverse chronological order, returning the first
+    match for a period whose effective date is <= *ts*.
+    """
+    resolved = MODEL_ALIASES.get(model, model)
+
+    for period in reversed(PRICING_HISTORY):
+        effective = _parse_effective(period["effective"])
+        if ts is not None and effective > ts:
+            continue
+        models = period["models"]
+        # Exact match
+        if resolved in models:
+            return models[resolved]
+        # Substring match: e.g. "claude-opus-4-6" <-> "claude-opus-4-6-20260101"
+        for key, prices in models.items():
+            if key in resolved or resolved in key:
+                return prices
     return None
 
 
-def calc_cost(tokens: TokenCounts, model: str) -> float:
+def calc_cost(tokens: TokenCounts, model: str, ts: datetime | None = None) -> float:
     """Calculate cost for token counts using model-specific pricing."""
-    prices = find_pricing(model)
+    prices = find_pricing(model, ts)
     if not prices:
         return 0.0
 
@@ -358,14 +395,14 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
         day = rec.timestamp.astimezone().strftime("%Y-%m-%d")
         b = buckets[day]
         b.tokens += rec.tokens
-        b.cost += calc_cost(rec.tokens, rec.model)
+        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
         b.models.add(rec.model)
         b.count += 1
 
         if breakdown:
             mb = model_buckets[day][rec.model]
             mb.tokens += rec.tokens
-            mb.cost += calc_cost(rec.tokens, rec.model)
+            mb.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
             mb.count += 1
 
     table = Table(title=f"Daily Usage ({len(buckets)} days)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
@@ -421,7 +458,7 @@ def report_monthly(records: list[UsageRecord]) -> None:
         month = rec.timestamp.astimezone().strftime("%Y-%m")
         b = buckets[month]
         b.tokens += rec.tokens
-        b.cost += calc_cost(rec.tokens, rec.model)
+        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
         b.models.add(rec.model)
         b.count += 1
 
@@ -464,6 +501,63 @@ def report_monthly(records: list[UsageRecord]) -> None:
     console.print()
 
 
+def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
+    """Print per-project usage report."""
+    buckets: dict[str, AggBucket] = defaultdict(AggBucket)
+
+    for rec in records:
+        b = buckets[rec.project]
+        b.tokens += rec.tokens
+        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
+        b.models.add(rec.model)
+        b.count += 1
+
+    sorted_projects = sorted(buckets, key=lambda p: buckets[p].cost, reverse=True)
+    if limit and len(sorted_projects) > limit:
+        shown = f"top {limit} of {len(sorted_projects)}"
+        sorted_projects = sorted_projects[:limit]
+    else:
+        shown = str(len(sorted_projects))
+
+    table = Table(title=f"Projects ({shown})", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
+    table.add_column("Project", style="magenta", no_wrap=True)
+    _add_token_columns(table)
+    table.add_column("Models", style="dim", no_wrap=True)
+
+    total_agg = AggBucket()
+    for proj in sorted_projects:
+        b = buckets[proj]
+        models_str = ", ".join(sorted(short_model(m) for m in b.models))
+        table.add_row(proj, *_token_row(b), models_str)
+        total_agg.tokens += b.tokens
+        total_agg.cost += b.cost
+        total_agg.count += b.count
+        total_agg.models |= b.models
+
+    table.add_section()
+    table.add_row(
+        Text("TOTAL", style="bold"),
+        *_token_row(total_agg),
+        f"{len(total_agg.models)} models",
+        style="bold",
+    )
+    n = len(sorted_projects)
+    if n > 1:
+        avg_cost = total_agg.cost / n
+        table.add_row(
+            Text("AVERAGE", style="dim bold"),
+            "", "", "", "", "",
+            Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+            "",
+            f"per project",
+            style="dim",
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
+
+
 def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
     """Print per-session usage report."""
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
@@ -473,7 +567,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         sid = rec.session_id
         b = buckets[sid]
         b.tokens += rec.tokens
-        b.cost += calc_cost(rec.tokens, rec.model)
+        b.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
         b.models.add(rec.model)
         b.count += 1
 
@@ -584,7 +678,7 @@ def report_json(records: list[UsageRecord]) -> None:
             "cache_creation_tokens": rec.tokens.cache_create,
             "cache_read_tokens": rec.tokens.cache_read,
             "total_tokens": rec.tokens.total,
-            "cost_usd": round(calc_cost(rec.tokens, rec.model), 6),
+            "cost_usd": round(calc_cost(rec.tokens, rec.model, rec.timestamp), 6),
         })
     print(json.dumps(output, indent=2))
 
@@ -609,7 +703,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", help="Report type")
 
     # Common args
-    for name in ["daily", "monthly", "session"]:
+    for name in ["daily", "monthly", "project", "session"]:
         p = sub.add_parser(name)
         p.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
@@ -617,6 +711,8 @@ def main() -> None:
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         if name == "daily":
             p.add_argument("--breakdown", "-b", action="store_true", help="Show per-model breakdown")
+        if name == "project":
+            p.add_argument("--limit", "-l", type=int, default=20, help="Max projects to show (0=all)")
         if name == "session":
             p.add_argument("--limit", "-l", type=int, default=20, help="Max sessions to show (0=all)")
 
@@ -648,6 +744,9 @@ def main() -> None:
         report_daily(records, breakdown=args.breakdown)
     elif command == "monthly":
         report_monthly(records)
+    elif command == "project":
+        lim = args.limit if args.limit != 0 else None
+        report_project(records, limit=lim)
     elif command == "session":
         lim = args.limit if args.limit != 0 else None
         report_session(records, limit=lim)
@@ -655,6 +754,7 @@ def main() -> None:
         # No subcommand: show daily + monthly summary
         report_daily(records)
         report_monthly(records)
+        report_project(records)
         report_session(records)
 
 

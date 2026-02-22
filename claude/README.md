@@ -45,6 +45,7 @@ Reports:
 
 * **Daily** — per-day token breakdown with optional per-model detail (`--breakdown`)
 * **Monthly** — aggregated by month
+* **Project** — top 20 projects ranked by cost, with model mix and averages
 * **Session** — top sessions ranked by cost, with project name, model mix, and averages
 
 Features:
@@ -56,11 +57,12 @@ Features:
 * Filter by date range (`--since` / `--until`) and project (`--project`)
 * JSON output (`--json`) for programmatic use
 
-Run with no arguments to see all three reports, or pick one:
+Run with no arguments to see all four reports, or pick one:
 
 ```
 ccreport.py                          # all reports
 ccreport.py daily --breakdown        # daily with per-model detail
+ccreport.py project --limit 10       # top 10 projects by cost
 ccreport.py session --limit 10       # top 10 sessions by cost
 ccreport.py daily --since 20260201 --project myapp
 ```
