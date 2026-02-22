@@ -549,7 +549,20 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
             "", "", "", "", "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
             "",
-            f"per project",
+            f"per project (top {n})",
+            style="dim",
+        )
+    # Average across ALL projects
+    all_n = len(buckets)
+    if all_n > 1:
+        all_cost = sum(b.cost for b in buckets.values())
+        all_avg = all_cost / all_n
+        table.add_row(
+            Text("AVERAGE", style="dim bold"),
+            "", "", "", "", "",
+            Text(fmt_cost(all_avg), style=cost_style(all_avg)),
+            "",
+            f"per project (all {all_n})",
             style="dim",
         )
 
