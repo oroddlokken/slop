@@ -23,7 +23,7 @@ Commands:
   status              Show installation status and bypassed commands
   install             Install the bypass hook (requires rtk hooks already set up)
   uninstall           Remove bypass hook, restore rtk-rewrite
-  disable <command>   Disable rtk rewriting for a command (e.g. curl, wget)
+  disable <command>   Disable rtk rewriting for a command (e.g. curl, "git status")
   enable <command>    Re-enable rtk rewriting for a command
 EOF
   exit 1
@@ -45,14 +45,21 @@ CMD=$(printf '%s\n' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
 
 [ -z "$CMD" ] && exit 0
 
-# Strip leading env var assignments, get first word, then basename for path commands
+# Strip leading env var assignments, get first word + subcommand
 MATCH_CMD=$(printf '%s' "$CMD" | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*=[^ ]* +)*//')
 FIRST_WORD=${MATCH_CMD%% *}
 FIRST_WORD=$(basename "$FIRST_WORD")
+REST=${MATCH_CMD#"$FIRST_WORD"}
+SECOND_WORD=$(printf '%s' "$REST" | sed -E 's/^[[:space:]]+//' | cut -d' ' -f1)
 
-# Check if this command is bypassed
-if [[ -f "$BYPASS_CONF" ]] && grep -qxF "$FIRST_WORD" "$BYPASS_CONF" 2>/dev/null; then
-  exit 0
+# Check if this command is bypassed (subcommand match first, then base command)
+if [[ -f "$BYPASS_CONF" ]]; then
+  if [[ -n "$SECOND_WORD" ]] && grep -qxF "$FIRST_WORD $SECOND_WORD" "$BYPASS_CONF" 2>/dev/null; then
+    exit 0
+  fi
+  if grep -qxF "$FIRST_WORD" "$BYPASS_CONF" 2>/dev/null; then
+    exit 0
+  fi
 fi
 
 # Delegate to rtk-rewrite
@@ -91,7 +98,7 @@ cmd_status() {
 
   # Bypass list
   if [[ -f "$BYPASS_CONF" ]] && [[ -s "$BYPASS_CONF" ]]; then
-    echo "Bypassed: $(paste -sd', ' "$BYPASS_CONF")"
+    echo "Bypassed: $(paste -sd', ' "$BYPASS_CONF" | sed 's/,/, /g')"
   else
     echo "Bypassed: (none)"
   fi
@@ -135,7 +142,7 @@ cmd_install() {
     ]
   ' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
 
-  echo "Installed. Bypassing: $(paste -sd', ' "$BYPASS_CONF")"
+  echo "Installed. Bypassing: $(paste -sd', ' "$BYPASS_CONF" | sed 's/,/, /g')"
 }
 
 cmd_uninstall() {
@@ -177,8 +184,13 @@ cmd_uninstall() {
 
 cmd_disable() {
   local cmd="$1"
-  if [[ "$cmd" =~ [[:space:]] || -z "$cmd" ]]; then
-    echo "Error: '$cmd' is not a valid command name (no spaces allowed)" >&2
+  if [[ -z "$cmd" ]]; then
+    echo "Error: command name cannot be empty" >&2
+    exit 1
+  fi
+  # Allow "cmd" or "cmd subcmd" (1-2 words only)
+  if ! [[ "$cmd" =~ ^[a-zA-Z0-9_./-]+([[:space:]][a-zA-Z0-9_./-]+)?$ ]]; then
+    echo "Error: '$cmd' is not valid (use 'cmd' or 'cmd subcmd')" >&2
     exit 1
   fi
   if [[ -f "$BYPASS_CONF" ]] && grep -qxF "$cmd" "$BYPASS_CONF" 2>/dev/null; then
@@ -207,12 +219,12 @@ case "${1:-}" in
   install)   cmd_install ;;
   uninstall) cmd_uninstall ;;
   disable)
-    [[ -z "${2:-}" ]] && { echo "Usage: $(basename "$0") disable <command>" >&2; exit 1; }
-    cmd_disable "$2"
+    [[ -z "${2:-}" ]] && { echo "Usage: $(basename \"$0\") disable <command> [subcommand]" >&2; exit 1; }
+    if [[ -n "${3:-}" ]]; then cmd_disable "$2 $3"; else cmd_disable "$2"; fi
     ;;
   enable)
-    [[ -z "${2:-}" ]] && { echo "Usage: $(basename "$0") enable <command>" >&2; exit 1; }
-    cmd_enable "$2"
+    [[ -z "${2:-}" ]] && { echo "Usage: $(basename \"$0\") enable <command> [subcommand]" >&2; exit 1; }
+    if [[ -n "${3:-}" ]]; then cmd_enable "$2 $3"; else cmd_enable "$2"; fi
     ;;
   *) usage ;;
 esac
