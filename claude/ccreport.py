@@ -4,9 +4,15 @@
 # requires-python = ">=3.12"
 # dependencies = ["orjson", "rich"]
 # ///
-"""Analyze Claude Code token usage and costs from local JSONL session logs."""
+"""Analyze Claude Code token usage and costs from local JSONL session logs.
+
+AUDIT: All calculations are documented in claude/CLAUDE.md.
+When changing any calculation, caching, or data format here,
+update CLAUDE.md to match.
+"""
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -15,101 +21,84 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import orjson
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
-# Per-token pricing for Claude models (time-aware).
-# Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-# Each period lists models introduced or whose pricing changed on that date.
-# Lookup walks periods in reverse to find the most recent entry for a model.
-LAST_CHECKED = "2026-02-22"
+# pricing.py and cache_db.py live in the same directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from cache_db import (
+    check_ccreport_valid,
+    delete_ccreport_stale,
+    get_ccreport_file,
+    get_ccreport_records,
+    init_ccreport_meta,
+    invalidate_ccreport,
+    save_ccreport_file,
+)
+from pricing import calc_cost
 
-PRICING_HISTORY: list[dict] = [
-    {
-        # Models available before Opus 4.6 / Sonnet 4.6 releases.
-        "effective": "2025-01-01",
-        "models": {
-            "claude-opus-4-5-20251101": {
-                "input": 5e-06,
-                "output": 25e-06,
-                "cache_create": 6.25e-06,
-                "cache_read": 0.5e-06,
-            },
-            "claude-sonnet-4-20250514": {
-                "input": 3e-06,
-                "output": 15e-06,
-                "cache_create": 3.75e-06,
-                "cache_read": 0.3e-06,
-                "input_200k": 6e-06,
-                "output_200k": 22.5e-06,
-                "cache_create_200k": 7.5e-06,
-                "cache_read_200k": 0.6e-06,
-            },
-            "claude-haiku-4-5-20251001": {
-                "input": 1e-06,
-                "output": 5e-06,
-                "cache_create": 1.25e-06,
-                "cache_read": 0.1e-06,
-            },
-            "claude-sonnet-4-5-20250929": {
-                "input": 3e-06,
-                "output": 15e-06,
-                "cache_create": 3.75e-06,
-                "cache_read": 0.3e-06,
-                "input_200k": 6e-06,
-                "output_200k": 22.5e-06,
-                "cache_create_200k": 7.5e-06,
-                "cache_read_200k": 0.6e-06,
-            },
-            "<synthetic>": {
-                "input": 0.0,
-                "output": 0.0,
-                "cache_create": 0.0,
-                "cache_read": 0.0,
-            },
-        },
-    },
-    {
-        # Claude Opus 4.6 released
-        "effective": "2026-02-05",
-        "models": {
-            "claude-opus-4-6": {
-                "input": 5e-06,
-                "output": 25e-06,
-                "cache_create": 6.25e-06,
-                "cache_read": 0.5e-06,
-                "input_200k": 10e-06,
-                "output_200k": 37.5e-06,
-                "cache_create_200k": 12.5e-06,
-                "cache_read_200k": 1e-06,
-            },
-        },
-    },
-    {
-        # Claude Sonnet 4.6 released
-        "effective": "2026-02-17",
-        "models": {
-            "claude-sonnet-4-6": {
-                "input": 3e-06,
-                "output": 15e-06,
-                "cache_create": 3.75e-06,
-                "cache_read": 0.3e-06,
-                "input_200k": 6e-06,
-                "output_200k": 22.5e-06,
-                "cache_create_200k": 7.5e-06,
-                "cache_read_200k": 0.6e-06,
-            },
-        },
-    },
-]
+_PROJECT_ROOTS = (
+    Path.home() / ".claude" / "projects",
+    Path.home() / ".config" / "claude" / "projects",
+)
 
-# Aliases: map model IDs to their pricing key
-MODEL_ALIASES: dict[str, str] = {
-    "claude-opus-4-5": "claude-opus-4-5-20251101",
-    "claude-sonnet-4": "claude-sonnet-4-20250514",
-    "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5": "claude-haiku-4-5-20251001",
-}
+# --- File-level cache ---
+CACHE_VERSION = 1
 
-TIER_THRESHOLD = 200_000
+
+def _script_hash() -> str:
+    """SHA256 of this script file, used to invalidate cache on code changes."""
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _ensure_cache_valid() -> None:
+    """Ensure ccreport cache is valid; invalidate and reinitialize if stale."""
+    sh = _script_hash()
+    if not check_ccreport_valid(CACHE_VERSION, sh):
+        invalidate_ccreport()
+        init_ccreport_meta(CACHE_VERSION, sh)
+
+
+def _serialize_records(records: list) -> list[dict]:
+    """Convert UsageRecords to compact cache dicts."""
+    return [
+        {
+            "mid": r.message_id,
+            "model": r.model,
+            "ts": r.timestamp.timestamp(),
+            "sid": r.session_id,
+            "project": r.project,
+            "dk": r.dedup_key,
+            "cost": r.cost_usd,
+            "t": [r.tokens.input, r.tokens.output, r.tokens.cache_create, r.tokens.cache_read],
+        }
+        for r in records
+    ]
+
+
+def _deserialize_records(raw: list[dict]) -> list:
+    """Convert compact cache dicts back to UsageRecords."""
+    return [
+        UsageRecord(
+            message_id=r["mid"],
+            model=r["model"],
+            timestamp=datetime.fromtimestamp(r["ts"], tz=timezone.utc),
+            session_id=r["sid"],
+            project=r["project"],
+            dedup_key=r.get("dk"),
+            cost_usd=r.get("cost"),
+            tokens=TokenCounts(
+                input=r["t"][0], output=r["t"][1],
+                cache_create=r["t"][2], cache_read=r["t"][3],
+            ),
+        )
+        for r in raw
+    ]
 
 
 @dataclass
@@ -151,66 +140,15 @@ class AggBucket:
     count: int = 0
 
 
-def _parse_effective(date_str: str) -> datetime:
-    """Parse an effective date string to a timezone-aware datetime."""
-    return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-
-
-def find_pricing(model: str, ts: datetime | None = None) -> dict[str, float] | None:
-    """Find pricing for a model at a given timestamp.
-
-    Walks PRICING_HISTORY in reverse chronological order, returning the first
-    match for a period whose effective date is <= *ts*.
-    """
-    resolved = MODEL_ALIASES.get(model, model)
-
-    for period in reversed(PRICING_HISTORY):
-        effective = _parse_effective(period["effective"])
-        if ts is not None and effective > ts:
-            continue
-        models = period["models"]
-        # Exact match
-        if resolved in models:
-            return models[resolved]
-        # Substring match: e.g. "claude-opus-4-6" <-> "claude-opus-4-6-20260101"
-        for key, prices in models.items():
-            if key in resolved or resolved in key:
-                return prices
-    return None
-
-
-def _tiered_cost(count: int, base_rate: float, tiered_rate: float | None) -> float:
-    """Calculate cost for a single token type with per-type 200K tiering."""
-    if count > TIER_THRESHOLD and tiered_rate is not None:
-        below = min(count, TIER_THRESHOLD)
-        above = count - below
-        return below * base_rate + above * tiered_rate
-    return count * base_rate
-
-
-def calc_cost(tokens: TokenCounts, model: str, ts: datetime | None = None) -> float:
-    """Calculate cost for token counts using model-specific pricing.
-
-    The 200K tier is applied per token type independently: each type's count
-    is checked against the threshold separately (matching ccusage behavior).
-    """
-    prices = find_pricing(model, ts)
-    if not prices:
-        return 0.0
-
-    return (
-        _tiered_cost(tokens.input, prices.get("input", 0.0), prices.get("input_200k"))
-        + _tiered_cost(tokens.output, prices.get("output", 0.0), prices.get("output_200k"))
-        + _tiered_cost(tokens.cache_create, prices.get("cache_create", 0.0), prices.get("cache_create_200k"))
-        + _tiered_cost(tokens.cache_read, prices.get("cache_read", 0.0), prices.get("cache_read_200k"))
-    )
-
-
 def record_cost(rec: UsageRecord) -> float:
     """Return cost for a record: use pre-calculated costUSD if available, else compute."""
     if rec.cost_usd is not None:
         return rec.cost_usd
-    return calc_cost(rec.tokens, rec.model, rec.timestamp)
+    return calc_cost(
+        rec.tokens.input, rec.tokens.output,
+        rec.tokens.cache_create, rec.tokens.cache_read,
+        rec.model, rec.timestamp,
+    )
 
 
 def project_display_name(project_dir: str) -> str:
@@ -225,28 +163,34 @@ def project_display_name(project_dir: str) -> str:
 
 def discover_jsonl_files() -> list[Path]:
     """Find all JSONL session logs across known Claude config directories."""
-    dirs = []
-    claude_dir = Path.home() / ".claude" / "projects"
-    config_dir = Path.home() / ".config" / "claude" / "projects"
-    if claude_dir.is_dir():
-        dirs.append(claude_dir)
-    if config_dir.is_dir():
-        dirs.append(config_dir)
-
     files = []
-    for d in dirs:
-        files.extend(d.rglob("*.jsonl"))
+    for d in _PROJECT_ROOTS:
+        if d.is_dir():
+            files.extend(d.rglob("*.jsonl"))
     return sorted(files)
+
+
+def _derive_project(path: Path) -> str:
+    """Derive project display name from a JSONL file's location.
+
+    The project key is the first directory component under a projects root:
+      projects/project-key/session.jsonl → project-key
+      projects/project-key/session-id/sub.jsonl → project-key
+    """
+    for root in _PROJECT_ROOTS:
+        try:
+            rel = path.relative_to(root)
+            if rel.parts:
+                return project_display_name(rel.parts[0])
+        except ValueError:
+            continue
+    return project_display_name(path.parent.name)
 
 
 def parse_jsonl_file(path: Path) -> list[UsageRecord]:
     """Parse a single JSONL file and extract usage records."""
     records = []
-    # Derive project name from parent directory
-    project = project_display_name(path.parent.name)
-    # Check if this is a subagent file (nested deeper)
-    if path.parent.name == "subagents":
-        project = project_display_name(path.parent.parent.parent.name)
+    project = _derive_project(path)
 
     try:
         with open(path, "rb") as f:
@@ -325,39 +269,47 @@ def load_all_records(
 ) -> list[UsageRecord]:
     """Load and deduplicate all usage records.
 
-    Deduplication uses a composite key of message_id + request_id
-    (matching ccusage).  First occurrence wins.  Records lacking either
-    ID are never deduplicated — they always pass through.
+    Uses a SQLite cache keyed by (mtime_ns, size) to avoid re-parsing
+    unchanged files.  Deduplication uses a composite key of message_id +
+    request_id (matching ccusage).  First occurrence wins.
     """
     files = discover_jsonl_files()
+    _ensure_cache_valid()
     seen_keys: set[str] = set()
     all_records: list[UsageRecord] = []
+    live_paths: set[str] = set()
 
     for path in files:
-        for rec in parse_jsonl_file(path):
+        key = str(path)
+        live_paths.add(key)
+        st = path.stat()
+        cached = get_ccreport_file(key)
+
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            records = _deserialize_records(get_ccreport_records(key))
+        else:
+            records = parse_jsonl_file(path)
+            save_ccreport_file(key, st.st_mtime_ns, st.st_size, _serialize_records(records))
+
+        for rec in records:
             if since and rec.timestamp < since:
                 continue
             if until and rec.timestamp > until:
                 continue
             if project_filter and project_filter.lower() not in rec.project.lower():
                 continue
-            # Dedup: first occurrence wins; records without dedup_key always pass
             if rec.dedup_key is not None:
                 if rec.dedup_key in seen_keys:
                     continue
                 seen_keys.add(rec.dedup_key)
             all_records.append(rec)
 
+    delete_ccreport_stale(live_paths)
     all_records.sort(key=lambda r: r.timestamp)
     return all_records
 
 
 # --- Formatting ---
-
-from rich import box
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
 
 console = Console(soft_wrap=True)
 
@@ -378,6 +330,16 @@ def fmt_cost(c: float) -> str:
     return f"${c:.4f}"
 
 
+def fmt_pct(cost: float, total: float) -> str:
+    """Format cost as percentage of total."""
+    if total <= 0:
+        return ""
+    pct = cost / total * 100
+    if pct >= 10:
+        return f"{pct:.0f}%"
+    return f"{pct:.1f}%"
+
+
 def cost_style(c: float) -> str:
     """Return a color style based on cost magnitude."""
     if c >= 50:
@@ -392,8 +354,9 @@ def cost_style(c: float) -> str:
 def short_model(model: str) -> str:
     """Shorten model name for display."""
     m = model.replace("claude-", "")
-    for suffix in ["-20251101", "-20250514", "-20251001", "-20250929"]:
-        m = m.replace(suffix, "")
+    # Strip -YYYYMMDD date suffix
+    if len(m) > 9 and m[-9] == "-" and m[-8:].isdigit():
+        m = m[:-9]
     return m
 
 
@@ -405,10 +368,11 @@ def _add_token_columns(table: Table) -> None:
     table.add_column("Cache R", justify="right", style="blue", no_wrap=True)
     table.add_column("Total", justify="right", style="bold", no_wrap=True)
     table.add_column("Cost", justify="right", no_wrap=True)
+    table.add_column("%", justify="right", style="dim", no_wrap=True)
     table.add_column("Calls", justify="right", style="dim", no_wrap=True)
 
 
-def _token_row(b: "AggBucket") -> list:
+def _token_row(b: "AggBucket", total_cost: float = 0.0) -> list:
     """Build the token/cost cells for a bucket."""
     cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
     return [
@@ -418,6 +382,7 @@ def _token_row(b: "AggBucket") -> list:
         fmt_tokens(b.tokens.cache_read),
         fmt_tokens(b.tokens.total),
         cost_text,
+        fmt_pct(b.cost, total_cost),
         str(b.count),
     ]
 
@@ -449,11 +414,12 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
     _add_token_columns(table)
     table.add_column("Models", style="dim", no_wrap=True)
 
+    total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
     for day in sorted(buckets):
         b = buckets[day]
         models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(day, *_token_row(b), models_str)
+        table.add_row(day, *_token_row(b, total_cost), models_str)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
@@ -462,10 +428,9 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
         if breakdown:
             for model in sorted(model_buckets[day]):
                 mb = model_buckets[day][model]
-                table.add_row(f"  [dim]{short_model(model)}[/dim]", *_token_row(mb), "")
+                table.add_row(f"  [dim]{short_model(model)}[/dim]", *_token_row(mb, total_cost), "")
 
     table.add_section()
-    total_agg.models = total_agg.models  # keep set
     table.add_row(
         Text("TOTAL", style="bold"),
         *_token_row(total_agg),
@@ -479,8 +444,8 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
             Text("AVERAGE", style="dim bold"),
             "", "", "", "", "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "",
-            f"per day",
+            "", "",
+            "per day",
             style="dim",
         )
 
@@ -507,11 +472,12 @@ def report_monthly(records: list[UsageRecord]) -> None:
     _add_token_columns(table)
     table.add_column("Models", style="dim", no_wrap=True)
 
+    total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
     for month in sorted(buckets):
         b = buckets[month]
         models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(month, *_token_row(b), models_str)
+        table.add_row(month, *_token_row(b, total_cost), models_str)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
@@ -531,8 +497,8 @@ def report_monthly(records: list[UsageRecord]) -> None:
             Text("AVERAGE", style="dim bold"),
             "", "", "", "", "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "",
-            f"per month",
+            "", "",
+            "per month",
             style="dim",
         )
 
@@ -565,11 +531,12 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     _add_token_columns(table)
     table.add_column("Models", style="dim", no_wrap=True)
 
+    total_cost = sum(buckets[p].cost for p in sorted_projects)
     total_agg = AggBucket()
     for proj in sorted_projects:
         b = buckets[proj]
         models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(proj, *_token_row(b), models_str)
+        table.add_row(proj, *_token_row(b, total_cost), models_str)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
@@ -589,7 +556,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
             Text("AVERAGE", style="dim bold"),
             "", "", "", "", "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "",
+            "", "",
             f"per project (top {n})",
             style="dim",
         )
@@ -602,7 +569,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
             Text("AVERAGE", style="dim bold"),
             "", "", "", "", "",
             Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-            "",
+            "", "",
             f"per project (all {all_n})",
             style="dim",
         )
@@ -649,9 +616,11 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
     table.add_column("Output", justify="right", style="cyan", no_wrap=True)
     table.add_column("Total", justify="right", style="bold", no_wrap=True)
     table.add_column("Cost", justify="right", no_wrap=True)
+    table.add_column("%", justify="right", style="dim", no_wrap=True)
     table.add_column("Calls", justify="right", style="dim", no_wrap=True)
     table.add_column("Models", style="dim", no_wrap=True)
 
+    total_cost = sum(buckets[s].cost for s in sorted_sessions)
     total_agg = AggBucket()
     for sid in sorted_sessions:
         b = buckets[sid]
@@ -667,6 +636,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
             fmt_tokens(b.tokens.output),
             fmt_tokens(b.tokens.total),
             cost_text,
+            fmt_pct(b.cost, total_cost),
             str(b.count),
             models_str,
         )
@@ -675,7 +645,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         total_agg.count += b.count
 
     table.add_section()
-    total_cost = Text(fmt_cost(total_agg.cost), style=cost_style(total_agg.cost))
+    total_cost_text = Text(fmt_cost(total_agg.cost), style=cost_style(total_agg.cost))
     table.add_row(
         Text("TOTAL", style="bold"),
         "",
@@ -683,7 +653,8 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         fmt_tokens(total_agg.tokens.input),
         fmt_tokens(total_agg.tokens.output),
         fmt_tokens(total_agg.tokens.total),
-        total_cost,
+        total_cost_text,
+        "",
         str(total_agg.count),
         "",
         style="bold",
@@ -695,7 +666,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
             Text("AVERAGE", style="dim bold"),
             "", "", "", "", "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "",
+            "", "",
             f"per session (top {n})",
             style="dim",
         )
@@ -708,7 +679,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
             Text("AVERAGE", style="dim bold"),
             "", "", "", "", "",
             Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-            "",
+            "", "",
             f"per session (all {all_n})",
             style="dim",
         )
@@ -739,10 +710,11 @@ def report_json(records: list[UsageRecord]) -> None:
 
 
 def parse_date(s: str) -> datetime:
-    """Parse YYYYMMDD or YYYY-MM-DD into a timezone-aware datetime."""
+    """Parse YYYYMMDD or YYYY-MM-DD into a timezone-aware datetime (local midnight)."""
     s = s.replace("-", "")
     dt = datetime.strptime(s, "%Y%m%d")
-    return dt.replace(tzinfo=timezone.utc)
+    local_tz = datetime.now(tz=timezone.utc).astimezone().tzinfo
+    return dt.replace(tzinfo=local_tz)
 
 
 def main() -> None:

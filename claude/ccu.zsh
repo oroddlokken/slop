@@ -1,12 +1,16 @@
 #!/usr/bin/env zsh
 # Claude Code Usage — terminal dashboard similar to the /usage screen.
-# Calls get_usage.py and renders progress bars with reset countdowns.
+# Calls get_claude_usage.py and renders progress bars with reset countdowns.
+#
+# AUDIT: All calculations are documented in claude/CLAUDE.md.
+#        When changing any calculation, caching, or data format here,
+#        update CLAUDE.md to match.
 #
 # Usage: ccu.zsh [--force|-f]
 
 set -euo pipefail
 
-SETUP_DIR="${SETUP_DIR:-$HOME/git/macsetup}"
+SETUP_DIR="${SETUP_DIR:-$HOME/git/slop}"
 
 # --- Fetch usage JSON ---
 
@@ -19,11 +23,7 @@ for p in python3.14 python3.13 python3.12 python3.11 python3.10; do
   command -v "$p" >/dev/null 2>&1 && py="$p" && break
 done
 
-local script_dir="${0:a:h}"
-local usage_script="$script_dir/get_usage.py"
-if [[ ! -f "$usage_script" ]]; then
-  usage_script="$SETUP_DIR/claude/get_usage.py"
-fi
+local usage_script="$SETUP_DIR/claude/get_claude_usage.py"
 
 local json
 json=$("$py" "$usage_script" $force_flag 2>/dev/null) || true
@@ -34,17 +34,22 @@ fi
 
 # --- Parse fields ---
 
-local s_pct=$(echo "$json" | jq -r '.session_percent // empty')
-local w_pct=$(echo "$json" | jq -r '.week_percent // empty')
-local so_pct=$(echo "$json" | jq -r '.sonnet_percent // empty')
-local e_pct=$(echo "$json" | jq -r '.extra_percent // empty')
-local e_spent=$(echo "$json" | jq -r '.extra_spent // empty')
-local e_limit=$(echo "$json" | jq -r '.extra_limit // empty')
-local s_reset=$(echo "$json" | jq -r '.session_reset // empty')
-local w_reset=$(echo "$json" | jq -r '.week_reset // empty')
-local so_reset=$(echo "$json" | jq -r '.sonnet_reset // empty')
-local e_reset=$(echo "$json" | jq -r '.extra_reset // empty')
-local last_updated=$(echo "$json" | jq -r '.last_updated // empty')
+local jq_out
+jq_out=$(echo "$json" | jq -r '[
+  (.session_percent // ""),
+  (.week_percent // ""),
+  (.sonnet_percent // ""),
+  (.extra_percent // ""),
+  (.extra_spent // ""),
+  (.extra_limit // ""),
+  (.session_reset // ""),
+  (.week_reset // ""),
+  (.sonnet_reset // ""),
+  (.extra_reset // ""),
+  (.last_updated // "")
+] | join("\u001f")')
+local s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated
+IFS=$'\x1f' read -r s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated <<< "$jq_out"
 
 if [[ -z "$s_pct" && -z "$w_pct" ]]; then
   echo "No usage data available" >&2
@@ -171,6 +176,7 @@ ccu_section() {
   local reset_line
   reset_line=$(ccu_reset_fmt "$reset_iso")
   [[ -n "$reset_line" ]] && echo "$reset_line"
+  return 0
 }
 
 # --- Render ---

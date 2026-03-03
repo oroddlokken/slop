@@ -15,9 +15,12 @@
 * Sonnet-specific usage % with reset countdown (hidden below 25% by default)
 * Extra usage spend/limit (hidden when session usage < 60% by default)
 * TTL countdown until next usage data refresh
+* Historic cost tracking (6H/12H/24H/7D/30D/all-time) with per-project breakdowns
 * Active parallel projects count (distinct project folders from last 15 min)
 
 ![Claude Code statusline](claude.png)
+
+Toggle sections via environment variables (1=enabled, 0=disabled) — see the top of `statusline-command.py` for the full list. The wrapper `statusline-command_x.sh` sets defaults and detects terminal width.
 
 ## CCU — Claude Code Usage
 
@@ -33,7 +36,7 @@ Shows:
 * Extra usage spend/limit with reset countdown
 * Human-readable reset times in your local timezone
 
-Requires `jq` and the companion `get_usage.py` script. Run with `--force` / `-f` to bypass the cache.
+Requires `jq` and the companion `get_claude_usage.py` script. Run with `--force` / `-f` to bypass the cache.
 
 ## CCReport — Claude Code Report
 
@@ -53,7 +56,8 @@ Features:
 * Tiered pricing support (base vs 200K+ context rates)
 * Prompt cache token tracking (cache write and cache read)
 * Per-model cost calculation for Opus, Sonnet, and Haiku
-* Deduplication across session files
+* Deduplication across session files (composite message_id + request_id keys)
+* Per-file SQLite caching with mtime/size change detection
 * Filter by date range (`--since` / `--until`) and project (`--project`)
 * JSON output (`--json`) for programmatic use
 
@@ -68,6 +72,13 @@ ccreport.py daily --since 20260201 --project myapp
 ```
 
 Requires `uv` (used as an inline script via `uv run --script`).
+
+## Architecture
+
+All scripts share two common modules:
+
+* **`pricing.py`** — pricing tables, model aliases, tiered cost calculation, and cost aggregation across time windows (session, week, rolling 6H/12H/24H/7D/30D, all-time). Single source of truth for all cost computation.
+* **`cache_db.py`** — unified SQLite cache at `~/.cache/macsetup/claude/cache.db` (WAL mode). Stores usage data, per-file cost totals, dedup keys, session costs, cache stats, and ccreport records.
 
 ## Installation
 

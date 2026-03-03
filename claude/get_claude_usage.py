@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Fetch Claude Code usage data, cached for 10 minutes."""
+"""Fetch Claude Code usage data, cached for 10 minutes.
+
+AUDIT: All calculations are documented in claude/CLAUDE.md.
+When changing any calculation, caching, or data format here,
+update CLAUDE.md to match.
+"""
 
 import fcntl
 import json
@@ -17,10 +22,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from cache_db import (
+    read_usage_cache,
+    write_usage_cache,
+)
+from pricing import compute_costs
+
 CACHE_DIR = Path.home() / ".cache" / "macsetup" / "claude"
-CACHE_FILE = CACHE_DIR / "usage.json"
-SAMPLES_FILE = CACHE_DIR / "usage-samples.jsonl"
-SAMPLES_MAX_LINES = 50
 CACHE_MAX_AGE = 600  # 10 minutes
 HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
 CLAUDE_DIR = Path.home() / ".claude"
@@ -97,7 +105,6 @@ def find_claude() -> str | None:
         return "npx claude"
 
     return None
-
 
 
 def strip_ansi(text: str) -> str:
@@ -177,19 +184,35 @@ def parse_usage_output(text: str) -> dict[str, Any]:
 
     # PTY mangles text: "Current" -> "rrent", "Resets" -> "Rese s",
     # "2am" -> "2 m" (terminal escape sequences eat letters like t, C, a)
+    #
     # Bound each section so regexes can't leak across sections.
-    _week_start = re.search(r"week", text, re.IGNORECASE)
-    _session_text = text[: _week_start.start()] if _week_start else text
+    # Section order: session → week (all models) → week (Sonnet only) → extra
+    _section_bounds: list[tuple[str, int, int]] = []
+    _anchors = [
+        ("session", re.compile(r"session", re.IGNORECASE)),
+        ("week", re.compile(r"week\s*\(all", re.IGNORECASE)),
+        ("sonnet", re.compile(r"week\s*\(Sonnet", re.IGNORECASE)),
+        ("extra", re.compile(r"Extra\s+usage", re.IGNORECASE)),
+    ]
+    _starts: list[tuple[str, int]] = []
+    for name, pat in _anchors:
+        m = pat.search(text)
+        if m:
+            _starts.append((name, m.start()))
+    _starts.sort(key=lambda x: x[1])
+    for i, (name, start) in enumerate(_starts):
+        end = _starts[i + 1][1] if i + 1 < len(_starts) else len(text)
+        _section_bounds.append((name, start, end))
+    _sections = {name: text[start:end] for name, start, end in _section_bounds}
 
-    # --- Current session ---
-    if (m := re.search(r"session.+?(\d+)%\s*used", _session_text, re.DOTALL | re.IGNORECASE)):
-        data["session_percent"] = int(m.group(1))
-
-    # Match mangled am/pm: "am" may become " m", "pm" may become " m"
-    if (m := re.search(
-        r"Rese[\w\s]*?(\d+(?::\d+)?)\s*([ap]?\s*m)",
-        _session_text, re.DOTALL | re.IGNORECASE,
-    )):
+    # Helper: parse a time-only reset ("Resets 10pm", "Rese s 10 m") into ISO.
+    def _reset_time_only(section_text: str) -> str | None:
+        m = re.search(
+            r"Rese[\w\s]*?(\d+(?::\d+)?)\s*([ap]?\s*m)",
+            section_text, re.DOTALL | re.IGNORECASE,
+        )
+        if not m:
+            return None
         ampm_raw = re.sub(r"\s", "", m.group(2)).lower()
         ampm = "pm" if ampm_raw.startswith("p") else "am"
         hour, minute = _parse_time(m.group(1), ampm)
@@ -197,56 +220,61 @@ def parse_usage_output(text: str) -> dict[str, Any]:
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
-        data["session_reset"] = target.isoformat()
+        return target.isoformat()
 
-    # --- Current week (all models) ---
-    if (m := re.search(
-        r"Current\s+week\s*\(all\s*models\).+?(\d+)%\s*used", text, re.DOTALL,
-    )):
-        data["week_percent"] = int(m.group(1))
-
-    if (m := re.search(
-        r"Current\s+week\s*\(all\s*models\).*?Resets?\s+"
-        r"([A-Za-z]+\s+\d+)(?:,?\s*(\d{4}))?\s*(?:at\s+)?(\d+(?::\d+)?)\s*(am|pm)",
-        text, re.DOTALL | re.IGNORECASE,
-    )):
-        hour, minute = _parse_time(m.group(3), m.group(4).lower())
-        if (iso := _parse_reset_date(m.group(1), m.group(2), hour, minute)):
-            data["week_reset"] = iso
-
-    # --- Current week (Sonnet only) ---
-    if (m := re.search(
-        r"Current\s+week\s*\(Sonnet\s*only\).+?(\d+)%\s*used", text, re.DOTALL,
-    )):
-        data["sonnet_percent"] = int(m.group(1))
-
-    if (m := re.search(
-        r"Current\s+week\s*\(Sonnet\s*only\).*?Resets?\s+"
-        r"([A-Za-z]+\s+\d+)(?:,?\s*(\d{4}))?\s*(?:at\s+)?(\d+(?::\d+)?)\s*(am|pm)",
-        text, re.DOTALL | re.IGNORECASE,
-    )):
-        hour, minute = _parse_time(m.group(3), m.group(4).lower())
-        if (iso := _parse_reset_date(m.group(1), m.group(2), hour, minute)):
-            data["sonnet_reset"] = iso
-
-    # --- Extra usage ---
-    if (m := re.search(r"Extra\s+usage.+?(\d+)%\s*used", text, re.DOTALL)):
-        data["extra_percent"] = int(m.group(1))
-
-    if (m := re.search(r"\$([0-9.]+)\s*/\s*\$([0-9.]+)\s*spent", text, re.DOTALL)):
-        data["extra_spent"] = float(m.group(1))
-        data["extra_limit"] = float(m.group(2))
-
-    if (m := re.search(
-        r"Extra\s+usage.*?Resets?\s+"
-        r"([A-Za-z]+\s+\d+)(?:,?\s*(\d{4}))?\s*(?:at\s+)?(?:(\d+(?::\d+)?)\s*(am|pm))?",
-        text, re.DOTALL | re.IGNORECASE,
-    )) and m.group(1):
+    # Helper: parse a date+time reset ("Resets Mar 1", "Resets Feb 25 at 8pm").
+    def _reset_date_time(section_text: str) -> str | None:
+        m = re.search(
+            r"Rese[\w\s]*?\s+"
+            r"([A-Za-z]+\s+\d+)(?:,?\s*(\d{4}))?\s*"
+            r"(?:at\s+)?(?:(\d+(?::\d+)?)\s*([ap]?\s*m))?",
+            section_text, re.DOTALL | re.IGNORECASE,
+        )
+        if not m or not m.group(1):
+            return None
         hour, minute = 0, 0
         if m.group(3):
-            hour, minute = _parse_time(m.group(3), (m.group(4) or "am").lower())
-        if (iso := _parse_reset_date(m.group(1), m.group(2), hour, minute)):
-            data["extra_reset"] = iso
+            ampm_raw = re.sub(r"\s", "", (m.group(4) or "am")).lower()
+            ampm = "pm" if ampm_raw.startswith("p") else "am"
+            hour, minute = _parse_time(m.group(3), ampm)
+        return _parse_reset_date(m.group(1), m.group(2), hour, minute)
+
+    # --- Current session ---
+    _s = _sections.get("session", "")
+    if (m := re.search(r"session.+?(\d+)%\s*used", _s, re.DOTALL | re.IGNORECASE)):
+        data["session_percent"] = int(m.group(1))
+    if (iso := _reset_time_only(_s)):
+        data["session_reset"] = iso
+
+    # --- Current week (all models) ---
+    _w = _sections.get("week", "")
+    if (m := re.search(r"(\d+)%\s*used", _w, re.DOTALL)):
+        data["week_percent"] = int(m.group(1))
+    # Try date+time first (e.g. "Resets Mar 3 at 10pm"), fall back to time-only.
+    if (iso := _reset_date_time(_w)):
+        data["week_reset"] = iso
+    elif (iso := _reset_time_only(_w)):
+        data["week_reset"] = iso
+
+    # --- Current week (Sonnet only) ---
+    _so = _sections.get("sonnet", "")
+    if (m := re.search(r"(\d+)%\s*used", _so, re.DOTALL)):
+        data["sonnet_percent"] = int(m.group(1))
+    if (iso := _reset_time_only(_so)):
+        data["sonnet_reset"] = iso
+    elif (iso := _reset_date_time(_so)):
+        data["sonnet_reset"] = iso
+
+    # --- Extra usage ---
+    _e = _sections.get("extra", "")
+    if (m := re.search(r"(\d+)%\s*used", _e, re.DOTALL)):
+        data["extra_percent"] = int(m.group(1))
+    if (m := re.search(r"\$([0-9.]+)\s*/\s*\$([0-9.]+)\s*spent", _e, re.DOTALL)):
+        data["extra_spent"] = float(m.group(1))
+        data["extra_limit"] = float(m.group(2))
+    # Extra always uses date+time format ("Resets Mar 1").
+    if (iso := _reset_date_time(_e)):
+        data["extra_reset"] = iso
 
     return data
 
@@ -298,7 +326,7 @@ def fetch_usage_via_pty() -> tuple[dict[str, Any], str]:
         stderr=slave,
         cwd=USAGE_CWD,
         preexec_fn=os.setsid,
-        env={**os.environ, "TERM": "xterm-256color"},
+        env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
     )
     os.close(slave)
 
@@ -369,28 +397,20 @@ def fetch_usage_via_pty() -> tuple[dict[str, Any], str]:
 
 
 def read_cache() -> dict[str, Any] | None:
-    """Read cached usage data if fresh enough (based on file mtime)."""
-    if not CACHE_FILE.exists():
-        return None
-    age = time.time() - CACHE_FILE.stat().st_mtime
-    if age > CACHE_MAX_AGE:
-        return None
-    with open(CACHE_FILE) as f:
-        return json.load(f)
+    """Read cached usage data if fresh enough."""
+    return read_usage_cache(CACHE_MAX_AGE)
 
 
 def write_cache(data: dict[str, Any]) -> None:
-    """Write usage data to the cache file."""
-    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CACHE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    """Write usage data to the SQLite cache."""
+    write_usage_cache(data)
 
 
 def clean_history() -> int:
     """Remove /usage lines from Claude's history.jsonl.
 
     Opens the file with an exclusive lock, filters in memory, then
-    truncates and rewrites.  The lock serialises concurrent get_usage.py
+    truncates and rewrites.  The lock serialises concurrent get_claude_usage.py
     runs; the window where an unlocked Claude append could be lost is
     reduced to the truncate+write (microseconds).
 
@@ -406,7 +426,7 @@ def clean_history() -> int:
         with os.fdopen(os.dup(fd), "r") as f:
             lines = f.readlines()
 
-        kept = [l for l in lines if '"display":"/usage"' not in l]
+        kept = [line for line in lines if '"display":"/usage"' not in line]
         removed = len(lines) - len(kept)
 
         if removed:
@@ -475,43 +495,33 @@ def clean_session(session_id: str) -> list[str]:
     return removed
 
 
-def append_sample(data: dict[str, Any], correlation_id: str | None = None) -> None:
-    """Append usage data as a single JSON line to the samples file."""
-    SAMPLES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    record = {**data}
-    if correlation_id:
-        record["correlation_id"] = correlation_id
-    with open(SAMPLES_FILE, "a") as f:
-        f.write(json.dumps(record, separators=(",", ":")) + "\n")
-
-
-def trim_samples(max_lines: int = SAMPLES_MAX_LINES) -> None:
-    """Trim the samples file to the last max_lines entries."""
-    try:
-        lines = SAMPLES_FILE.read_text().splitlines(keepends=True)
-        if len(lines) > max_lines:
-            SAMPLES_FILE.write_text("".join(lines[-max_lines:]))
-    except OSError:
-        pass
-
-
 def main() -> None:
     """Fetch and print Claude usage data, using cache when fresh."""
     raw_mode = "--raw" in sys.argv
     force = "--force" in sys.argv
-    append = "--append" in sys.argv
-    trim = "--trim" in sys.argv
-    correlation_id: str | None = None
-    if "--correlation-id" in sys.argv:
-        idx = sys.argv.index("--correlation-id")
+    session_id_arg: str | None = None
+    if "--session" in sys.argv:
+        idx = sys.argv.index("--session")
         if idx + 1 < len(sys.argv):
-            correlation_id = sys.argv[idx + 1]
+            session_id_arg = sys.argv[idx + 1]
+    cwd_arg: str | None = None
+    if "--cwd" in sys.argv:
+        idx = sys.argv.index("--cwd")
+        if idx + 1 < len(sys.argv):
+            cwd_arg = sys.argv[idx + 1]
 
     if not force:
         cached = read_cache()
         if cached:
-            if append:
-                append_sample(cached, correlation_id)
+            try:
+                costs = compute_costs(
+                    session_id=session_id_arg, cwd=cwd_arg,
+                    session_reset_iso=cached.get("session_reset"),
+                    week_reset_iso=cached.get("week_reset"),
+                )
+                cached.update(costs)
+            except Exception as e:  # noqa: BLE001
+                print(f"Warning: cost computation failed: {e}", file=sys.stderr)
             print(json.dumps(cached, indent=2))
             return
 
@@ -532,12 +542,18 @@ def main() -> None:
         sys.exit(1)
 
     data["last_updated"] = datetime.now(tz=timezone.utc).astimezone().isoformat()
-    write_cache(data)
 
-    if append:
-        append_sample(data, correlation_id)
-    if trim:
-        trim_samples()
+    try:
+        costs = compute_costs(
+            session_id=session_id_arg, cwd=cwd_arg,
+            session_reset_iso=data.get("session_reset"),
+            week_reset_iso=data.get("week_reset"),
+        )
+        data.update(costs)
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: cost computation failed: {e}", file=sys.stderr)
+
+    write_cache(data)
 
     cleaned: dict[str, Any] = {}
     history_removed = clean_history()
