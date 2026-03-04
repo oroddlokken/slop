@@ -527,6 +527,23 @@ def delete_ccreport_stale(live_paths: set[str]) -> bool:
     return True
 
 
+def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
+    """Fetch cached records for files no longer on disk.
+
+    Returns records from ccreport_files entries whose path is NOT in
+    live_paths, preserving historic data after Claude Code purges JSONL files.
+    """
+    conn = get_connection()
+    rows = conn.execute("SELECT path FROM ccreport_files").fetchall()
+    orphaned = [r[0] for r in rows if r[0] not in live_paths]
+    if not orphaned:
+        return []
+    all_records: list[dict] = []
+    for path in orphaned:
+        all_records.extend(get_ccreport_records(path))
+    return all_records
+
+
 # ---------------------------------------------------------------------------
 # Meta helpers
 # ---------------------------------------------------------------------------

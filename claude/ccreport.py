@@ -30,8 +30,8 @@ from rich.text import Text
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
     check_ccreport_valid,
-    delete_ccreport_stale,
     get_ccreport_file,
+    get_ccreport_orphaned_records,
     get_ccreport_records,
     init_ccreport_meta,
     invalidate_ccreport,
@@ -304,7 +304,20 @@ def load_all_records(
                 seen_keys.add(rec.dedup_key)
             all_records.append(rec)
 
-    delete_ccreport_stale(live_paths)
+    # Load records from files that were purged from disk but cached in SQLite
+    for raw in _deserialize_records(get_ccreport_orphaned_records(live_paths)):
+        if since and raw.timestamp < since:
+            continue
+        if until and raw.timestamp > until:
+            continue
+        if project_filter and project_filter.lower() not in raw.project.lower():
+            continue
+        if raw.dedup_key is not None:
+            if raw.dedup_key in seen_keys:
+                continue
+            seen_keys.add(raw.dedup_key)
+        all_records.append(raw)
+
     all_records.sort(key=lambda r: r.timestamp)
     return all_records
 
