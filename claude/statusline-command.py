@@ -61,11 +61,12 @@ from pathlib import Path
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
+    check_fetch_backoff,
     read_cache_stats,
     read_usage_for_statusline,
     write_cache_stats,
 )
-from pricing import compute_project_rolling_costs, compute_session_cost
+from pricing import compute_costs, compute_project_rolling_costs, compute_session_cost
 
 # --- Config ---
 
@@ -501,65 +502,76 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
     w_pct_raw = usage.get("week_percent", "")
     s_pct = str(s_pct_raw) if s_pct_raw is not None and s_pct_raw != "" else ""
     w_pct = str(w_pct_raw) if w_pct_raw is not None and w_pct_raw != "" else ""
-    if not s_pct and not w_pct:
-        return "", "", ""
+    have_rate_limits = s_pct or w_pct
 
     def _bracket(inner: str) -> str:
         return f"\033[0;34m[\033[0m{inner}\033[0;34m]\033[0m"
 
     # --- Rate-limit sections: S/W/So in one bracket ---
     rl_inners: list[str] = []
+    rl_line = ""
 
-    s = _usage_combined(
-        "S", s_pct, usage.get("session_reset", ""),
-        str(usage.get("session_window_cost", "") or ""), now,
-    )
-    if s:
-        rl_inners.append(s)
+    if have_rate_limits:
+        s = _usage_combined(
+            "S", s_pct, usage.get("session_reset", ""),
+            str(usage.get("session_window_cost", "") or ""), now,
+        )
+        if s:
+            rl_inners.append(s)
 
-    s = _usage_combined(
-        "W", w_pct, usage.get("week_reset", ""),
-        str(usage.get("week_cost", "") or ""), now,
-    )
-    if s:
-        rl_inners.append(s)
+        s = _usage_combined(
+            "W", w_pct, usage.get("week_reset", ""),
+            str(usage.get("week_cost", "") or ""), now,
+        )
+        if s:
+            rl_inners.append(s)
 
-    # Sonnet (hidden below threshold)
-    so_pct_raw = usage.get("sonnet_percent", "")
-    so_pct = str(so_pct_raw) if so_pct_raw is not None and so_pct_raw != "" else ""
-    if _on("SONNET") and so_pct:
-        try:
-            if int(so_pct) >= _env_int("SONNET_THRESHOLD", 25):
-                s = _usage_combined("So", so_pct, usage.get("sonnet_reset", ""), "", now)
-                if s:
-                    rl_inners.append(s)
-        except ValueError:
-            pass
+        # Sonnet (hidden below threshold)
+        so_pct_raw = usage.get("sonnet_percent", "")
+        so_pct = str(so_pct_raw) if so_pct_raw is not None and so_pct_raw != "" else ""
+        if _on("SONNET") and so_pct:
+            try:
+                if int(so_pct) >= _env_int("SONNET_THRESHOLD", 25):
+                    s = _usage_combined("So", so_pct, usage.get("sonnet_reset", ""), "", now)
+                    if s:
+                        rl_inners.append(s)
+            except ValueError:
+                pass
 
-    # Prepend TTL inside the S/W bracket
-    if _on("TTL"):
-        upd_epoch = _parse_iso_epoch(str(usage.get("last_updated", "") or ""))
-        if upd_epoch is not None:
-            ttl_s = int(600 - (now - upd_epoch))
-            if ttl_s > 0:
-                rl_inners.insert(0, f"\033[0;90mTTL:{ttl_s // 60}m{ttl_s % 60}s\033[0m")
+        # Prepend TTL (or staleness age) inside the S/W bracket
+        if _on("TTL"):
+            upd_epoch = _parse_iso_epoch(str(usage.get("last_updated", "") or ""))
+            if upd_epoch is not None:
+                ttl_s = int(600 - (now - upd_epoch))
+                if ttl_s > 0:
+                    rl_inners.insert(0, f"\033[0;90mTTL:{ttl_s // 60}m{ttl_s % 60}s\033[0m")
+                else:
+                    age_s = int(now - upd_epoch)
+                    if age_s >= 3600:
+                        # Data is too old — suppress rate-limit display,
+                        # but continue to render historic cost line below
+                        rl_inners.clear()
+                        have_rate_limits = False
+                    else:
+                        age_fmt = f"{age_s // 60}m"
+                        rl_inners.insert(0, f"\033[0;31mstale:{age_fmt}\033[0m")
+
+        # Extra usage (only when session % >= threshold) — separate line
+        extra_sections: list[str] = []
+        if _on("EXTRA") and s_pct:
+            try:
+                if int(s_pct) >= _env_int("EXTRA_SESSION_THRESHOLD", 60):
+                    es = str(usage.get("extra_spent", "") or "")
+                    el = str(usage.get("extra_limit", "") or "")
+                    if es and el:
+                        extra = f"\033[0;90mE:${_fmt_money(es)}/${_fmt_money(el)}\033[0m"
+                        extra_sections.append(_bracket(extra))
+            except ValueError:
+                pass
+
+        rl_line = " ".join(extra_sections) if extra_sections else ""
 
     session_rl = _bracket(" ".join(rl_inners)) if rl_inners else ""
-
-    # Extra usage (only when session % >= threshold) — separate line
-    extra_sections: list[str] = []
-    if _on("EXTRA") and s_pct:
-        try:
-            if int(s_pct) >= _env_int("EXTRA_SESSION_THRESHOLD", 60):
-                es = str(usage.get("extra_spent", "") or "")
-                el = str(usage.get("extra_limit", "") or "")
-                if es and el:
-                    extra = f"\033[0;90mE:${_fmt_money(es)}/${_fmt_money(el)}\033[0m"
-                    extra_sections.append(_bracket(extra))
-        except ValueError:
-            pass
-
-    rl_line = " ".join(extra_sections) if extra_sections else ""
 
     # --- Cost line: 6H/12H/24H/7D/30D ---
     cost_parts: list[str] = []
@@ -731,6 +743,12 @@ def main() -> None:
     try:
         # In-process: usage cache + dcat library (no subprocess)
         usage_data = _fetch_usage(session_id, cwd)
+        # When usage fetch failed, compute costs independently from JSONL files
+        if not usage_data and _on("HISTORIC_COST"):
+            try:
+                usage_data = compute_costs(session_id=session_id, cwd=cwd)
+            except Exception:  # noqa: BLE001
+                pass
         # Always compute project costs from cwd (independent of shared cache)
         if cwd and _on("HISTORIC_COST") and usage_data:
             usage_data.update(compute_project_rolling_costs(cwd))
@@ -777,6 +795,18 @@ def main() -> None:
     )
     sessions = _render_sessions(cwd, now_epoch)
     usage_session_rl, usage_rl, usage_cost = _render_usage(usage_data, now_epoch)
+
+    # Show failure indicator when usage is empty and fetch is in error backoff
+    # Show error when usage is empty and fetch is in backoff, or data is > 1 hour stale
+    usage_stale_1h = False
+    if usage_data:
+        upd = _parse_iso_epoch(str(usage_data.get("last_updated", "") or ""))
+        if upd is not None and (now_epoch - upd) >= 3600:
+            usage_stale_1h = True
+    if usage_stale_1h or (not usage_session_rl and not usage_rl and not usage_cost and check_fetch_backoff()):
+        usage_session_rl = (
+            f"\033[0;34m[\033[0m\033[0;31musage fetch failed\033[0m\033[0;34m]\033[0m"
+        )
 
     top = [s for s in top if s]
     top_str = " ".join(top)

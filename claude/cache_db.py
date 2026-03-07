@@ -233,9 +233,130 @@ def read_usage_cache(max_age: int = 600) -> dict[str, Any] | None:
     return d
 
 
+def _read_usage_stale() -> dict[str, Any] | None:
+    """Read cached usage data regardless of freshness."""
+    conn = get_connection()
+    cols = ", ".join(["id", *_USAGE_FIELDS, "meta_json"])
+    row = conn.execute(f"SELECT {cols} FROM usage WHERE id = 1").fetchone()
+    if row is None:
+        return None
+    return _usage_row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Fetch lock & error backoff
+# ---------------------------------------------------------------------------
+
+_BACKOFF_SCHEDULE = [45, 120, 240]  # seconds, indexed by consecutive failures
+_LOCK_STALE_TIMEOUT = 30  # seconds before a held lock is considered abandoned
+
+
+def try_acquire_fetch_lock() -> bool:
+    """Atomically acquire fetch lock. Returns True if acquired.
+
+    Uses BEGIN IMMEDIATE to serialise concurrent writers so the
+    read-check-write is atomic.  A lock older than _LOCK_STALE_TIMEOUT
+    is treated as abandoned (e.g. crashed process).
+    """
+    conn = get_connection()
+    now = time.time()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        locked_at_str = _get_meta(conn, "fetch_lock_time")
+        if locked_at_str:
+            try:
+                if now - float(locked_at_str) < _LOCK_STALE_TIMEOUT:
+                    conn.execute("COMMIT")
+                    return False
+            except ValueError:
+                pass
+        _set_meta(conn, "fetch_lock_time", str(now))
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def release_fetch_lock() -> None:
+    """Release the fetch lock."""
+    conn = get_connection()
+    conn.execute("DELETE FROM meta WHERE key = 'fetch_lock_time'")
+    conn.commit()
+
+
+def record_fetch_failure() -> None:
+    """Increment consecutive failure count and record time."""
+    conn = get_connection()
+    count_str = _get_meta(conn, "fetch_fail_count") or "0"
+    try:
+        count = int(count_str) + 1
+    except ValueError:
+        count = 1
+    _set_meta(conn, "fetch_fail_count", str(count))
+    _set_meta(conn, "fetch_fail_time", str(time.time()))
+    conn.commit()
+
+
+def clear_fetch_failures() -> None:
+    """Clear failure count on successful fetch."""
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM meta WHERE key IN ('fetch_fail_count', 'fetch_fail_time')"
+    )
+    conn.commit()
+
+
+def check_fetch_backoff() -> bool:
+    """Return True if we should skip fetching due to error backoff."""
+    conn = get_connection()
+    count_str = _get_meta(conn, "fetch_fail_count")
+    if not count_str:
+        return False
+    try:
+        count = int(count_str)
+    except ValueError:
+        return False
+    if count <= 0:
+        return False
+    fail_time_str = _get_meta(conn, "fetch_fail_time")
+    if not fail_time_str:
+        return False
+    try:
+        elapsed = time.time() - float(fail_time_str)
+    except ValueError:
+        return False
+    idx = min(count - 1, len(_BACKOFF_SCHEDULE) - 1)
+    return elapsed < _BACKOFF_SCHEDULE[idx]
+
+
+def _is_fetch_blocked() -> bool:
+    """Check if fetching is blocked by an active lock or error backoff."""
+    if check_fetch_backoff():
+        return True
+    conn = get_connection()
+    locked_at_str = _get_meta(conn, "fetch_lock_time")
+    if locked_at_str:
+        try:
+            if time.time() - float(locked_at_str) < _LOCK_STALE_TIMEOUT:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
 def read_usage_for_statusline() -> dict[str, Any] | None:
-    """Fast read of usage data for statusline (same validation as read_usage_cache)."""
-    return read_usage_cache(600)
+    """Fast read of usage data for statusline (same validation as read_usage_cache).
+
+    When cache is expired but a fetch is blocked (lock held or error backoff),
+    returns stale data to avoid spawning a pointless subprocess.
+    """
+    result = read_usage_cache(600)
+    if result is not None:
+        return result
+    if _is_fetch_blocked():
+        return _read_usage_stale()
+    return None
 
 
 def write_usage_cache(data: dict[str, Any]) -> None:

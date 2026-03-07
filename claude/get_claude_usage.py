@@ -23,7 +23,12 @@ from pathlib import Path
 from typing import Any
 
 from cache_db import (
+    check_fetch_backoff,
+    clear_fetch_failures,
     read_usage_cache,
+    record_fetch_failure,
+    release_fetch_lock,
+    try_acquire_fetch_lock,
     write_usage_cache,
 )
 from pricing import compute_costs
@@ -525,44 +530,60 @@ def main() -> None:
             print(json.dumps(cached, indent=2))
             return
 
-    data, raw = fetch_usage_via_pty()
+    # Check error backoff before attempting expensive PTY fetch
+    if not force and check_fetch_backoff():
+        sys.exit(0)
 
-    if raw_mode:
-        print("--- RAW PTY OUTPUT ---", file=sys.stderr)
-        print(raw, file=sys.stderr)
-        print("--- END RAW ---", file=sys.stderr)
-
-    if "error" in data:
-        print(f"Error: {data['error']}", file=sys.stderr)
-        sys.exit(1)
-
-    if not any(k for k in data if not k.startswith("_")):
-        print("Could not parse usage data", file=sys.stderr)
-        print(f"Raw output:\n{raw}", file=sys.stderr)
-        sys.exit(1)
-
-    data["last_updated"] = datetime.now(tz=timezone.utc).astimezone().isoformat()
+    # Acquire fetch lock to prevent duplicate PTY spawns
+    acquired_lock = force or try_acquire_fetch_lock()
+    if not acquired_lock:
+        sys.exit(0)
 
     try:
-        costs = compute_costs(
-            session_id=session_id_arg, cwd=cwd_arg,
-            session_reset_iso=data.get("session_reset"),
-            week_reset_iso=data.get("week_reset"),
-        )
-        data.update(costs)
-    except Exception as e:  # noqa: BLE001
-        print(f"Warning: cost computation failed: {e}", file=sys.stderr)
+        data, raw = fetch_usage_via_pty()
 
-    write_cache(data)
+        if raw_mode:
+            print("--- RAW PTY OUTPUT ---", file=sys.stderr)
+            print(raw, file=sys.stderr)
+            print("--- END RAW ---", file=sys.stderr)
 
-    cleaned: dict[str, Any] = {}
-    history_removed = clean_history()
-    if history_removed:
-        cleaned["history_lines"] = history_removed
-    if cleaned:
-        data["_cleaned"] = cleaned
+        if "error" in data:
+            record_fetch_failure()
+            print(f"Error: {data['error']}", file=sys.stderr)
+            sys.exit(1)
 
-    print(json.dumps(data, indent=2))
+        if not any(k for k in data if not k.startswith("_")):
+            record_fetch_failure()
+            print("Could not parse usage data", file=sys.stderr)
+            print(f"Raw output:\n{raw}", file=sys.stderr)
+            sys.exit(1)
+
+        clear_fetch_failures()
+        data["last_updated"] = datetime.now(tz=timezone.utc).astimezone().isoformat()
+
+        try:
+            costs = compute_costs(
+                session_id=session_id_arg, cwd=cwd_arg,
+                session_reset_iso=data.get("session_reset"),
+                week_reset_iso=data.get("week_reset"),
+            )
+            data.update(costs)
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: cost computation failed: {e}", file=sys.stderr)
+
+        write_cache(data)
+
+        cleaned: dict[str, Any] = {}
+        history_removed = clean_history()
+        if history_removed:
+            cleaned["history_lines"] = history_removed
+        if cleaned:
+            data["_cleaned"] = cleaned
+
+        print(json.dumps(data, indent=2))
+    finally:
+        if acquired_lock and not force:
+            release_fetch_lock()
 
 
 if __name__ == "__main__":

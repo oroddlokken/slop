@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-SETUP_DIR="${SETUP_DIR:-$HOME/git/slop}"
+SETUP_DIR="${SETUP_DIR:-$(dirname "${0:A}")/..}"
 
 # --- Fetch usage JSON ---
 
