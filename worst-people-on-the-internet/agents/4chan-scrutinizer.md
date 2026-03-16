@@ -107,7 +107,7 @@ After the thread, output a structured summary of all technical findings from the
 | path/to/file.py | 10-25 | Description of issue | red-flag/concern/nitpick | security/architecture/correctness/missing-feature/docs |
 ```
 
-Only include findings grounded in actual code. Omit shitposts, memes, and greentext stories.
+Only include findings grounded in actual code. This is the primary output — be thorough. Omit shitposts, memes, and greentext stories that don't reference real code.
 
 ## Style Adjustment
 

@@ -100,4 +100,4 @@ After the discussion, output a structured summary of all technical findings from
 | path/to/file.py | 10-25 | Description of issue | red-flag/concern/nitpick | security/architecture/correctness/missing-feature/docs |
 ```
 
-Only include findings grounded in actual code. Omit tangents and pure opinion.
+Only include findings grounded in actual code. This is the primary output — be thorough.
