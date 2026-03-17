@@ -1,5 +1,5 @@
 ---
-name: audit-docs
+name: audit-agent-docs
 description: "Audit agent-facing documentation (CLAUDE.md, AGENTS.md, copilot-instructions.md) for redundancies, contradictions, gaps, and misplaced content. Supports Claude Code, OpenAI Codex, and GitHub Copilot. Use when the user wants to review or improve their agent instructions."
 ---
 
@@ -77,6 +77,10 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
    - Are there destructive or irreversible actions the agent could take that lack explicit boundaries? (Consider: deleting data, force-pushing, modifying shared state, sending external messages)
    - Do guardrails include reasoning? Rules with a **why** are more robust — agents generalize from explanations to novel situations instead of following the letter while violating the spirit.
    - Are there contradictions between guardrails and other instructions? (e.g., "wait for approval before modifying X" but a workflow step says "update X automatically")
+   - **Tool restrictions need enforcement, not just prose**: Flag when docs rely solely on prose instructions to restrict dangerous commands (e.g., "never run kubectl delete", "don't git push --force"). Prose restrictions guide cooperative behavior but are not security boundaries — research shows they have high variance and can backfire via the pink elephant effect. For each prose-only tool restriction found:
+     - Recommend reframing as a positive directive with reasoning (e.g., "Use `kubectl get/describe/logs` for cluster inspection. Present a plan and wait for approval before any resource modifications" instead of "NEVER kubectl delete")
+     - Note whether the project has any enforcement layer (hooks, deny rules, sandboxing) backing it up — if not, flag that the restriction is guidance only
+     - Flag stacked negative prohibitions (3+ NEVER/DO NOT rules about tools) — compliance degrades as these accumulate
 
 9. **Cold Start** — Pretend to be a fresh agent with zero context. What assumptions does the documentation make that would confuse a first-time reader? Skip things derivable from code.
 
