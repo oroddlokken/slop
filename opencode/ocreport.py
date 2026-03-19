@@ -4,14 +4,16 @@
 # requires-python = ">=3.12"
 # dependencies = ["orjson", "rich"]
 # ///
-"""Analyze OpenCode token usage and costs from local JSON session logs.
+"""Analyze OpenCode token usage and costs from local session data.
 
 Claude, GPT, and Gemini models via GitHub Copilot are included.
+Reads from both the legacy JSON file storage and the current SQLite database.
 """
 
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -69,6 +71,21 @@ PRICING_HISTORY: list[dict] = [
                 "output": 2e-06,
                 "cache_read": 2.5e-08,
             },
+            "gpt-5-codex": {
+                "input": 1.25e-06,
+                "output": 1e-05,
+                "cache_read": 1.25e-07,
+            },
+            "gpt-5.2-codex": {
+                "input": 1.75e-06,
+                "output": 1.4e-05,
+                "cache_read": 1.75e-07,
+            },
+            "gpt-5.3-codex": {
+                "input": 1.75e-06,
+                "output": 1.4e-05,
+                "cache_read": 1.75e-07,
+            },
             # --- Gemini ---
             "gemini-3-pro-preview": {
                 "input": 2e-06,
@@ -117,7 +134,9 @@ PRICING_HISTORY: list[dict] = [
 # map them to the canonical dash-notation IDs used in PRICING_HISTORY.
 MODEL_ALIASES: dict[str, str] = {
     "claude-opus-4.5": "claude-opus-4-5-20251101",
+    "claude-opus-4.6": "claude-opus-4-6",
     "claude-sonnet-4.5": "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
     "claude-sonnet-4": "claude-sonnet-4-20250514",
     "claude-haiku-4.5": "claude-haiku-4-5-20251001",
 }
@@ -208,9 +227,19 @@ def calc_cost(tokens: TokenCounts, model: str, ts: datetime | None = None) -> fl
 
     return (
         _tiered_cost(tokens.input, prices.get("input", 0.0), prices.get("input_200k"))
-        + _tiered_cost(tokens.output, prices.get("output", 0.0), prices.get("output_200k"))
-        + _tiered_cost(tokens.cache_create, prices.get("cache_create", 0.0), prices.get("cache_create_200k"))
-        + _tiered_cost(tokens.cache_read, prices.get("cache_read", 0.0), prices.get("cache_read_200k"))
+        + _tiered_cost(
+            tokens.output, prices.get("output", 0.0), prices.get("output_200k")
+        )
+        + _tiered_cost(
+            tokens.cache_create,
+            prices.get("cache_create", 0.0),
+            prices.get("cache_create_200k"),
+        )
+        + _tiered_cost(
+            tokens.cache_read,
+            prices.get("cache_read", 0.0),
+            prices.get("cache_read_200k"),
+        )
     )
 
 
@@ -226,16 +255,35 @@ def project_display_name(directory: str) -> str:
     return Path(directory).name
 
 
-def _opencode_data_dir() -> Path:
-    """Return the OpenCode data directory."""
+def _opencode_base_dir() -> Path:
+    """Return the OpenCode base directory.
+
+    If OPENCODE_DATA_DIR is set, use it.  If it points at the legacy
+    ``storage/`` subdirectory (as older versions documented), walk up
+    one level so the DB lookup still works.
+    """
     env = os.environ.get("OPENCODE_DATA_DIR")
     if env:
-        return Path(env)
-    return Path.home() / ".local" / "share" / "opencode" / "storage"
+        p = Path(env)
+        # Detect the old convention where the env var pointed at storage/
+        if p.name == "storage" and (p.parent / "opencode.db").is_file():
+            return p.parent
+        return p
+    return Path.home() / ".local" / "share" / "opencode"
+
+
+def _opencode_storage_dir() -> Path:
+    """Return the legacy JSON file storage directory."""
+    return _opencode_base_dir() / "storage"
+
+
+def _opencode_db_path() -> Path:
+    """Return the path to the OpenCode SQLite database."""
+    return _opencode_base_dir() / "opencode.db"
 
 
 def _load_project_map(data_dir: Path) -> dict[str, str]:
-    """Load project ID -> directory mapping from project files."""
+    """Load project ID -> directory mapping from legacy JSON project files."""
     project_dir = data_dir / "project"
     mapping: dict[str, str] = {}
     if not project_dir.is_dir():
@@ -255,7 +303,7 @@ def _load_project_map(data_dir: Path) -> dict[str, str]:
 
 
 def _load_session_map(data_dir: Path) -> dict[str, dict]:
-    """Load session ID -> metadata mapping from session files."""
+    """Load session ID -> metadata mapping from legacy JSON session files."""
     session_base = data_dir / "session"
     mapping: dict[str, dict] = {}
     if not session_base.is_dir():
@@ -280,25 +328,55 @@ def _load_session_map(data_dir: Path) -> dict[str, dict]:
     return mapping
 
 
-def load_all_records(
-    since: datetime | None = None,
-    until: datetime | None = None,
-    project_filter: str | None = None,
-) -> list[UsageRecord]:
-    """Load and deduplicate all usage records from OpenCode message files.
+def _load_project_map_db(db_path: Path) -> dict[str, str]:
+    """Load project ID -> worktree mapping from the SQLite database."""
+    mapping: dict[str, str] = {}
+    if not db_path.is_file():
+        return mapping
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        for row in con.execute("SELECT id, worktree FROM project"):
+            mapping[row[0]] = row[1]
+        con.close()
+    except sqlite3.Error:
+        pass
+    return mapping
 
-    Only includes Claude, GPT, and Gemini models from GitHub Copilot.
-    """
-    data_dir = _opencode_data_dir()
+
+def _load_session_map_db(db_path: Path) -> dict[str, dict]:
+    """Load session ID -> metadata mapping from the SQLite database."""
+    mapping: dict[str, dict] = {}
+    if not db_path.is_file():
+        return mapping
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        for row in con.execute("SELECT id, project_id, directory, title FROM session"):
+            mapping[row[0]] = {
+                "projectID": row[1],
+                "directory": row[2],
+                "title": row[3],
+            }
+        con.close()
+    except sqlite3.Error:
+        pass
+    return mapping
+
+
+def _load_records_from_json(
+    data_dir: Path,
+    project_map: dict[str, str],
+    session_map: dict[str, dict],
+    since: datetime | None,
+    until: datetime | None,
+    project_filter: str | None,
+    seen_ids: set[str],
+) -> list[UsageRecord]:
+    """Load usage records from legacy JSON message files."""
     message_base = data_dir / "message"
     if not message_base.is_dir():
         return []
 
-    project_map = _load_project_map(data_dir)
-    session_map = _load_session_map(data_dir)
-
     records: list[UsageRecord] = []
-    seen_ids: set[str] = set()
 
     for sess_dir in message_base.iterdir():
         if not sess_dir.is_dir():
@@ -360,14 +438,160 @@ def load_all_records(
                 continue
 
             seen_ids.add(message_id)
-            records.append(UsageRecord(
-                message_id=message_id,
-                model=model_id,
-                tokens=tokens,
-                timestamp=ts,
-                session_id=session_id,
-                project=project,
-            ))
+            records.append(
+                UsageRecord(
+                    message_id=message_id,
+                    model=model_id,
+                    tokens=tokens,
+                    timestamp=ts,
+                    session_id=session_id,
+                    project=project,
+                )
+            )
+
+    return records
+
+
+def _load_records_from_db(
+    db_path: Path,
+    project_map: dict[str, str],
+    session_map: dict[str, dict],
+    since: datetime | None,
+    until: datetime | None,
+    project_filter: str | None,
+    seen_ids: set[str],
+) -> list[UsageRecord]:
+    """Load usage records from the SQLite database."""
+    if not db_path.is_file():
+        return []
+
+    records: list[UsageRecord] = []
+
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+
+    try:
+        cursor = con.execute("SELECT id, session_id, data FROM message")
+        for row in cursor:
+            message_id, session_id, data_json = row
+            try:
+                data = orjson.loads(data_json)
+            except (orjson.JSONDecodeError, ValueError):
+                continue
+
+            if data.get("role") != "assistant":
+                continue
+            if data.get("providerID") != "github-copilot":
+                continue
+
+            model_id = data.get("modelID", "")
+            if not is_supported_model(model_id):
+                continue
+
+            if not message_id or message_id in seen_ids:
+                continue
+
+            tokens_data = data.get("tokens", {})
+            if not tokens_data.get("input", 0) and not tokens_data.get("output", 0):
+                continue
+
+            cache = tokens_data.get("cache", {})
+            tokens = TokenCounts(
+                input=tokens_data.get("input", 0),
+                output=tokens_data.get("output", 0),
+                cache_create=cache.get("write", 0),
+                cache_read=cache.get("read", 0),
+            )
+
+            time_data = data.get("time", {})
+            created_ms = time_data.get("created")
+            if not created_ms:
+                continue
+            ts = datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
+
+            if since and ts < since:
+                continue
+            if until and ts > until:
+                continue
+
+            # Resolve project name
+            session_meta = session_map.get(session_id, {})
+            project_id = session_meta.get("projectID", "")
+            directory = session_meta.get("directory", "")
+            if not directory and project_id:
+                directory = project_map.get(project_id, "")
+            project = project_display_name(directory)
+
+            if project_filter and project_filter.lower() not in project.lower():
+                continue
+
+            seen_ids.add(message_id)
+            records.append(
+                UsageRecord(
+                    message_id=message_id,
+                    model=model_id,
+                    tokens=tokens,
+                    timestamp=ts,
+                    session_id=session_id,
+                    project=project,
+                )
+            )
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+
+    return records
+
+
+def load_all_records(
+    since: datetime | None = None,
+    until: datetime | None = None,
+    project_filter: str | None = None,
+) -> list[UsageRecord]:
+    """Load and deduplicate all usage records from OpenCode data.
+
+    Reads from both the legacy JSON file storage and the current SQLite
+    database, deduplicating by message ID across both sources.
+    Only includes Claude, GPT, and Gemini models from GitHub Copilot.
+    """
+    storage_dir = _opencode_storage_dir()
+    db_path = _opencode_db_path()
+
+    # Build project and session maps from both sources, DB wins on conflicts
+    project_map = _load_project_map(storage_dir)
+    project_map.update(_load_project_map_db(db_path))
+
+    session_map = _load_session_map(storage_dir)
+    session_map.update(_load_session_map_db(db_path))
+
+    seen_ids: set[str] = set()
+
+    # Load from DB first (preferred / current source)
+    records = _load_records_from_db(
+        db_path,
+        project_map,
+        session_map,
+        since,
+        until,
+        project_filter,
+        seen_ids,
+    )
+
+    # Also load from legacy JSON files (dedup handled via shared seen_ids)
+    records.extend(
+        _load_records_from_json(
+            storage_dir,
+            project_map,
+            session_map,
+            since,
+            until,
+            project_filter,
+            seen_ids,
+        )
+    )
 
     records.sort(key=lambda r: r.timestamp)
     return records
@@ -446,10 +670,13 @@ def _token_row(b: AggBucket) -> list:
 
 # --- Reports ---
 
+
 def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
     """Print daily usage report."""
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
-    model_buckets: dict[str, dict[str, AggBucket]] = defaultdict(lambda: defaultdict(AggBucket))
+    model_buckets: dict[str, dict[str, AggBucket]] = defaultdict(
+        lambda: defaultdict(AggBucket)
+    )
 
     for rec in records:
         day = rec.timestamp.astimezone().strftime("%Y-%m-%d")
@@ -465,7 +692,13 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
             mb.cost += calc_cost(rec.tokens, rec.model, rec.timestamp)
             mb.count += 1
 
-    table = Table(title=f"Daily Usage ({len(buckets)} days)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
+    table = Table(
+        title=f"Daily Usage ({len(buckets)} days)",
+        title_style="bold",
+        box=box.ROUNDED,
+        expand=False,
+        show_lines=False,
+    )
     table.add_column("Date", style="white", no_wrap=True)
     _add_token_columns(table)
     table.add_column("Models", style="dim", no_wrap=True)
@@ -497,7 +730,11 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
         avg_cost = total_agg.cost / n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
             "",
             "per day",
@@ -521,7 +758,13 @@ def report_monthly(records: list[UsageRecord]) -> None:
         b.models.add(rec.model)
         b.count += 1
 
-    table = Table(title=f"Monthly Usage ({len(buckets)} months)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
+    table = Table(
+        title=f"Monthly Usage ({len(buckets)} months)",
+        title_style="bold",
+        box=box.ROUNDED,
+        expand=False,
+        show_lines=False,
+    )
     table.add_column("Month", style="white", no_wrap=True)
     _add_token_columns(table)
     table.add_column("Models", style="dim", no_wrap=True)
@@ -548,7 +791,11 @@ def report_monthly(records: list[UsageRecord]) -> None:
         avg_cost = total_agg.cost / n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
             "",
             "per month",
@@ -578,7 +825,13 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     else:
         shown = str(len(sorted_projects))
 
-    table = Table(title=f"Projects ({shown})", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
+    table = Table(
+        title=f"Projects ({shown})",
+        title_style="bold",
+        box=box.ROUNDED,
+        expand=False,
+        show_lines=False,
+    )
     table.add_column("Project", style="magenta", no_wrap=True)
     _add_token_columns(table)
     table.add_column("Models", style="dim", no_wrap=True)
@@ -605,7 +858,11 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
         avg_cost = total_agg.cost / n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
             "",
             f"per project (top {n})",
@@ -617,7 +874,11 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
         all_avg = all_cost / all_n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
             Text(fmt_cost(all_avg), style=cost_style(all_avg)),
             "",
             f"per project (all {all_n})",
@@ -642,7 +903,9 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         b.models.add(rec.model)
         b.count += 1
 
-        meta = session_meta.setdefault(sid, {"project": rec.project, "first": rec.timestamp, "last": rec.timestamp})
+        meta = session_meta.setdefault(
+            sid, {"project": rec.project, "first": rec.timestamp, "last": rec.timestamp}
+        )
         if rec.timestamp < meta["first"]:
             meta["first"] = rec.timestamp
         if rec.timestamp > meta["last"]:
@@ -657,7 +920,13 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
     else:
         shown = str(len(buckets))
 
-    table = Table(title=f"Sessions ({shown})", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
+    table = Table(
+        title=f"Sessions ({shown})",
+        title_style="bold",
+        box=box.ROUNDED,
+        expand=False,
+        show_lines=False,
+    )
     table.add_column("Session", style="dim", no_wrap=True)
     table.add_column("Project", style="magenta", no_wrap=True)
     table.add_column("Date", style="white", no_wrap=True)
@@ -709,7 +978,11 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         avg_cost = total_agg.cost / n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
             "",
             f"per session (top {n})",
@@ -721,7 +994,11 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         all_avg = all_cost / all_n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "",
+            "",
+            "",
+            "",
+            "",
             Text(fmt_cost(all_avg), style=cost_style(all_avg)),
             "",
             f"per session (all {all_n})",
@@ -737,19 +1014,21 @@ def report_json(records: list[UsageRecord]) -> None:
     """Output all records as JSON for programmatic use."""
     output = []
     for rec in records:
-        output.append({
-            "message_id": rec.message_id,
-            "model": rec.model,
-            "timestamp": rec.timestamp.isoformat(),
-            "session_id": rec.session_id,
-            "project": rec.project,
-            "input_tokens": rec.tokens.input,
-            "output_tokens": rec.tokens.output,
-            "cache_creation_tokens": rec.tokens.cache_create,
-            "cache_read_tokens": rec.tokens.cache_read,
-            "total_tokens": rec.tokens.total,
-            "cost_usd": round(calc_cost(rec.tokens, rec.model, rec.timestamp), 6),
-        })
+        output.append(
+            {
+                "message_id": rec.message_id,
+                "model": rec.model,
+                "timestamp": rec.timestamp.isoformat(),
+                "session_id": rec.session_id,
+                "project": rec.project,
+                "input_tokens": rec.tokens.input,
+                "output_tokens": rec.tokens.output,
+                "cache_creation_tokens": rec.tokens.cache_create,
+                "cache_read_tokens": rec.tokens.cache_read,
+                "total_tokens": rec.tokens.total,
+                "cost_usd": round(calc_cost(rec.tokens, rec.model, rec.timestamp), 6),
+            }
+        )
     print(json.dumps(output, indent=2))
 
 
@@ -765,10 +1044,10 @@ def main() -> None:
         description="Analyze OpenCode token usage and costs (Claude, GPT, Gemini via GitHub Copilot).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  ocreport.py daily --since 20260201\n"
-               "  ocreport.py monthly\n"
-               "  ocreport.py session --limit 10\n"
-               "  ocreport.py daily --breakdown --project myapp\n",
+        "  ocreport.py daily --since 20260201\n"
+        "  ocreport.py monthly\n"
+        "  ocreport.py session --limit 10\n"
+        "  ocreport.py daily --breakdown --project myapp\n",
     )
     sub = parser.add_subparsers(dest="command", help="Report type")
 
@@ -776,14 +1055,33 @@ def main() -> None:
         p = sub.add_parser(name)
         p.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
-        p.add_argument("--project", "-p", help="Filter by project name (substring match)")
+        p.add_argument(
+            "--project", "-p", help="Filter by project name (substring match)"
+        )
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         if name == "daily":
-            p.add_argument("--breakdown", "-b", action="store_true", help="Show per-model breakdown")
+            p.add_argument(
+                "--breakdown",
+                "-b",
+                action="store_true",
+                help="Show per-model breakdown",
+            )
         if name == "project":
-            p.add_argument("--limit", "-l", type=int, default=20, help="Max projects to show (0=all)")
+            p.add_argument(
+                "--limit",
+                "-l",
+                type=int,
+                default=20,
+                help="Max projects to show (0=all)",
+            )
         if name == "session":
-            p.add_argument("--limit", "-l", type=int, default=20, help="Max sessions to show (0=all)")
+            p.add_argument(
+                "--limit",
+                "-l",
+                type=int,
+                default=20,
+                help="Max sessions to show (0=all)",
+            )
 
     parser.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
