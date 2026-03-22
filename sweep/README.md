@@ -4,7 +4,7 @@ Meta design review. Spins up parallel agents — each reviewing through a differ
 
 ## Prerequisites
 
-This skill is an orchestrator only. It requires the [impeccable](https://github.com/helgesverre/impeccable) design skills to be installed (`audit`, `critique`, `harden`, `optimize`, `polish`, `clarify`, `arrange`, `typeset`, `colorize`, `ux`). Sweep dispatches agents that read each skill's SKILL.md for review criteria.
+This skill is an orchestrator only. It requires the [impeccable](https://impeccable.style/) design skills to be installed (`audit`, `critique`, `harden`, `optimize`, `polish`, `clarify`, `arrange`, `typeset`, `colorize`, `ux`). Sweep dispatches agents that read each skill's SKILL.md for review criteria.
 
 ## What you get
 
