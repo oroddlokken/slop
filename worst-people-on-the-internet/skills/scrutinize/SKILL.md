@@ -1,7 +1,6 @@
 ---
 name: scrutinize
 description: "Use when the user wants to stress-test code quality through simulated community reactions (Reddit, HN, Twitter, Lobsters, /g/, Fediverse, Stack Overflow, LinkedIn, GitHub Issues, YouTube) and distill into action points."
-user_invocable: true
 ---
 
 # Scrutinize
@@ -41,15 +40,22 @@ Ask the user (if not already clear):
 - **Verbose**: `yes` | `no` (default: `no`) — When `yes`, show the full community discussions before the distilled action points. When `no`, skip straight to the action points (agent outputs are still used internally for distilling, just not shown to the user).
 - **Subreddit** (Reddit mode only): Auto-detect from project language if not specified (e.g., Rust project → r/rust, Python → r/python, otherwise r/programming)
 
+### Step 2.5: Prescan the Codebase (orchestrator does this once)
+
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 10 agents each independently scanning the same files.
+
+1. Replace `{focus}` in `scan-steps.md`
+2. Follow the scan procedure — read manifests, source files, CI/CD, git log, etc.
+3. Format all collected file contents into the snapshot format specified in `scan-steps.md`
+4. Store the result as `{codebase_snapshot}` for use in Step 3
+
 ### Step 3: Launch Agents
 
 Read the agent instruction files and spin up agents using the Agent tool. In Full mode, launch all ten in parallel. In single mode, launch just the one.
 
-Before launching agents, read `agents/scan-steps.md` once — its contents will be injected into each agent prompt.
-
 For each agent:
-1. Read its instruction file from `agents/`
-2. Replace `{path}`, `{style}`, `{subreddit}` (Reddit only), `{focus}` (with focus instruction or empty string), and `{scan_steps}` (with the contents of scan-steps.md) with actual values
+1. Read its instruction file from this skill's directory
+2. Replace `{path}`, `{style}`, `{subreddit}` (Reddit only), `{focus}` (with focus instruction or empty string), and `{codebase_snapshot}` (with the snapshot from Step 2.5) with actual values
 3. For `{focus}`: if the user specified a focus area, replace with the focus block below. If no focus was specified, replace `{focus}` with an empty string.
 4. If dcat issues were found, append them to the agent prompt under a `## Known Issues (skip these)` section
 5. If **verbose=no**: append the compact mode block below to the agent prompt
@@ -76,16 +82,16 @@ Concentrate your analysis primarily on **{area}**. During the scan, go deeper on
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reddit**: Read `agents/reddit-scrutinizer.md`
-**Hacker News**: Read `agents/hn-scrutinizer.md`
-**Twitter/X**: Read `agents/twitter-scrutinizer.md`
-**Lobsters**: Read `agents/lobsters-scrutinizer.md`
-**/g/**: Read `agents/4chan-scrutinizer.md`
-**Fediverse**: Read `agents/fediverse-scrutinizer.md`
-**Stack Overflow**: Read `agents/stackoverflow-scrutinizer.md`
-**LinkedIn**: Read `agents/linkedin-scrutinizer.md`
-**GitHub Issues**: Read `agents/github-issues-scrutinizer.md`
-**YouTube**: Read `agents/youtube-scrutinizer.md`
+**Reddit**: Read `reddit-scrutinizer.md`
+**Hacker News**: Read `hn-scrutinizer.md`
+**Twitter/X**: Read `twitter-scrutinizer.md`
+**Lobsters**: Read `lobsters-scrutinizer.md`
+**/g/**: Read `4chan-scrutinizer.md`
+**Fediverse**: Read `fediverse-scrutinizer.md`
+**Stack Overflow**: Read `stackoverflow-scrutinizer.md`
+**LinkedIn**: Read `linkedin-scrutinizer.md`
+**GitHub Issues**: Read `github-issues-scrutinizer.md`
+**YouTube**: Read `youtube-scrutinizer.md`
 
 ### Step 4: Present Results
 
@@ -158,6 +164,7 @@ After outputting, ask the user if they want to start working on any of the items
 ## Rules
 
 - **In Full mode, always run all ten in parallel** — never sequentially
-- **Each agent scans independently** — don't pass pre-scanned data between them
+- **The orchestrator prescans the codebase once (Step 2.5) and passes the snapshot to all agents** — agents do NOT scan independently
+- **Agents inherit the default model** — do not override with a specific model.
 - **Distill runs after all agents complete** — it needs the full picture
 - **Don't skip the distill step** — the action points are the whole point

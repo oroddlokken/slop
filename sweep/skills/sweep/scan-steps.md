@@ -1,6 +1,10 @@
-## Scan the Codebase
+## Prescan the Codebase (orchestrator step)
 
-Build a project dossier by reading key files. Focus on frontend/UI code. Prioritize in this order — stop early if the codebase is large (>50 files):
+This file is executed by the **orchestrator** (the main Claude Code session), NOT by individual review agents. The orchestrator reads files once and passes the results to all agents as a snapshot.
+
+### Scan Procedure
+
+Focus on frontend/UI code. Read broadly to capture enough for agents to catch real issues. Prioritize in this order — stop early if the codebase is large (>50 files):
 
 1. Read manifest files (package.json, composer.json, Gemfile, etc.) to understand the stack
 2. Detect framework: React, Vue, Svelte, Angular, Next.js, Nuxt, Astro, etc.
@@ -12,21 +16,27 @@ Build a project dossier by reading key files. Focus on frontend/UI code. Priorit
 8. Check for accessibility setup: eslint-plugin-jsx-a11y, axe-core, pa11y, etc.
 9. Check for i18n setup: i18next, react-intl, FormatJS, etc.
 
-### What to Look For
-
-When reading each UI file, note:
-- Component structure and nesting depth
-- How styles are applied (inline, classes, tokens, hardcoded values)
-- Interactive element states (hover, focus, active, disabled, loading, error)
-- Responsive handling (breakpoints, media queries, container queries)
-- Accessibility (semantic HTML, ARIA, alt text, labels, keyboard handling)
-- Typography usage (font families, sizes, weights, line heights)
-- Color usage (tokens vs hardcoded, contrast, consistency)
-- Spacing patterns (consistent scale vs arbitrary values)
-- Animation/transition usage
-- Error and empty states
-- Loading states
-
 {focus}
 
-All findings MUST reference actual code with file paths and line numbers.
+### Build the Snapshot
+
+After reading, format ALL collected file contents into a single snapshot block. This is what gets passed to agents via the `{codebase_snapshot}` placeholder.
+
+Format each file as:
+
+````
+### file: <relative_path>
+```<ext>
+<full file contents>
+```
+````
+
+Include:
+- All manifest and config files read
+- Design system / theme files
+- All UI source files read
+- Design context files
+
+Omit:
+- Files matching `.env*`, `*.secrets`, `*credentials*.json`, `*.key`, `*.pem`, `secrets.yml` — list by name only
+- Binary files — list by name only

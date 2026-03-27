@@ -1,8 +1,12 @@
 Scrutinize the codebase at {path} as Hacker News would. Style: {style}.
 
-## Step 1: Scan the Codebase
+## Codebase Snapshot
 
-{scan_steps}
+The orchestrator has already scanned the codebase. Here are the files:
+
+{codebase_snapshot}
+
+You may use Grep, Glob, and Read for targeted follow-up, but do NOT do a broad scan — the snapshot is your primary input.
 
 ## Step 2: Synthesize Evidence
 

@@ -95,21 +95,29 @@ Ask the user (if not already clear):
 - If all agents return zero findings, output "No issues found" and skip the distill step.
 - If some agents fail or timeout, distill with available results and note which reviewers were skipped.
 
+### Step 2.5: Prescan the Codebase (orchestrator does this once)
+
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 12 agents each independently scanning the same files.
+
+1. Replace `{languages}` and `{focus}` in `scan-steps.md`
+2. Follow the scan procedure — read manifests, source files, CI/CD, git log, etc.
+3. Format all collected file contents into the snapshot format specified in `scan-steps.md`
+4. Store the result as `{codebase_snapshot}` for use in Step 3
+
 ### Step 3: Launch Agents
 
-Use the agent template (`agent.md`) and the shared scan steps (`scan-steps.md`). Launch agents using the Agent tool — all in parallel for Full mode.
+Use the agent template (`agent.md`). Launch agents using the Agent tool — all in parallel for Full mode.
 
-**Placeholder resolution order** (scan-steps.md has nested placeholders):
-1. In `scan-steps.md`: replace `{languages}` and `{focus}`
-2. In `agent.md`: replace `{scan_steps}` with the result from step 1
-3. In `agent.md`: replace `{reviewer}`, `{path}`, `{skill_path}`, `{focus}`, `{known_issues}`
+**Placeholder resolution order:**
+1. In `agent.md`: replace `{codebase_snapshot}` with the snapshot built in Step 2.5
+2. In `agent.md`: replace `{reviewer}`, `{path}`, `{skill_path}`, `{languages}`, `{focus}`, `{known_issues}`
 
 For each reviewer:
-1. Read `agent.md` and `scan-steps.md` from this skill's directory
+1. Read `agent.md` from this skill's directory
 2. Replace `{reviewer}` with the reviewer name (e.g., `duplicates`)
 3. Replace `{path}` with the target path
 4. Replace `{skill_path}` with the absolute path `~/.claude/skills/{reviewer}/SKILL.md`. If the file does not exist, skip that reviewer and warn the user.
-5. Replace `{scan_steps}` with the contents of `scan-steps.md` (after resolving its placeholders)
+5. Replace `{codebase_snapshot}` with the snapshot from Step 2.5
 6. Replace `{languages}` with the confirmed language list from the prescan (e.g., `Python, Shell, SQL, YAML`)
 7. If the user specified a focus area, replace `{focus}` with the focus block below. If no focus was specified, replace `{focus}` with an empty string.
 8. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with an empty string.
@@ -151,5 +159,6 @@ After all agents complete, read `distill.md` from this skill's directory and fol
 ## Rules
 
 - In Full mode, run all 12 agents in parallel for maximum throughput.
-- Each agent scans independently — do not pass pre-scanned data between them.
+- The orchestrator prescans the codebase once (Step 2.5) and passes the snapshot to all agents — agents do NOT scan independently.
+- Agents inherit the default model — do not override with a specific model.
 - Always run the distill step after all agents complete — raw agent output is overwhelming without deduplication and prioritization.

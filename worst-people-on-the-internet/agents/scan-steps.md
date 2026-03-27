@@ -1,4 +1,8 @@
-## Scan the Codebase
+## Prescan the Codebase (orchestrator step)
+
+This file is executed by the **orchestrator** (the main Claude Code session), NOT by individual scrutinize agents. The orchestrator reads files once and passes the results to all agents as a snapshot.
+
+### Scan Procedure
 
 Build a project dossier by reading key files. Prioritize in this order — stop early if the codebase is large (>50 files):
 
@@ -33,4 +37,28 @@ Focus findings on what matters most for the target community. Not every check ne
 
 {focus}
 
-All findings in subsequent steps MUST reference actual code with file paths and line ranges.
+### Build the Snapshot
+
+After reading, format ALL collected file contents into a single snapshot block. This is what gets passed to agents via the `{codebase_snapshot}` placeholder.
+
+Format each file as:
+
+````
+### file: <relative_path>
+```<ext>
+<full file contents>
+```
+````
+
+Include:
+- All manifest and config files read
+- README excerpt
+- All source files read
+- CI/CD config files
+- License file
+- Git log output (as `### file: git-log.txt`)
+- Git shortlog output (as `### file: git-shortlog.txt`)
+
+Omit:
+- Files matching `.env*`, `*.secrets`, `*credentials*.json`, `*.key`, `*.pem`, `secrets.yml` — list by name only
+- Binary files — list by name only

@@ -78,6 +78,29 @@ Detect which languages are in scope so agents fuzz all of them:
 
 Check if the project uses **dcat**. Run `which dcat`. If the command succeeds AND a `.dogcats/` directory exists at the target path, run `dcat list --agent-only` to get tracked issues. Pass this list to each agent so they skip already-known problems. If either check fails, skip this step.
 
+### Step 4.5: Prescan the Codebase (orchestrator does this once)
+
+The orchestrator (you) reads the codebase once and builds a `{codebase_snapshot}` that gets passed to every fuzzer agent. This avoids ~20 agents each independently scanning the same files.
+
+1. Read manifest files (pyproject.toml, package.json, Cargo.toml, go.mod, etc.)
+2. Identify entry points: CLI parsers, API routes, event handlers, main functions, form handlers
+3. Identify data boundaries: where external input enters the system (HTTP requests, file reads, env vars, stdin, database results, message queues)
+4. Read key source files across all in-scope languages, focusing on: input parsing/validation, data transformation, error handling, config loading, external service integrations, auth/authz logic
+5. Check for existing validation: schemas, validators, type guards, assert statements, middleware
+6. Run `git log --oneline -15`
+7. Format all collected file contents into a snapshot block:
+
+````
+### file: <relative_path>
+```<ext>
+<full file contents>
+```
+````
+
+Include all source files read. Omit `.env*`, `*.secrets`, `*.key`, `*.pem` (list by name only).
+
+Store the result as `{codebase_snapshot}`.
+
 ### Step 5: Launch Agents
 
 Read `fuzzer-agent.md` from this skill's directory. For each selected fuzzer:
@@ -86,9 +109,10 @@ Read `fuzzer-agent.md` from this skill's directory. For each selected fuzzer:
 2. Replace `{attack_angle}` with the attack angle description from the table above
 3. Replace `{path}` with the target path
 4. Replace `{languages}` with the confirmed language list
-5. If the user specified a focus area, replace `{focus}` with the focus block below, replacing `{area}` within it with the user's specified area. If no focus was specified, replace `{focus}` with empty string.
-6. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with empty string.
-7. Launch all agents in parallel using the Agent tool
+5. Replace `{codebase_snapshot}` with the snapshot from Step 4.5
+6. If the user specified a focus area, replace `{focus}` with the focus block below, replacing `{area}` within it with the user's specified area. If no focus was specified, replace `{focus}` with empty string.
+7. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with empty string.
+8. Launch all agents in parallel using the Agent tool
 
 **Focus block** (inserted when focus is set — replace `{area}` with the user's focus area):
 ```
@@ -114,6 +138,7 @@ After all agents complete, read `distill.md` from this skill's directory and fol
 ## Rules
 
 - **Launch all selected fuzzers in a single parallel batch.** Sequential launching prevents timeout-related race condition detection and wastes time.
-- **Each agent discovers the codebase from scratch and probes for vulnerabilities independently.** Pre-scan context (languages, path, known issues) is passed to all agents, but agents do not share findings mid-run — shared vulnerability data biases results and hides attack surfaces.
+- **The orchestrator prescans the codebase once (Step 4.5) and passes the snapshot to all agents** — agents do NOT scan independently. Agents do not share findings mid-run.
+- **Agents inherit the default model** — do not override with a specific model.
 - **Agents analyze code without modifying files.** This preserves codebase integrity and lets the user review findings before acting.
 - **Run distillation only after all agents complete.** Distillation needs the full picture to deduplicate and prioritize accurately.

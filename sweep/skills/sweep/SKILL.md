@@ -49,16 +49,25 @@ Ask the user (if not already clear):
 - **Path**: Which directory to review (default: current working directory)
 - **Focus** (optional): A specific area to concentrate on — e.g., `accessibility`, `dark-mode`, `mobile`, `forms`, `navigation`, `typography`, `animations`. When set, agents spend ~3x more attention on this area.
 
+### Step 2.5: Prescan the Codebase (orchestrator does this once)
+
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 10 agents each independently scanning the same files.
+
+1. Replace `{focus}` in `scan-steps.md`
+2. Follow the scan procedure — read manifests, UI files, design system files, etc.
+3. Format all collected file contents into the snapshot format specified in `scan-steps.md`
+4. Store the result as `{codebase_snapshot}` for use in Step 3
+
 ### Step 3: Launch Agents
 
-Use a single agent template (`sweep-agent.md`) and the shared scan steps (`scan-steps.md`). Launch agents using the Agent tool — all in parallel for Full mode.
+Use a single agent template (`sweep-agent.md`). Launch agents using the Agent tool — all in parallel for Full mode.
 
 For each reviewer:
-1. Read `sweep-agent.md` and `scan-steps.md` from this skill's directory
+1. Read `sweep-agent.md` from this skill's directory
 2. Replace `{reviewer}` with the reviewer name (e.g., `audit`)
 3. Replace `{path}` with the target path
 4. Replace `{skill_path}` with the path to the existing skill's SKILL.md (e.g., `skills/audit/SKILL.md`)
-5. Replace `{scan_steps}` with the contents of `scan-steps.md`
+5. Replace `{codebase_snapshot}` with the snapshot from Step 2.5
 6. If the user specified a focus area, replace `{focus}` with the focus block below. If no focus was specified, replace `{focus}` with an empty string.
 7. If dcat issues were found, append them to the agent prompt under a `## Known Issues (skip these)` section
 8. Pass the result as the agent prompt
@@ -151,7 +160,8 @@ After outputting, ask the user if they want to start working on any of the items
 ## Rules
 
 - **In Full mode, always run all 10 in parallel** — never sequentially
-- **Each agent scans independently** — don't pass pre-scanned data between them
+- **The orchestrator prescans the codebase once (Step 2.5) and passes the snapshot to all agents** — agents do NOT scan independently
+- **Agents inherit the default model** — do not override with a specific model.
 - **Agents ONLY audit — they never modify code**
 - **Distill runs after all agents complete** — it needs the full picture
 - **Don't skip the distill step** — the action points are the whole point
