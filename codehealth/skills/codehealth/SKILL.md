@@ -91,7 +91,7 @@ Ask the user (if not already clear):
 ### Error Handling
 
 - If `git ls-files` fails (not a git repo, permissions), fall back to `find {path} -type f` and filter by extension.
-- If a reviewer's SKILL.md does not exist at the expected path, skip that reviewer and warn the user.
+- If a reviewer's criteria file does not exist at the expected path, skip that reviewer and warn the user.
 - If all agents return zero findings, output "No issues found" and skip the distill step.
 - If some agents fail or timeout, distill with available results and note which reviewers were skipped.
 
@@ -110,13 +110,13 @@ Use the agent template (`agent.md`). Launch agents using the Agent tool — all 
 
 **Placeholder resolution order:**
 1. In `agent.md`: replace `{codebase_snapshot}` with the snapshot built in Step 2.5
-2. In `agent.md`: replace `{reviewer}`, `{path}`, `{skill_path}`, `{languages}`, `{focus}`, `{known_issues}`
+2. In `agent.md`: replace `{reviewer}`, `{path}`, `{reviewer_criteria}`, `{languages}`, `{focus}`, `{known_issues}`
 
 For each reviewer:
 1. Read `agent.md` from this skill's directory
 2. Replace `{reviewer}` with the reviewer name (e.g., `duplicates`)
 3. Replace `{path}` with the target path
-4. Replace `{skill_path}` with the absolute path `~/.claude/skills/{reviewer}/SKILL.md`. If the file does not exist, skip that reviewer and warn the user.
+4. Read the reviewer's criteria file from `reviewers/{reviewer}.md` in this skill's directory. If the file does not exist, skip that reviewer and warn the user. Replace `{reviewer_criteria}` with the file contents.
 5. Replace `{codebase_snapshot}` with the snapshot from Step 2.5
 6. Replace `{languages}` with the confirmed language list from the prescan (e.g., `Python, Shell, SQL, YAML`)
 7. If the user specified a focus area, replace `{focus}` with the focus block below. If no focus was specified, replace `{focus}` with an empty string.
@@ -133,24 +133,7 @@ Concentrate your analysis primarily on **{area}**. During the scan, go deeper on
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reviewer to skill path mapping:**
-
-| Reviewer | Reads criteria from |
-|----------|-------------------|
-| duplicates | `skills/duplicates/SKILL.md` |
-| extract-logic | `skills/extract-logic/SKILL.md` |
-| simplify-code | `skills/simplify-code/SKILL.md` |
-| hardcoded | `skills/hardcoded/SKILL.md` |
-| error-gaps | `skills/error-gaps/SKILL.md` |
-| complexity | `skills/complexity/SKILL.md` |
-| query-smells | `skills/query-smells/SKILL.md` |
-| dead-code | `skills/dead-code/SKILL.md` |
-| naming | `skills/naming/SKILL.md` |
-| dep-hygiene | `skills/dep-hygiene/SKILL.md` |
-| test-gaps | `skills/test-gaps/SKILL.md` |
-| type-structs | `skills/type-structs/SKILL.md` |
-
-All paths resolve to `~/.claude/skills/{reviewer}/SKILL.md`.
+**Reviewer criteria files** are in this skill's `reviewers/` directory: `duplicates.md`, `extract-logic.md`, `simplify-code.md`, `hardcoded.md`, `error-gaps.md`, `complexity.md`, `query-smells.md`, `dead-code.md`, `naming.md`, `dep-hygiene.md`, `test-gaps.md`, `type-structs.md`.
 
 ### Step 4: Distill
 

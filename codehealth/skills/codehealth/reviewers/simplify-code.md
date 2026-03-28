@@ -1,15 +1,6 @@
----
-name: simplify-code
-description: "Find over-engineered solutions, unnecessary abstractions, and convoluted logic. Suggests how to make code easier to reason about by replacing complexity with straightforward approaches."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
 
 # Simplify Code
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for over-engineered solutions and suggest simpler alternatives. The goal: every piece of code should be as simple as possible for what it does — no simpler, no more complex.
 

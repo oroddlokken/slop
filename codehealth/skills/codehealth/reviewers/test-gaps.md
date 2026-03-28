@@ -1,15 +1,5 @@
----
-name: test-gaps
-description: "Find critical code paths lacking test coverage: auth, payments, data mutations, error handling, and business logic with no corresponding tests."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
-
 # Find Test Gaps
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for critical code that lacks test coverage. Not every line needs a test — focus on code where bugs would cause the most damage.
 

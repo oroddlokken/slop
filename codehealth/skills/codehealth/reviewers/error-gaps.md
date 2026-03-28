@@ -1,15 +1,6 @@
----
-name: error-gaps
-description: "Find missing, swallowed, or inconsistent error handling. Detects bare except blocks, ignored return values, missing error paths, and inconsistent error patterns across the codebase."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
 
 # Find Error Handling Gaps
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for missing, swallowed, or inconsistent error handling that could cause silent failures, data corruption, or confusing user experiences.
 

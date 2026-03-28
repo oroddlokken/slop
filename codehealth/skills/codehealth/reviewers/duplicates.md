@@ -1,15 +1,6 @@
----
-name: duplicates
-description: "Find duplicated and near-identical code blocks across the codebase. Detects copy-paste patterns, repeated logic, and similar implementations that should be consolidated."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
 
 # Find Duplicated Code
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for copy-pasted and near-identical code blocks that should be consolidated into shared functions, methods, or modules.
 

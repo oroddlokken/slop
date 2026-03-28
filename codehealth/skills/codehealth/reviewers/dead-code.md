@@ -1,15 +1,5 @@
----
-name: dead-code
-description: "Find unused functions, unreachable branches, dead routes, commented-out code, and orphaned files that should be removed."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
-
 # Find Dead Code
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for code that's no longer used, reachable, or needed. Dead code adds confusion, increases maintenance burden, and makes the codebase harder to navigate.
 

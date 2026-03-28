@@ -1,15 +1,5 @@
----
-name: naming
-description: "Find naming inconsistencies: mixed case conventions, same concept with different names, ambiguous identifiers, and inconsistent prefixes/suffixes across the codebase."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
-
 # Find Naming Inconsistencies
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for naming problems that make code harder to navigate, understand, and maintain. Good names are the cheapest documentation.
 

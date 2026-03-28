@@ -1,15 +1,5 @@
----
-name: dep-hygiene
-description: "Find dependency issues: unused imports, unnecessary packages, outdated dependencies, and overly heavy dependencies for what they provide."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
-
 # Find Dependency Issues
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for dependency problems — unused packages, unnecessary imports, outdated deps, and heavyweight libraries used for trivial tasks.
 

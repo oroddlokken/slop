@@ -1,15 +1,6 @@
----
-name: extract-logic
-description: "Find inline operations that should be extracted into functions, methods, or service layers. Detects raw SQL in handlers, scattered API calls, repeated multi-step operations, and business logic buried in the wrong layer."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
 
 # Find Code That Should Be Extracted
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for inline operations that should be functions, methods, or services. The goal: business logic should be named, testable, and reusable — not scattered inline across handlers, views, and scripts.
 

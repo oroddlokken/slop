@@ -1,15 +1,5 @@
----
-name: type-structs
-description: "Find places where raw dicts, lists, tuples, and untyped data structures are passed around and should be replaced with dataclasses, NamedTuples, TypedDicts, Pydantic models, or equivalent typed structures."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
-
 # Find Missing Type Structures
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for raw dicts, lists, and tuples being passed between functions that should be proper typed data structures. Raw data structures provide no documentation, no validation, and no IDE support — they're the #1 source of "what keys does this dict have?" confusion.
 

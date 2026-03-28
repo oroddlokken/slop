@@ -1,15 +1,5 @@
----
-name: query-smells
-description: "Find database query issues: N+1 queries, raw SQL in loops, missing parameterization, scattered queries outside the data access layer, and missing transaction management."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
-
 # Find Query Smells
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for database query patterns that cause performance problems, security vulnerabilities, or maintenance headaches.
 

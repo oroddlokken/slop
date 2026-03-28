@@ -20,12 +20,9 @@ The orchestrator has already scanned the codebase. Here are the files:
 
 {codebase_snapshot}
 
-## Apply Your Review Lens
+## Your Review Criteria
 
-Read the skill file at `{skill_path}` for your review criteria:
-- **"What to Look For"** — your detection patterns
-- **"Severity Guide"** — how to rank findings
-- **"Output Format"** — how to structure your report
+{reviewer_criteria}
 
 {focus}
 

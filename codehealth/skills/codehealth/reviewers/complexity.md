@@ -1,15 +1,6 @@
----
-name: complexity
-description: "Find complexity hotspots: long functions, deep nesting, high branching, and large files that are hardest to maintain and most likely to contain bugs."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
 
 # Find Complexity Hotspots
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for mechanically complex code — functions that are too long, too deeply nested, or have too many branches. These are the places where bugs hide and maintenance is most expensive.
 

@@ -1,15 +1,6 @@
----
-name: hardcoded
-description: "Find hardcoded values that should be configuration: magic strings, numbers, URLs, ports, credentials, thresholds, and feature flags buried in source code."
-args:
-  - name: path
-    description: The directory to scan (optional, defaults to cwd)
-    required: false
-user-invokable: true
----
 
 # Find Hardcoded Values
-This skill scans code and reports findings — it does not modify code. It can run standalone or as part of `/codehealth`. Examples are Python; apply equivalent patterns for your target language.
+This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for magic strings, numbers, URLs, credentials, and thresholds that should be extracted to configuration, environment variables, or constants.
 
