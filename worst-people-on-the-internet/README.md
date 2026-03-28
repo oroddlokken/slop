@@ -1,5 +1,7 @@
 # Worst People on the Internet
 
+> **Superseded.** For serious code review, use [codehealth](../codehealth) (structured review across 12 dimensions) or [fuzz-my-stuff-up](../fuzz-my-stuff-up) (adversarial break-it testing with ~20 parallel agents). Both produce cleaner, more actionable output without the community theater.
+
 Simulate how ten online communities would tear apart your codebase, then distill the combined roasting into a prioritized list of things to actually fix.
 
 ## What you get
