@@ -145,8 +145,39 @@ def get_connection() -> sqlite3.Connection:
             _conn.execute(f"ALTER TABLE usage ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
             pass  # column already exists
+    _run_migrations(_conn)
     atexit.register(close_connection)
     return _conn
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Run one-time data migrations, tracked by meta flags."""
+    # Migration 1: Opus 4.6 / Sonnet 4.6 switched to flat pricing (no 200k tier)
+    # on 2026-03-13T18:00 UTC. Cached costs for files modified after that date
+    # used inflated tiered rates. Only clear those — older files had correct
+    # pricing and their JSONL sources may already be purged from disk.
+    if not _get_meta(conn, "migrated_flat_pricing_2026_03_13"):
+        cutoff_ns = 1773273600000000000  # 2026-03-12T00:00 UTC in nanoseconds
+        conn.execute("DELETE FROM file_costs WHERE mtime_ns >= ?", (cutoff_ns,))
+        conn.execute("DELETE FROM session_costs")
+        conn.execute("DELETE FROM meta WHERE key IN ('cost_summary', 'cost_summary_time')")
+        _set_meta(conn, "migrated_flat_pricing_2026_03_13", "1")
+        conn.commit()
+
+    # Migration 2: Also NULL out cached costs in ccreport_records for
+    # post-flat-pricing Opus/Sonnet 4.6 records so _rec_cost and record_cost
+    # recompute from tokens with the new flat pricing.
+    if not _get_meta(conn, "migrated_flat_pricing_ccreport"):
+        cutoff_ts = 1773424800.0  # 2026-03-13T18:00 UTC
+        conn.execute(
+            "UPDATE ccreport_records SET cost = NULL "
+            "WHERE ts >= ? AND model IN ('claude-opus-4-6', 'claude-sonnet-4-6')",
+            (cutoff_ts,),
+        )
+        conn.execute("DELETE FROM session_costs")
+        conn.execute("DELETE FROM meta WHERE key IN ('cost_summary', 'cost_summary_time')")
+        _set_meta(conn, "migrated_flat_pricing_ccreport", "1")
+        conn.commit()
 
 
 def close_connection() -> None:
@@ -233,7 +264,7 @@ def read_usage_cache(max_age: int = 600) -> dict[str, Any] | None:
     return d
 
 
-def _read_usage_stale() -> dict[str, Any] | None:
+def read_usage_stale() -> dict[str, Any] | None:
     """Read cached usage data regardless of freshness."""
     conn = get_connection()
     cols = ", ".join(["id", *_USAGE_FIELDS, "meta_json"])
@@ -355,7 +386,7 @@ def read_usage_for_statusline() -> dict[str, Any] | None:
     if result is not None:
         return result
     if _is_fetch_blocked():
-        return _read_usage_stale()
+        return read_usage_stale()
     return None
 
 
@@ -558,9 +589,13 @@ def check_ccreport_valid(version: int, script_hash: str) -> bool:
 
 
 def invalidate_ccreport() -> None:
-    """Delete all ccreport data and reset meta."""
+    """Invalidate ccreport cache, preserving orphaned records.
+
+    Resets mtime_ns/size so all live files get re-parsed on the next run,
+    but keeps records from files no longer on disk (orphans) intact.
+    """
     conn = get_connection()
-    conn.execute("DELETE FROM ccreport_files")
+    conn.execute("UPDATE ccreport_files SET mtime_ns = 0, size = 0")
     conn.execute("DELETE FROM meta WHERE key IN ('ccreport_version', 'ccreport_script_hash')")
     conn.commit()
 
@@ -580,6 +615,33 @@ def get_ccreport_file(path: str) -> tuple[int, int] | None:
         "SELECT mtime_ns, size FROM ccreport_files WHERE path = ?", (path,)
     ).fetchone()
     return row
+
+
+def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, list[dict]]]:
+    """Bulk-load all ccreport file metadata and records.
+
+    Returns (file_meta, records_by_file) where:
+      file_meta: {path: (mtime_ns, size)}
+      records_by_file: {path: [list of record dicts]}
+    """
+    conn = get_connection()
+    # File metadata
+    file_rows = conn.execute("SELECT path, mtime_ns, size FROM ccreport_files").fetchall()
+    file_meta = {r[0]: (r[1], r[2]) for r in file_rows}
+    if not file_meta:
+        return {}, {}
+    # All records
+    rec_rows = conn.execute(
+        "SELECT file_path, model, ts, dk, cost, "
+        "input_tokens, output_tokens, cache_create, cache_read, sid "
+        "FROM ccreport_records"
+    ).fetchall()
+    records_by_file: dict[str, list[dict]] = {}
+    for fp, model, ts, dk, cost, inp, out, cc, cr, sid in rec_rows:
+        rec = {"model": model, "ts": ts, "dk": dk, "cost": cost,
+               "t": [inp, out, cc, cr], "sid": sid}
+        records_by_file.setdefault(fp, []).append(rec)
+    return file_meta, records_by_file
 
 
 def get_ccreport_records(path: str) -> list[dict]:
@@ -663,6 +725,38 @@ def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
     for path in orphaned:
         all_records.extend(get_ccreport_records(path))
     return all_records
+
+
+# ---------------------------------------------------------------------------
+# Cost summary cache (written by compute_costs, read by statusline)
+# ---------------------------------------------------------------------------
+
+def write_cost_summary(costs: dict[str, Any]) -> None:
+    """Cache the latest compute_costs() result for fast statusline reads."""
+    conn = get_connection()
+    _set_meta(conn, "cost_summary", json.dumps(costs))
+    _set_meta(conn, "cost_summary_time", str(time.time()))
+    conn.commit()
+
+
+def read_cost_summary(max_age: int = 600) -> dict[str, Any] | None:
+    """Read cached cost summary if fresh enough."""
+    conn = get_connection()
+    ts_str = _get_meta(conn, "cost_summary_time")
+    if not ts_str:
+        return None
+    try:
+        if time.time() - float(ts_str) > max_age:
+            return None
+    except ValueError:
+        return None
+    raw = _get_meta(conn, "cost_summary")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -373,31 +373,45 @@ def short_model(model: str) -> str:
     return m
 
 
-def _add_token_columns(table: Table) -> None:
+def _add_token_columns(table: Table, *, compact: bool = False) -> None:
     """Add the standard token + cost columns to a table."""
     table.add_column("Input", justify="right", style="cyan", no_wrap=True)
     table.add_column("Output", justify="right", style="cyan", no_wrap=True)
-    table.add_column("Cache W", justify="right", style="blue", no_wrap=True)
-    table.add_column("Cache R", justify="right", style="blue", no_wrap=True)
+    if not compact:
+        table.add_column("Cache W", justify="right", style="blue", no_wrap=True)
+        table.add_column("Cache R", justify="right", style="blue", no_wrap=True)
     table.add_column("Total", justify="right", style="bold", no_wrap=True)
     table.add_column("Cost", justify="right", no_wrap=True)
     table.add_column("%", justify="right", style="dim", no_wrap=True)
     table.add_column("Calls", justify="right", style="dim", no_wrap=True)
 
 
-def _token_row(b: "AggBucket", total_cost: float = 0.0) -> list:
+def _fmt_cache_read(t: TokenCounts) -> str:
+    """Format cache read tokens with hit rate: '9.0M (87%)'."""
+    s = fmt_tokens(t.cache_read)
+    total_input = t.input + t.cache_create + t.cache_read
+    if total_input > 0 and t.cache_read > 0:
+        pct = t.cache_read / total_input * 100
+        s += f" ({pct:.0f}%)"
+    return s
+
+
+def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False) -> list:
     """Build the token/cost cells for a bucket."""
     cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
-    return [
+    row = [
         fmt_tokens(b.tokens.input),
         fmt_tokens(b.tokens.output),
-        fmt_tokens(b.tokens.cache_create),
-        fmt_tokens(b.tokens.cache_read),
+    ]
+    if not compact:
+        row += [fmt_tokens(b.tokens.cache_create), _fmt_cache_read(b.tokens)]
+    row += [
         fmt_tokens(b.tokens.total),
         cost_text,
         fmt_pct(b.cost, total_cost),
         str(b.count),
     ]
+    return row
 
 
 # --- Reports ---
@@ -541,7 +555,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
 
     table = Table(title=f"Projects ({shown})", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
     table.add_column("Project", style="magenta", no_wrap=True)
-    _add_token_columns(table)
+    _add_token_columns(table, compact=True)
     table.add_column("Models", style="dim", no_wrap=True)
 
     total_cost = sum(buckets[p].cost for p in sorted_projects)
@@ -549,7 +563,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     for proj in sorted_projects:
         b = buckets[proj]
         models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(proj, *_token_row(b, total_cost), models_str)
+        table.add_row(proj, *_token_row(b, total_cost, compact=True), models_str)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
@@ -558,7 +572,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     table.add_section()
     table.add_row(
         Text("TOTAL", style="bold"),
-        *_token_row(total_agg),
+        *_token_row(total_agg, compact=True),
         f"{len(total_agg.models)} models",
         style="bold",
     )
@@ -567,7 +581,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
         avg_cost = total_agg.cost / n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "", "", "",
             Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
             "", "",
             f"per project (top {n})",
@@ -580,7 +594,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
         all_avg = all_cost / all_n
         table.add_row(
             Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
+            "", "", "",
             Text(fmt_cost(all_avg), style=cost_style(all_avg)),
             "", "",
             f"per project (all {all_n})",

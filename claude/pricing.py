@@ -67,6 +67,21 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        # 2026-03-13 18:00 UTC (19:00 Oslo CET): Opus 4.6 and Sonnet 4.6
+        # switched to flat pricing — no 200k tier premium.
+        "effective": "2026-03-13T18",
+        "models": {
+            "claude-opus-4-6": {
+                "input": 5e-06, "output": 25e-06,
+                "cache_create": 6.25e-06, "cache_read": 0.5e-06,
+            },
+            "claude-sonnet-4-6": {
+                "input": 3e-06, "output": 15e-06,
+                "cache_create": 3.75e-06, "cache_read": 0.3e-06,
+            },
+        },
+    },
 ]
 
 MODEL_ALIASES: dict[str, str] = {
@@ -80,7 +95,12 @@ TIER_THRESHOLD = 200_000
 
 
 def _parse_effective(date_str: str) -> datetime:
-    """Parse an effective date string to a timezone-aware datetime."""
+    """Parse an effective date string to a timezone-aware datetime.
+
+    Accepts 'YYYY-MM-DD' (midnight UTC) or 'YYYY-MM-DDTHH' (hour-level UTC).
+    """
+    if "T" in date_str:
+        return datetime.strptime(date_str, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
     return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
@@ -354,6 +374,24 @@ def _parse_window_starts(
     return session_window_start, week_window_start
 
 
+def _rec_cost(rec: dict) -> float:
+    """Compute cost for a ccreport record dict, recomputing from tokens if needed."""
+    cost = rec.get("cost")
+    if cost is not None and cost != 0:
+        return cost
+    t = rec.get("t")
+    if not t or len(t) < 4:
+        return 0.0
+    ts_epoch = rec.get("ts", 0)
+    ts_dt = None
+    if ts_epoch:
+        try:
+            ts_dt = datetime.fromtimestamp(ts_epoch, tz=timezone.utc)
+        except (ValueError, OSError):
+            pass
+    return calc_cost(t[0], t[1], t[2], t[3], rec.get("model", ""), ts_dt)
+
+
 def compute_costs(
     session_id: str | None = None,
     cwd: str | None = None,
@@ -361,6 +399,10 @@ def compute_costs(
     week_reset_iso: str | None = None,
 ) -> dict[str, float]:
     """Compute per-chat, session-window, week-window, and rolling costs.
+
+    Uses ccreport_records cache when available (fast path, ~0.7s) with
+    JSONL fallback for uncached files. Falls back to full JSONL scan
+    if ccreport cache is empty.
 
     Cost buckets:
       session_cost          – total cost for the target chat (all time)
@@ -380,6 +422,7 @@ def compute_costs(
     session_window_cost and rolling costs are computed fresh.
     """
     from cache_db import (
+        bulk_load_ccreport_cache,
         bulk_save_file_costs,
         load_cost_cache,
     )
@@ -409,9 +452,14 @@ def compute_costs(
 
     # Per-project prefixes for identifying files belonging to current cwd
     project_prefixes: list[str] = []
+    project_name = ""
     if cwd:
         project_key = cwd.replace("/", "-")
         project_prefixes = [str(d / project_key) for d in projects_dirs]
+        project_name = Path(cwd).name
+
+    # Bulk-load ccreport cache for fast rolling cost computation
+    ccr_file_meta, ccr_records_by_file = bulk_load_ccreport_cache()
 
     week_total = 0.0
     session_total = 0.0
@@ -437,11 +485,19 @@ def compute_costs(
     sw_ts = session_window_start.timestamp() if session_window_start else None
     mw_ts = month_window_start.timestamp()
     td_ts = thirty_day_start.timestamp()
+    h6_ts = six_hour_start.timestamp()
+    h12_ts = twelve_hour_start.timestamp()
+    h24_ts = twenty_four_hour_start.timestamp()
+    sd_ts = seven_day_start.timestamp()
+    ww_ts = week_window_start.timestamp()
     oldest_ts = min(mw_ts, td_ts)
+
+    live_paths: set[str] = set()
 
     for projects_dir in projects_dirs:
         for jsonl_path in projects_dir.rglob("*.jsonl"):
             key = str(jsonl_path)
+            live_paths.add(key)
             try:
                 st = jsonl_path.stat()
             except OSError:
@@ -459,6 +515,7 @@ def compute_costs(
                 and cached_entry.get("size") == st.st_size
             )
 
+            # --- Full cache hit: old file, unchanged, not in any rolling window ---
             if st.st_mtime < oldest_ts and not is_session_file:
                 if file_unchanged:
                     c = cached_entry.get("all_time_cost", 0.0)
@@ -482,7 +539,69 @@ def compute_costs(
                 seen_keys.update(cached_entry.get("dedup_keys", []))
                 continue
 
-            # Parse file for costs
+            # --- Partial hit: file unchanged but needs rolling costs ---
+            # Try ccreport_records cache first (much faster than JSONL re-parse)
+            ccr_meta = ccr_file_meta.get(key)
+            ccr_fresh = (
+                ccr_meta is not None
+                and ccr_meta[0] == st.st_mtime_ns
+                and ccr_meta[1] == st.st_size
+            )
+
+            if file_unchanged and ccr_fresh:
+                # Use file_costs for week/month/all_time, ccreport for rolling
+                week_total += cached_entry.get("week_cost", 0.0)
+                month_total += cached_entry.get("month_cost", 0.0)
+                c = cached_entry.get("all_time_cost", 0.0)
+                at_total += c
+                if is_project_file:
+                    at_proj += c
+                if is_session_file:
+                    session_total += cached_entry.get("session_cost", 0.0)
+                new_entries[key] = cached_entry
+
+                # Compute rolling costs from ccreport records
+                for rec in ccr_records_by_file.get(key, []):
+                    dk = rec.get("dk")
+                    if dk:
+                        if dk in seen_keys:
+                            continue
+                        seen_keys.add(dk)
+                    ts_e = rec.get("ts", 0)
+                    if not ts_e or ts_e < td_ts:
+                        # Outside all rolling windows, skip
+                        if not (in_session_window and sw_ts and ts_e >= sw_ts):
+                            continue
+                    cost = _rec_cost(rec)
+                    if not cost:
+                        continue
+                    if ts_e >= td_ts:
+                        td_total += cost
+                        if is_project_file:
+                            td_proj += cost
+                    if ts_e >= sd_ts:
+                        sd_total += cost
+                        if is_project_file:
+                            sd_proj += cost
+                    if ts_e >= h24_ts:
+                        h24_total += cost
+                        if is_project_file:
+                            h24_proj += cost
+                    if ts_e >= h12_ts:
+                        h12_total += cost
+                        if is_project_file:
+                            h12_proj += cost
+                    if ts_e >= h6_ts:
+                        h6_total += cost
+                        if is_project_file:
+                            h6_proj += cost
+                    if sw_ts and ts_e >= sw_ts:
+                        sw_total += cost
+                # Also add any file_costs dedup keys not seen via ccreport records
+                seen_keys.update(cached_entry.get("dedup_keys", []))
+                continue
+
+            # --- Cache miss: parse JSONL file ---
             w_cost = 0.0
             s_cost = 0.0
             sw_cost = 0.0
@@ -567,7 +686,44 @@ def compute_costs(
         except OSError:
             pass
 
-    return {
+    # Include orphaned records (from deleted JSONL files cached by ccreport)
+    for fp, recs in ccr_records_by_file.items():
+        if fp in live_paths:
+            continue
+        for rec in recs:
+            dk = rec.get("dk")
+            if dk:
+                if dk in seen_keys:
+                    continue
+                seen_keys.add(dk)
+            cost = _rec_cost(rec)
+            if not cost:
+                continue
+            ts_epoch = rec.get("ts", 0)
+            at_total += cost
+            if project_name:
+                proj = rec.get("project", "")
+                if proj == project_name:
+                    at_proj += cost
+            if ts_epoch:
+                if ts_epoch >= td_ts:
+                    td_total += cost
+                if ts_epoch >= sd_ts:
+                    sd_total += cost
+                if ts_epoch >= h24_ts:
+                    h24_total += cost
+                if ts_epoch >= h12_ts:
+                    h12_total += cost
+                if ts_epoch >= h6_ts:
+                    h6_total += cost
+                if ts_epoch >= mw_ts:
+                    month_total += cost
+                if ts_epoch >= ww_ts:
+                    week_total += cost
+                if sw_ts and ts_epoch >= sw_ts:
+                    sw_total += cost
+
+    result = {
         "session_cost": round(session_total, 4),
         "session_window_cost": round(sw_total, 4),
         "week_cost": round(week_total, 4),
@@ -585,3 +741,12 @@ def compute_costs(
         "thirty_day_project_cost": round(td_proj, 4),
         "all_time_project_cost": round(at_proj, 4),
     }
+
+    # Cache for fast reads by statusline
+    try:
+        from cache_db import write_cost_summary
+        write_cost_summary(result)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return result

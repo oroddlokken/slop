@@ -46,10 +46,12 @@ jq_out=$(echo "$json" | jq -r '[
   (.week_reset // ""),
   (.sonnet_reset // ""),
   (.extra_reset // ""),
-  (.last_updated // "")
+  (.last_updated // ""),
+  (.peak_is_peak // ""),
+  (.peak_flip_seconds // "")
 ] | join("\u001f")')
-local s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated
-IFS=$'\x1f' read -r s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated <<< "$jq_out"
+local s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated peak_is_peak peak_flip_s
+IFS=$'\x1f' read -r s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated peak_is_peak peak_flip_s <<< "$jq_out"
 
 if [[ -z "$s_pct" && -z "$w_pct" ]]; then
   echo "No usage data available" >&2
@@ -63,6 +65,25 @@ tz_name=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' || true)
 [[ -z "$tz_name" ]] && tz_name=$(date +%Z)
 
 # --- Helpers ---
+
+# Parse ISO 8601 timestamp to epoch, respecting timezone offset.
+ccu_iso_to_epoch() {
+  local iso=$1
+  local stripped
+  stripped=$(echo "$iso" | sed 's/\.[0-9]*//')
+
+  if [[ "$stripped" == *Z ]]; then
+    local clean="${stripped%Z}"
+    TZ=UTC0 date -j -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null
+  elif [[ "$stripped" =~ (.*T[0-9:]+)([+-])([0-9]{2}:[0-9]{2})$ ]]; then
+    local clean="${match[1]}" sign="${match[2]}" offset="${match[3]}"
+    # POSIX TZ inverts the sign: ISO +02:00 → TZ=UTC-02:00
+    local inv="-"; [[ "$sign" == "-" ]] && inv="+"
+    TZ="UTC${inv}${offset}" date -j -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null
+  else
+    date -j -f "%Y-%m-%dT%H:%M:%S" "$stripped" +%s 2>/dev/null
+  fi
+}
 
 # Progress bar: green filled, dark gray empty.
 ccu_bar() {
@@ -115,10 +136,8 @@ ccu_countdown() {
 ccu_reset_fmt() {
   local iso=$1
   [[ -z "$iso" ]] && return 0
-  local clean
-  clean=$(echo "$iso" | sed 's/\.[0-9]*//;s/[+-][0-9][0-9]:[0-9][0-9]$//')
   local epoch
-  epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null) || return 0
+  epoch=$(ccu_iso_to_epoch "$iso")
   [[ -z "$epoch" ]] && return 0
 
   local countdown
@@ -182,10 +201,8 @@ ccu_section() {
 # --- Render ---
 
 if [[ -n "$last_updated" ]]; then
-  local clean_lu
-  clean_lu=$(echo "$last_updated" | sed 's/\.[0-9]*//;s/[+-][0-9][0-9]:[0-9][0-9]$//')
   local lu_epoch
-  lu_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$clean_lu" +%s 2>/dev/null) || true
+  lu_epoch=$(ccu_iso_to_epoch "$last_updated") || true
   if [[ -n "$lu_epoch" ]]; then
     local ago_s=$(( $(date +%s) - lu_epoch ))
     local ago_m=$(( ago_s / 60 ))
@@ -215,5 +232,19 @@ if [[ -n "$e_pct" ]]; then
     extra_info=$(printf '$%.2f / $%.2f spent' "$e_spent" "$e_limit")
   fi
   ccu_section "Extra usage" "$e_pct" "$e_reset" "$extra_info"
+fi
+if [[ -n "$peak_is_peak" ]]; then
+  echo
+  local flip_cd=""
+  if [[ -n "$peak_flip_s" && "$peak_flip_s" != "0" ]]; then
+    flip_cd=$(ccu_countdown "$(( $(date +%s) + peak_flip_s ))")
+  fi
+  if [[ "$peak_is_peak" == "true" ]]; then
+    printf '\033[1;31mPeak hours\033[0m (weekdays 1PM–7PM UTC)\n'
+    [[ -n "$flip_cd" ]] && echo "Off-peak in $flip_cd"
+  else
+    printf '\033[1;32mOff-peak\033[0m\n'
+    [[ -n "$flip_cd" ]] && echo "Peak starts in $flip_cd"
+  fi
 fi
 echo

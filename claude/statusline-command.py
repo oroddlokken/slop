@@ -27,10 +27,12 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_COST                  — session cost
     CLAUDE_STATUSLINE_IO_RATIO              — output/input token ratio
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate %
+  CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on 80% usable window (auto-compact threshold)
   CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon)
   CLAUDE_STATUSLINE_PEAK                    — peak/off-peak indicator with countdown
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
+    CLAUDE_STATUSLINE_WEEKLY_PACE            — weekly pace indicator (D3/7: On Pace)
     CLAUDE_STATUSLINE_SONNET                — Sonnet usage %
     CLAUDE_STATUSLINE_SONNET_THRESHOLD      — hide Sonnet below this % (default 25)
     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit
@@ -66,6 +68,7 @@ from cache_db import (
     check_fetch_backoff,
     read_cache_stats,
     read_usage_for_statusline,
+    read_usage_stale,
     write_cache_stats,
 )
 from pricing import compute_costs, compute_project_rolling_costs, compute_session_cost
@@ -111,6 +114,11 @@ def _get_terminal_cols() -> int:
 
 
 # --- ANSI helpers ---
+
+# Two-tier dimming: structural/stable info uses SUBDUED (very dim),
+# dynamic/changing info uses the standard dim grey (0;90).
+SUBDUED = "\033[38;5;242m"  # 256-color dark grey — structural info
+RST = "\033[0m"
 
 
 def _c(code: str, text: str) -> str:
@@ -221,9 +229,15 @@ def _render_macmon(data: dict) -> str:
 
     if cpu_t is not None:
         t = int(cpu_t)
-        col = "31" if t >= 90 else "33" if t >= 75 else "90"
+        # Alert colors only for hot temps; otherwise subdued
+        if t >= 90:
+            val_col = "\033[0;31m"
+        elif t >= 75:
+            val_col = "\033[0;33m"
+        else:
+            val_col = SUBDUED
         w_str = f"/{cpu_w:.1f}W" if cpu_w is not None else ""
-        parts.append(f"\033[0;90mCPU:\033[0;{col}m{t}°C{w_str}\033[0m")
+        parts.append(f"{SUBDUED}CPU:{val_col}{t}°C{w_str}{RST}")
 
     mem = data.get("memory", {})
     ram_usage = mem.get("ram_usage")
@@ -231,21 +245,25 @@ def _render_macmon(data: dict) -> str:
     if ram_usage is not None and ram_total is not None:
         used_gb = ram_usage / (1024 ** 3)
         total_gb = ram_total / (1024 ** 3)
-        parts.append(f"\033[0;90mRAM:{used_gb:.0f}GB/{total_gb:.0f}GB\033[0m")
+        parts.append(f"{SUBDUED}RAM:{used_gb:.0f}GB/{total_gb:.0f}GB{RST}")
 
     if gpu_t is not None:
         t = int(gpu_t)
-        col = "31" if t >= 90 else "33" if t >= 75 else "90"
+        if t >= 90:
+            val_col = "\033[0;31m"
+        elif t >= 75:
+            val_col = "\033[0;33m"
+        else:
+            val_col = SUBDUED
         w_str = f"/{gpu_w:.1f}W" if gpu_w is not None else ""
-        parts.append(f"\033[0;90mGPU:\033[0;{col}m{t}°C{w_str}\033[0m")
+        parts.append(f"{SUBDUED}GPU:{val_col}{t}°C{w_str}{RST}")
 
     if ane_w is not None and ane_w > 0.05:
-        parts.append(f"\033[0;90mANE:{ane_w:.1f}W\033[0m")
+        parts.append(f"{SUBDUED}ANE:{ane_w:.1f}W{RST}")
 
     if not parts:
         return ""
-    inner = " ".join(parts)
-    return f"\033[0;34m[\033[0m{inner}\033[0;34m]\033[0m"
+    return " ".join(parts)
 
 
 # --- Usage data ---
@@ -257,7 +275,12 @@ def _try_cache_bypass() -> dict | None:
 
 
 def _fetch_usage(session_id: str, cwd: str) -> dict:
-    """Get usage data: env var → cache bypass → get_claude_usage.py subprocess."""
+    """Get usage data: env var → cache bypass → detached get_claude_usage.py.
+
+    The fetch subprocess is detached (start_new_session=True) so it survives
+    the parent being killed by the statusline framework (e.g. tmux interval).
+    Stale cached data is returned for this render; fresh data appears next call.
+    """
     pre = os.environ.get("CLAUDE_STATUSLINE_USAGE_JSON", "")
     if pre:
         try:
@@ -267,21 +290,20 @@ def _fetch_usage(session_id: str, cwd: str) -> dict:
     cached = _try_cache_bypass()
     if cached is not None:
         return cached
+    # Cache is stale — spawn detached fetch (survives parent kill)
     script = Path(__file__).resolve().parent / "get_claude_usage.py"
-    if not script.exists():
-        return {}
-    try:
-        r = subprocess.run(
-            [sys.executable, str(script), "--session", session_id, "--cwd", cwd],
-            capture_output=True,
-            text=True,
-            timeout=12,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return json.loads(r.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-        pass
-    return {}
+    if script.exists():
+        try:
+            subprocess.Popen(
+                [sys.executable, str(script), "--session", session_id, "--cwd", cwd],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            pass
+    # Return stale data for this render; fresh data will be in cache next call
+    return read_usage_stale() or {}
 
 
 # --- Dcat status ---
@@ -344,13 +366,13 @@ def _render_timestamp() -> str:
             ts = datetime.now().strftime("%H:%M")  # noqa: DTZ005
     else:
         ts = datetime.now().strftime("%H:%M")  # noqa: DTZ005
-    return _c("0;90", ts)
+    return f"{SUBDUED}{ts}{RST}"
 
 
 def _render_session_id(session_id: str) -> str:
     if not _on("SESSION_ID") or not session_id:
         return ""
-    return _c("0;90", session_id.rsplit("-", 1)[-1])
+    return f"{SUBDUED}{session_id.rsplit('-', 1)[-1]}{RST}"
 
 
 def _render_hostname() -> str:
@@ -434,10 +456,18 @@ def _render_dogcat(dcat_data: dict) -> str:
     return f"dc[{parts}]"
 
 
-def _render_ctx_pct(used: str) -> str:
+AUTOCOMPACT_BUFFER = 33_000  # tokens reserved by Claude Code before auto-compact
+
+
+def _render_ctx_pct(used: str, ctx_size: int) -> str:
     if not used:
         return ""
-    used_int = math.ceil(float(used))
+    used_f = float(used)
+    # Usable context: auto-compact reserves ~33k tokens, scale to usable range
+    if _on("USABLE_CTX") and ctx_size > AUTOCOMPACT_BUFFER:
+        usable_ratio = (ctx_size - AUTOCOMPACT_BUFFER) / ctx_size
+        used_f = min(100.0, used_f / usable_ratio)
+    used_int = math.ceil(used_f)
     col = "31" if used_int >= 70 else "33" if used_int >= 50 else "32"
     return f"\033[0;90mctx:\033[0;{col}m{used_int}%\033[0m"
 
@@ -447,7 +477,7 @@ def _render_changes(lines_added: int, lines_removed: int) -> str:
         return ""
     if not lines_added and not lines_removed:
         return ""
-    return f'[{_c("0;32", f"+{lines_added}")} {_c("0;31", f"-{lines_removed}")}]'
+    return f'{_c("0;32", f"+{lines_added}")} {_c("0;31", f"-{lines_removed}")}'
 
 
 def _usage_color(pct: int) -> str:
@@ -482,6 +512,35 @@ def _usage_section(label: str, pct_s: str, reset_iso: str, now: float) -> str:
     if cd:
         return f"\033[0;90m{label}:\033[0;{col}m{pct}%\033[0;90m({cd})\033[0m"
     return f"\033[0;90m{label}:\033[0;{col}m{pct}%\033[0m"
+
+
+def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
+    """Weekly pace indicator: compare actual usage % to expected % based on day of week.
+
+    Expected = how far through the 7-day window we are.
+    Delta thresholds: >+15 Overcooking, >+5 Warm, ±5 On Pace, <-5 Cool, <-15 Underusing.
+    """
+    if not _on("WEEKLY_PACE"):
+        return ""
+    if not w_pct_s:
+        return ""
+    reset_epoch = _parse_iso_epoch(reset_iso)
+    if reset_epoch is None:
+        return ""
+    try:
+        actual = int(w_pct_s)
+    except ValueError:
+        return ""
+    week_start = reset_epoch - 7 * 86400
+    elapsed = (now - week_start) / (7 * 86400)
+    if elapsed <= 0 or elapsed > 1:
+        return ""
+    expected = elapsed * 100
+    delta = actual - expected
+    day = max(1, min(7, math.ceil(elapsed * 7)))
+    d_round = round(delta)
+    sign = "+" if d_round >= 0 else ""
+    return f"\033[0;90mD{day}/7 {sign}{d_round}%\033[0m"
 
 
 def _usage_combined(
@@ -519,15 +578,88 @@ def _usage_cost(label: str, val: str, project_val: str = "") -> str:
     rounded = math.ceil(v)
     if rounded == 0:
         return ""
-    # Show $project/$total when project cost differs from total
+    DIM = "\033[0;90m"
+    # Show label $project/$total when project cost differs from total
     if project_val and project_val not in ("0", "0.0", "0.0000", ""):
         try:
             p_rounded = math.ceil(float(project_val))
             if 0 < p_rounded < rounded:
-                return f"\033[0;90m{label}:${p_rounded}/${rounded}\033[0m"
+                return f"{SUBDUED}{label} {DIM}${p_rounded}/${rounded}{RST}"
         except ValueError:
             pass
-    return f"\033[0;90m{label}:${rounded}\033[0m"
+    return f"{SUBDUED}{label} {DIM}${rounded}{RST}"
+
+
+def _render_cost_arrow(usage: dict) -> str:
+    """Render cost roll-up in compact arrow format: 24H→7D→30D $48→194→457 (proj:$59→210→595)"""
+    # Collect (label, total, project) tuples for enabled cost windows
+    windows: list[tuple[str, str, str]] = []
+    if _on("6H_COST", default=False):
+        windows.append(("6H", str(usage.get("six_hour_cost", "") or ""),
+                        str(usage.get("six_hour_project_cost", "") or "")))
+    if _on("12H_COST", default=False):
+        windows.append(("12H", str(usage.get("twelve_hour_cost", "") or ""),
+                        str(usage.get("twelve_hour_project_cost", "") or "")))
+    if _on("24H_COST"):
+        windows.append(("24H", str(usage.get("twenty_four_hour_cost", "") or ""),
+                        str(usage.get("twenty_four_hour_project_cost", "") or "")))
+    if _on("7D_COST"):
+        windows.append(("7D", str(usage.get("seven_day_cost", "") or ""),
+                        str(usage.get("seven_day_project_cost", "") or "")))
+    if _on("30D_COST"):
+        windows.append(("30D", str(usage.get("thirty_day_cost", "") or ""),
+                        str(usage.get("thirty_day_project_cost", "") or "")))
+    # All-time (only when cost beyond 30D)
+    if _on("AT_COST"):
+        at_val = str(usage.get("all_time_cost", "") or "")
+        td_val = str(usage.get("thirty_day_cost", "") or "")
+        if at_val and td_val:
+            try:
+                if float(at_val) - float(td_val) >= 0.005:
+                    windows.append(("AT", at_val,
+                                    str(usage.get("all_time_project_cost", "") or "")))
+            except ValueError:
+                pass
+
+    if not windows:
+        return ""
+
+    # Build parallel arrays of rounded values
+    labels: list[str] = []
+    totals: list[int] = []
+    projects: list[int] = []
+    for label, val, proj_val in windows:
+        try:
+            r = math.ceil(float(val))
+        except (ValueError, TypeError):
+            continue
+        if r == 0:
+            continue
+        labels.append(label)
+        totals.append(r)
+        try:
+            p = math.ceil(float(proj_val)) if proj_val and proj_val not in ("0", "0.0", "0.0000", "") else 0
+        except (ValueError, TypeError):
+            p = 0
+        projects.append(p)
+
+    if not totals:
+        return ""
+
+    DIM = "\033[0;90m"
+
+    # Header labels are structural (subdued), values are dynamic (standard dim)
+    header = SUBDUED + "→".join(labels) + RST
+    total_str = DIM + "$" + "→".join(str(t) for t in totals) + RST
+    # Project costs (only if any differ from total)
+    has_proj = any(0 < p < t for p, t in zip(projects, totals))
+    if has_proj:
+        proj_vals = [str(p) if p > 0 else "·" for p in projects]
+        proj_str = f" {SUBDUED}proj:{DIM}${'→'.join(proj_vals)}{RST}"
+    else:
+        proj_str = ""
+
+    return f"{header} {total_str}{proj_str}"
 
 
 def _fmt_money(v: str) -> str:
@@ -536,49 +668,21 @@ def _fmt_money(v: str) -> str:
     return re.sub(r"(\.[^0])0$", r"\1", f)
 
 
-def _render_peak(now_epoch: float) -> str:
-    """Peak/off-peak indicator with countdown to next flip.
-
-    Peak hours: weekdays 12:00–18:00 UTC (8 AM–2 PM EDT).
-    Weekends are always off-peak.
-    """
+def _render_peak(_now_epoch: float) -> str:
+    """Peak/off-peak indicator with countdown to next flip."""
     if not _on("PEAK"):
         return ""
-    from datetime import datetime, timezone
+    from get_claude_usage import compute_peak_info
 
-    now = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
-    h = now.hour
-    wd = now.weekday()  # 0=Mon … 6=Sun
-    weekend = wd >= 5
-
-    PEAK_START, PEAK_END = 12, 18
-    peak = not weekend and PEAK_START <= h < PEAK_END
-
-    # Calculate minutes until next flip
-    if weekend:
-        # Minutes until Monday 12:00 UTC
-        days_until_mon = (7 - wd) % 7 or 7  # Sat=2, Sun=1
-        target = now.replace(hour=PEAK_START, minute=0, second=0, microsecond=0)
-        from datetime import timedelta
-        target += timedelta(days=days_until_mon)
-    elif peak:
-        # Flip at PEAK_END today
-        target = now.replace(hour=PEAK_END, minute=0, second=0, microsecond=0)
-    elif h >= PEAK_END:
-        # Off-peak evening — flip tomorrow at PEAK_START
-        from datetime import timedelta
-        target = now.replace(hour=PEAK_START, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    else:
-        # Off-peak morning — flip at PEAK_START today
-        target = now.replace(hour=PEAK_START, minute=0, second=0, microsecond=0)
-
-    mins = max(0, int((target - now).total_seconds()) // 60)
+    info = compute_peak_info()
+    peak = info["peak_is_peak"]
+    mins = info["peak_flip_seconds"] // 60
     hrs, m = divmod(mins, 60)
-    countdown = f"{hrs}h{m:02d}m"
+    countdown = f"{hrs}h{m:02d}m" if hrs else f"{m}m"
 
     if peak:
         return f"\033[0;31mPeak\033[0;90m({countdown})\033[0m"
-    if mins < 60:
+    if mins < 30:
         return f"\033[0;33mOffPk\033[0;90m({countdown})\033[0m"
     if mins < 300:
         return f"\033[0;32mOffPk\033[0;90m({countdown})\033[0m"
@@ -607,8 +711,10 @@ def _render_sessions(cwd: str, now: float) -> str:
                     continue
         count = len(projects)
         if count > 0:
-            col = "31" if count >= 4 else "33" if count >= 2 else "90"
-            return f"\033[0;90m+\033[0;{col}m{count}\033[0;90msess\033[0m"
+            col = "31" if count >= 4 else "33" if count >= 2 else ""
+            if col:
+                return f"{SUBDUED}+\033[0;{col}m{count}{SUBDUED}sess{RST}"
+            return f"{SUBDUED}+{count}sess{RST}"
     except OSError:
         pass
     return ""
@@ -627,10 +733,9 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
     w_pct = str(w_pct_raw) if w_pct_raw is not None and w_pct_raw != "" else ""
     have_rate_limits = s_pct or w_pct
 
-    def _bracket(inner: str) -> str:
-        return f"\033[0;34m[\033[0m{inner}\033[0;34m]\033[0m"
+    SEP = f"{SUBDUED} · {RST}"
 
-    # --- Rate-limit sections: S/W/So in one bracket ---
+    # --- Rate-limit sections: S/W/So ---
     rl_inners: list[str] = []
     rl_line = ""
 
@@ -648,6 +753,11 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
         )
         if s:
             rl_inners.append(s)
+
+        # Weekly pace indicator
+        pace = _weekly_pace(w_pct, usage.get("week_reset", ""), now)
+        if pace:
+            rl_inners.append(pace)
 
         # Sonnet (hidden below threshold)
         so_pct_raw = usage.get("sonnet_percent", "")
@@ -667,7 +777,7 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
             if upd_epoch is not None:
                 ttl_s = int(600 - (now - upd_epoch))
                 if ttl_s > 0:
-                    rl_inners.insert(0, f"\033[0;90mTTL:{ttl_s // 60}m{ttl_s % 60}s\033[0m")
+                    rl_inners.insert(0, f"{SUBDUED}TTL:{ttl_s // 60}m{ttl_s % 60}s{RST}")
                 else:
                     age_s = int(now - upd_epoch)
                     if age_s >= 3600:
@@ -688,15 +798,15 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
                     el = str(usage.get("extra_limit", "") or "")
                     if es and el:
                         extra = f"\033[0;90mE:${_fmt_money(es)}/${_fmt_money(el)}\033[0m"
-                        extra_sections.append(_bracket(extra))
+                        extra_sections.append(extra)
             except ValueError:
                 pass
 
         rl_line = " ".join(extra_sections) if extra_sections else ""
 
-    session_rl = _bracket(" ".join(rl_inners)) if rl_inners else ""
+    session_rl = SEP.join(rl_inners) if rl_inners else ""
 
-    # --- Cost line: 6H/12H/24H/7D/30D ---
+    # --- Cost line: label $proj/$total · separated ---
     cost_parts: list[str] = []
     if not _on("HISTORIC_COST"):
         return session_rl, rl_line, ""
@@ -706,32 +816,26 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
                         str(usage.get("six_hour_project_cost", "") or ""))
         if s:
             cost_parts.append(s)
-
     if _on("12H_COST", default=False):
         s = _usage_cost("12H", str(usage.get("twelve_hour_cost", "") or ""),
                         str(usage.get("twelve_hour_project_cost", "") or ""))
         if s:
             cost_parts.append(s)
-
     if _on("24H_COST"):
         s = _usage_cost("24H", str(usage.get("twenty_four_hour_cost", "") or ""),
                         str(usage.get("twenty_four_hour_project_cost", "") or ""))
         if s:
             cost_parts.append(s)
-
     if _on("7D_COST"):
         s = _usage_cost("7D", str(usage.get("seven_day_cost", "") or ""),
                         str(usage.get("seven_day_project_cost", "") or ""))
         if s:
             cost_parts.append(s)
-
     if _on("30D_COST"):
         s = _usage_cost("30D", str(usage.get("thirty_day_cost", "") or ""),
                         str(usage.get("thirty_day_project_cost", "") or ""))
         if s:
             cost_parts.append(s)
-
-    # All-time cost (shown only when there's cost beyond 30 days)
     if _on("AT_COST"):
         at_val = str(usage.get("all_time_cost", "") or "")
         td_val = str(usage.get("thirty_day_cost", "") or "")
@@ -745,9 +849,7 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
             except ValueError:
                 pass
 
-    cost_line = ""
-    if cost_parts:
-        cost_line = f"\033[0;34m[\033[0m{' '.join(cost_parts)}\033[0;34m]\033[0m"
+    cost_line = SEP.join(cost_parts) if cost_parts else ""
 
     return session_rl, rl_line, cost_line
 
@@ -768,10 +870,11 @@ def _render_session(
     parts: list[str] = []
 
     if model:
-        col = "0;90" if "Opus" in model else "0;36"
-        parts.append(_c(col, model))
+        # "Opus 4.6 (1M context)" → "Opus 4.6 1M"
+        short_model = re.sub(r"\s*\((\d+\w+)\s+context\)", r" \1", model)
+        parts.append(f"{SUBDUED}{short_model}{RST}")
 
-    # Per-session cost
+    # Per-session cost (dynamic — standard dim)
     if _on("COST") and session_cost:
         try:
             fmt = f"{float(session_cost):.2f}"
@@ -780,31 +883,31 @@ def _render_session(
         except ValueError:
             pass
 
-    # I/O ratio
+    # I/O ratio (structural)
     if _on("IO_RATIO") and total_in > 0 and total_out > 0:
         ratio = (total_out * 10 + total_in // 2) // total_in
         w, f = divmod(ratio, 10)
-        parts.append(f"\033[0;90mI/O:{w}.{f}x\033[0m")
+        parts.append(f"{SUBDUED}I/O:{w}.{f}x{RST}")
 
-    # Cumulative cache hit rate
+    # Cumulative cache hit rate (structural)
     if _on("CACHE_HIT"):
         ti = cum_fresh + cum_create + cum_read
         if ti > 0:
             ch = cum_read * 100 // ti
-            parts.append(f"\033[0;90mCH:{ch}%\033[0m")
+            parts.append(f"{SUBDUED}CH:{ch}%{RST}")
 
-    # Context window token counts (percentage moved to top line)
+    # Context window token counts (structural)
     if used and ctx_size > 0:
         used_int = math.ceil(float(used))
         used_k = (ctx_size * used_int + 99999) // 100000
-        total_k = (ctx_size + 999) // 1000
+        effective_size = max(1, ctx_size - AUTOCOMPACT_BUFFER) if _on("USABLE_CTX") else ctx_size
+        total_k = (effective_size + 999) // 1000
         total_str = f"{total_k // 1000}M" if total_k >= 1000 else f"{total_k}k"
-        parts.append(f"\033[0;90m{used_k}k/{total_str}\033[0m")
+        parts.append(f"{SUBDUED}{used_k}k/{total_str}{RST}")
 
     if not parts:
         return ""
-    inner = " ".join(parts)
-    return f"\033[0;34m[\033[0m{inner}\033[0;34m]\033[0m"
+    return " ".join(parts)
 
 
 # --- Main ---
@@ -926,7 +1029,7 @@ def main() -> None:
         _render_git(git_status, stash_out, branch, git_ins, git_del),
         _render_dogcat(dcat_data),
         _render_changes(lines_added, lines_removed),
-        _render_ctx_pct(used),
+        _render_ctx_pct(used, ctx_size),
     ]
     # Per-chat cost: compute directly from session JSONL file (scoped to session ID).
     chat_cost_val = compute_session_cost(session_id, cwd)
@@ -954,17 +1057,17 @@ def main() -> None:
         if upd is not None and (now_epoch - upd) >= 3600:
             usage_stale_1h = True
     if usage_stale_1h or (not usage_session_rl and (check_fetch_backoff() or not usage_data.get("session_percent"))):
-        usage_session_rl = (
-            f"\033[0;34m[\033[0m\033[0;31musage fetch failed\033[0m\033[0;34m]\033[0m"
-        )
+        usage_session_rl = f"\033[0;31musage fetch failed\033[0m"
+
+    DOT = f"{SUBDUED} · {RST}"
 
     top = [s for s in top if s]
     top_str = " ".join(top)
     peak_str = _render_peak(now_epoch)
     session_parts = [s for s in [session, peak_str] if s]
-    session_str = " ".join(session_parts) if session_parts else ""
+    session_str = DOT.join(session_parts) if session_parts else ""
     usage_parts = [s for s in [usage_session_rl, usage_rl, usage_cost] if s]
-    usage_str = " ".join(usage_parts) if usage_parts else ""
+    usage_str = DOT.join(usage_parts) if usage_parts else ""
 
     # Adaptive layout based on terminal width
     term_cols = _get_terminal_cols()
@@ -972,7 +1075,7 @@ def main() -> None:
         # Wide: 2 lines — top+session | usage+costs
         line1_parts = [s for s in [top_str, session_str] if s]
         line2_parts = [s for s in [usage_str] if s]
-        lines = [" ".join(line1_parts)]
+        lines = [DOT.join(line1_parts)]
         if line2_parts:
             lines.append(" ".join(line2_parts))
     else:
@@ -984,17 +1087,17 @@ def main() -> None:
             lines.append(usage_session_rl)
         rest = [s for s in [usage_rl, usage_cost] if s]
         if rest:
-            lines.append(" ".join(rest))
+            lines.append(DOT.join(rest))
 
     _t_elapsed = time.monotonic() - _t_start
     # macmon + timer + sessions on their own last line
     last_parts: list[str] = []
     if macmon_str:
         last_parts.append(macmon_str)
-    last_parts.append(f"\033[0;34m[\033[0;90m{_t_elapsed:.3f}s\033[0;34m]\033[0m")
+    last_parts.append(f"{SUBDUED}{_t_elapsed:.3f}s{RST}")
     if sessions:
         last_parts.append(sessions)
-    lines.append(" ".join(last_parts))
+    lines.append(DOT.join(last_parts))
     print("\n".join(lines))
 
 
