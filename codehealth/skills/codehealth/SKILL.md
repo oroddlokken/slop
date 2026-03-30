@@ -12,6 +12,13 @@ user-invokable: true
 
 Launch parallel code-quality agents, each analyzing the codebase through a different lens, then distill all findings into unified, prioritized action points.
 
+## Rules
+
+- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential. Everything above `---` in the agent template is identical across agents and gets cached by the API after the first agent, reducing input cost by ~90%.
+- **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
+- **Agents inherit the default model** — do not override with a specific model.
+- **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
+
 ## Workflow
 
 ### Step 1: Choose Mode
@@ -76,7 +83,7 @@ Detect which languages are in scope so agents review all of them, not just the l
 5. Ask: "Are these the languages to review? (Remove or add any)"
 6. After confirmation, pass the final language list to each agent via the `{languages}` placeholder
 
-**Important:** Do not retain or pass the file list from `git ls-files` to agents. It is only used here to identify languages. Agents discover files independently during their scan.
+**Important:** Do not retain or pass the file list from `git ls-files` to agents. It is only used here to identify languages.
 
 ### Step 1.75: Check for Existing Issue Tracker
 
@@ -106,7 +113,14 @@ Read `scan-steps.md` from this skill's directory and follow its scan procedure. 
 
 ### Step 3: Launch Agents
 
-Use the agent template (`agent.md`). Launch agents using the Agent tool — all in parallel for Full mode.
+Use the agent template (`agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
+
+**Launch strategy** — The agent template places all shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider so it forms a cacheable prompt prefix. Ask the user:
+
+- **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
+- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+
+If the user doesn't specify, use **Sequential**.
 
 **Placeholder resolution order:**
 1. In `agent.md`: replace `{codebase_snapshot}` with the snapshot built in Step 2.5
@@ -139,9 +153,3 @@ Other issues are still worth mentioning but give {area} roughly 3x the attention
 
 After all agents complete, read `distill.md` from this skill's directory and follow the distillation algorithm.
 
-## Rules
-
-- In Full mode, run all 12 agents in parallel for maximum throughput.
-- The orchestrator prescans the codebase once (Step 2.5) and passes the snapshot to all agents — agents do NOT scan independently.
-- Agents inherit the default model — do not override with a specific model.
-- Always run the distill step after all agents complete — raw agent output is overwhelming without deduplication and prioritization.

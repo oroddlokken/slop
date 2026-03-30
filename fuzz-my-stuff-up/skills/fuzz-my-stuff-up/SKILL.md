@@ -1,6 +1,6 @@
 ---
 name: fuzz-my-stuff-up
-description: "Adversarial code exploration. Spins up ~20 parallel agents — each trying to break the code from a different angle (empty inputs, unicode chaos, race conditions, injection, state machine abuse, etc.) — then distills all findings into prioritized action points."
+description: "Adversarial code exploration. Launches ~20 agents — sequentially (default, cheapest) or in parallel — each trying to break the code from a different angle (empty inputs, unicode chaos, race conditions, injection, state machine abuse, etc.) — then distills all findings into prioritized action points."
 args:
   - name: area
     description: The directory, feature, or component to fuzz (optional)
@@ -11,6 +11,14 @@ user-invokable: true
 # Fuzz My Stuff Up
 
 Launch ~20 parallel adversarial agents, each trying to break the codebase from a different angle — like fuzzing but with reasoning. Each agent thinks like an attacker, a confused user, a hostile environment, or an edge-case machine. Then distill all findings into prioritized action points.
+
+## Rules
+
+- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential. Everything above `---` in the agent template is identical across agents and gets cached by the API after the first agent, reducing input cost by ~90%.
+- **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
+- **Agents inherit the default model** — do not override with a specific model.
+- **Agents analyze code without modifying files.** Users review findings before acting.
+- **Run distillation only after all agents complete.** Distillation needs the full picture to deduplicate and prioritize.
 
 ## Workflow
 
@@ -80,26 +88,12 @@ Check if the project uses **dcat**. Run `which dcat`. If the command succeeds AN
 
 ### Step 4.5: Prescan the Codebase (orchestrator does this once)
 
-The orchestrator (you) reads the codebase once and builds a `{codebase_snapshot}` that gets passed to every fuzzer agent. This avoids ~20 agents each independently scanning the same files.
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads the codebase once and builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids ~20 agents each independently scanning the same files.
 
-1. Read manifest files (pyproject.toml, package.json, Cargo.toml, go.mod, etc.)
-2. Identify entry points: CLI parsers, API routes, event handlers, main functions, form handlers
-3. Identify data boundaries: where external input enters the system (HTTP requests, file reads, env vars, stdin, database results, message queues)
-4. Read key source files across all in-scope languages, focusing on: input parsing/validation, data transformation, error handling, config loading, external service integrations, auth/authz logic
-5. Check for existing validation: schemas, validators, type guards, assert statements, middleware
-6. Run `git log --oneline -15`
-7. Format all collected file contents into a snapshot block:
-
-````
-### file: <relative_path>
-```<ext>
-<full file contents>
-```
-````
-
-Include all source files read. Omit `.env*`, `*.secrets`, `*.key`, `*.pem` (list by name only).
-
-Store the result as `{codebase_snapshot}`.
+1. Replace `{languages}` and `{focus}` in `scan-steps.md`
+2. Follow the scan procedure — read manifests, source files, grep for risk patterns, git log
+3. Format all collected file contents into the snapshot format specified in `scan-steps.md`
+4. Store the result as `{codebase_snapshot}` for use in Step 5
 
 ### Step 5: Launch Agents
 
@@ -112,7 +106,7 @@ Read `fuzzer-agent.md` from this skill's directory. For each selected fuzzer:
 5. Replace `{codebase_snapshot}` with the snapshot from Step 4.5
 6. If the user specified a focus area, replace `{focus}` with the focus block below, replacing `{area}` within it with the user's specified area. If no focus was specified, replace `{focus}` with empty string.
 7. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with empty string.
-8. Launch all agents in parallel using the Agent tool
+8. Launch agents using the cache-optimized stagger described below
 
 **Focus block** (inserted when focus is set — replace `{area}` with the user's focus area):
 ```
@@ -123,7 +117,12 @@ Concentrate your fuzzing primarily on **{area}**. Go deeper on {area}-related co
 Other areas are still worth probing but give {area} roughly 3x the attention.
 ```
 
-**Launch all selected fuzzers in a single parallel batch.** Sequential launching wastes time and prevents detection of timing-related issues.
+**Launch strategy** — The agent template places all shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider so it forms a cacheable prompt prefix. Ask the user:
+
+- **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
+- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+
+If the user doesn't specify, use **Sequential**.
 
 ### Step 6: Distill
 
@@ -135,10 +134,3 @@ After all agents complete, read `distill.md` from this skill's directory and fol
 - If an agent returns zero findings, that is a valid result — note "{fuzzer}: no issues found" in the distill summary.
 - If some agents fail or timeout, distill with available results and note which fuzzers were skipped.
 
-## Rules
-
-- **Launch all selected fuzzers in a single parallel batch.** Sequential launching prevents timeout-related race condition detection and wastes time.
-- **The orchestrator prescans the codebase once (Step 4.5) and passes the snapshot to all agents** — agents do NOT scan independently. Agents do not share findings mid-run.
-- **Agents inherit the default model** — do not override with a specific model.
-- **Agents analyze code without modifying files.** This preserves codebase integrity and lets the user review findings before acting.
-- **Run distillation only after all agents complete.** Distillation needs the full picture to deduplicate and prioritize accurately.

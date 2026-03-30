@@ -3,6 +3,8 @@ This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for critical code that lacks test coverage. Not every line needs a test — focus on code where bugs would cause the most damage.
 
+**Note**: This reviewer identifies code lacking ANY tests. For deeper test quality analysis (assertion quality, mock debt, user flow coverage, data realism), use the `/test-my-tests` skill instead.
+
 ## What to Look For (Priority Order)
 
 ### 1. Authentication and authorization (CRITICAL)

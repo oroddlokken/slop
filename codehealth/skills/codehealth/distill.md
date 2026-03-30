@@ -9,6 +9,12 @@ After all agents complete, analyze the combined output:
    - **Hygiene**: Minor cleanliness issues worth fixing when nearby
    - **Noise**: Subjective preference or edge case not worth addressing — skip
 
+   **Severity → Tier mapping from agent output:**
+   - Agent "Critical" → Red
+   - Agent "High" → Red (if security/correctness) or Yellow (if maintainability)
+   - Agent "Medium" → Yellow
+   - Agent "Low" → Green
+
 2. Cross-reference with code: read only files explicitly referenced in findings (one per finding) to confirm line accuracy. Do not scan for additional patterns during distillation.
 
 3. Deduplicate using the following algorithm:

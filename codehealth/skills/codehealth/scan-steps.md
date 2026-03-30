@@ -19,7 +19,8 @@ Read broadly — the goal is to capture enough code across all languages so agen
 7. Detect tests: test/, tests/, spec/, __tests__/ — note test framework and approximate coverage
 8. Check CI/CD: .github/workflows/, .gitlab-ci.yml, Jenkinsfile — look at what's linted, tested, checked
 9. Git history snapshot: run `git log --oneline -20` — assess commit quality and recent activity areas
-10. Check for config management: config modules, settings files, feature flags. Note whether `.env` or secrets files exist, but do not read their contents — scan for credential patterns by filename and grep instead.
+10. Check for risk patterns: grep for `eval(`, `innerHTML`, `dangerouslySetInnerHTML`, `unwrap()` without justification, bare `except:`, `Any` type annotations. Even 1 instance of `eval()`/`innerHTML` with user input is a red flag; bare `except:`/`unwrap()` are concerns at >5 occurrences.
+11. Check for config management: config modules, settings files, feature flags. Note whether `.env` or secrets files exist, but do not read their contents — scan for credential patterns by filename and grep instead.
 
 {focus}
 
@@ -46,3 +47,5 @@ Include:
 Omit:
 - Files matching `.env*`, `*.secrets`, `*credentials*.json`, `*.key`, `*.pem`, `secrets.yml` — list by name only
 - Binary files — list by name only
+
+**Snapshot size limit**: If the snapshot exceeds ~80K tokens (~400 source files), ask the user to narrow scope before proceeding.

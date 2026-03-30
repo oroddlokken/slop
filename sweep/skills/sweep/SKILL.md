@@ -12,6 +12,14 @@ user-invokable: true
 
 Launch parallel design-review agents, each analyzing the codebase through a different lens, then distill all findings into unified, prioritized action points.
 
+## Rules
+
+- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential. Everything above `---` in the agent template is identical across agents and gets cached by the API after the first agent, reducing input cost by ~90%.
+- **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
+- **Agents inherit the default model** — do not override with a specific model.
+- **Agents perform read-only audits** — document findings for user review before any changes.
+- **Run distillation after all agents complete.** Every finding must reference a file path and line.
+
 ## Workflow
 
 ### Step 1: Choose Mode
@@ -60,7 +68,14 @@ Read `scan-steps.md` from this skill's directory and follow its scan procedure. 
 
 ### Step 3: Launch Agents
 
-Use a single agent template (`sweep-agent.md`). Launch agents using the Agent tool — all in parallel for Full mode.
+Use a single agent template (`sweep-agent.md`). The template places shared content (codebase snapshot, review checklist, output format) before the `---` divider to form a common prompt prefix for API caching.
+
+**Launch strategy** — The agent template places all shared content (codebase snapshot, review checklist, output format) before the `---` divider so it forms a cacheable prompt prefix. Ask the user:
+
+- **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
+- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+
+If the user doesn't specify, use **Sequential**.
 
 For each reviewer:
 1. Read `sweep-agent.md` from this skill's directory
@@ -100,69 +115,5 @@ All paths are relative to the skills directory.
 
 ### Step 4: Distill
 
-After all agents complete, analyze the combined output:
+After all agents complete, read `distill.md` from this skill's directory and follow the distillation algorithm.
 
-1. Read through every finding from every agent and classify:
-   - **Critical defect**: Broken functionality, WCAG A violation, security issue
-   - **Quality issue**: Poor UX, inconsistency, missing states, bad contrast
-   - **Design debt**: Suboptimal but functional — worth improving
-   - **Polish opportunity**: Small detail that separates good from great
-   - **Noise**: Subjective preference or edge case not worth addressing — skip
-
-2. Cross-reference with code: read referenced files to confirm issues exist
-
-3. Deduplicate using the following algorithm:
-   - **Pass 1 — File match**: Group findings that reference the same file and line range (within 10 lines). These are almost certainly the same issue.
-   - **Pass 2 — Category match**: Within the same file, merge findings that share an issue category (e.g., two agents both flagging "missing hover state" in the same component).
-   - **Pass 3 — Semantic match**: Across different files, merge findings that describe the same systemic issue (e.g., "inconsistent spacing" flagged by polish, arrange, and audit pointing at different components).
-   - After merging, mark cross-reviewer consensus with "flagged by N/{total}" where {total} is the number of reviewers run.
-   - Use the structured findings from each agent's `## Findings Summary` section as the primary dedup input.
-
-4. Output as:
-
-```
-## Sweep Results
-
-### Red — Fix Now
-Issues that affect accessibility, correctness, or core usability.
-
-1. [ ] **{title}** — {one-line description}
-   `{file_path}:{line}` — {what to change} | Fix with: `/{skill}`
-
-### Yellow — Should Address
-Real quality issues that affect design consistency or user experience.
-
-2. [ ] **{title}** — {one-line description}
-   `{file_path}:{line}` — {what to change} | Fix with: `/{skill}`
-
-### Green — Consider
-Valid improvements worth thinking about but not urgent.
-
-3. [ ] **{title}** — {one-line description}
-   `{file_path}:{line}` — {what to change} | Fix with: `/{skill}`
-
-### Skipped
-{count} findings were subjective preference or noise — ignored.
-```
-
-Rules for distilling:
-- **Number items sequentially across all sections** (1, 2, 3... not restarting per section) so the user can reference them by number
-- If dcat issues were found earlier, exclude any action point that overlaps with an existing tracked issue
-- Each item must have a file path — no vague suggestions
-- Each item must recommend which `/skill` to use for the fix
-- One line per fix — say what to change concretely
-- No duplicates — if multiple reviewers flagged the same thing, merge into one item with consensus count
-- Severity is based on user impact, not how many reviewers mentioned it
-- Skip style-only feedback unless it affects usability or consistency significantly
-
-After outputting, ask the user if they want to start working on any of the items (or run the suggested `/skill` on specific items).
-
-## Rules
-
-- **In Full mode, always run all 10 in parallel** — never sequentially
-- **The orchestrator prescans the codebase once (Step 2.5) and passes the snapshot to all agents** — agents do NOT scan independently
-- **Agents inherit the default model** — do not override with a specific model.
-- **Agents ONLY audit — they never modify code**
-- **Distill runs after all agents complete** — it needs the full picture
-- **Don't skip the distill step** — the action points are the whole point
-- **Every finding must reference a file path and line** — no hand-wavy suggestions

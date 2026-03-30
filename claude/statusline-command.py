@@ -27,6 +27,8 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_COST                  — session cost
     CLAUDE_STATUSLINE_IO_RATIO              — output/input token ratio
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate %
+  CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon)
+  CLAUDE_STATUSLINE_PEAK                    — peak/off-peak indicator with countdown
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
     CLAUDE_STATUSLINE_SONNET                — Sonnet usage %
@@ -172,6 +174,78 @@ def _collect_git(
         if m:
             deletions = int(m.group(1))
     return status_out, stash_out, toplevel, branch, insertions, deletions
+
+
+# --- Apple Silicon stats (macmon) ---
+
+
+def _start_macmon() -> subprocess.Popen[bytes] | None:
+    """Start macmon pipe as a non-blocking subprocess."""
+    if not _on("APPLE_SILICON"):
+        return None
+    try:
+        return subprocess.Popen(
+            ["macmon", "pipe", "-s", "1"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _collect_macmon(proc: subprocess.Popen[bytes] | None) -> dict:
+    """Collect macmon JSON output."""
+    if proc is None:
+        return {}
+    try:
+        out, _ = proc.communicate(timeout=5)
+        if out:
+            return json.loads(out.strip())
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        proc.kill()
+    return {}
+
+
+def _render_macmon(data: dict) -> str:
+    """Render Apple Silicon temps and power: CPU:53°C/0.8W GPU:49°C/0.1W ANE:0W"""
+    if not data:
+        return ""
+    temp = data.get("temp", {})
+    cpu_t = temp.get("cpu_temp_avg")
+    gpu_t = temp.get("gpu_temp_avg")
+    cpu_w = data.get("cpu_power")
+    gpu_w = data.get("gpu_power")
+    ane_w = data.get("ane_power")
+
+    parts: list[str] = []
+
+    if cpu_t is not None:
+        t = int(cpu_t)
+        col = "31" if t >= 90 else "33" if t >= 75 else "90"
+        w_str = f"/{cpu_w:.1f}W" if cpu_w is not None else ""
+        parts.append(f"\033[0;90mCPU:\033[0;{col}m{t}°C{w_str}\033[0m")
+
+    mem = data.get("memory", {})
+    ram_usage = mem.get("ram_usage")
+    ram_total = mem.get("ram_total")
+    if ram_usage is not None and ram_total is not None:
+        used_gb = ram_usage / (1024 ** 3)
+        total_gb = ram_total / (1024 ** 3)
+        parts.append(f"\033[0;90mRAM:{used_gb:.0f}GB/{total_gb:.0f}GB\033[0m")
+
+    if gpu_t is not None:
+        t = int(gpu_t)
+        col = "31" if t >= 90 else "33" if t >= 75 else "90"
+        w_str = f"/{gpu_w:.1f}W" if gpu_w is not None else ""
+        parts.append(f"\033[0;90mGPU:\033[0;{col}m{t}°C{w_str}\033[0m")
+
+    if ane_w is not None and ane_w > 0.05:
+        parts.append(f"\033[0;90mANE:{ane_w:.1f}W\033[0m")
+
+    if not parts:
+        return ""
+    inner = " ".join(parts)
+    return f"\033[0;34m[\033[0m{inner}\033[0;34m]\033[0m"
 
 
 # --- Usage data ---
@@ -462,6 +536,55 @@ def _fmt_money(v: str) -> str:
     return re.sub(r"(\.[^0])0$", r"\1", f)
 
 
+def _render_peak(now_epoch: float) -> str:
+    """Peak/off-peak indicator with countdown to next flip.
+
+    Peak hours: weekdays 12:00–18:00 UTC (8 AM–2 PM EDT).
+    Weekends are always off-peak.
+    """
+    if not _on("PEAK"):
+        return ""
+    from datetime import datetime, timezone
+
+    now = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+    h = now.hour
+    wd = now.weekday()  # 0=Mon … 6=Sun
+    weekend = wd >= 5
+
+    PEAK_START, PEAK_END = 12, 18
+    peak = not weekend and PEAK_START <= h < PEAK_END
+
+    # Calculate minutes until next flip
+    if weekend:
+        # Minutes until Monday 12:00 UTC
+        days_until_mon = (7 - wd) % 7 or 7  # Sat=2, Sun=1
+        target = now.replace(hour=PEAK_START, minute=0, second=0, microsecond=0)
+        from datetime import timedelta
+        target += timedelta(days=days_until_mon)
+    elif peak:
+        # Flip at PEAK_END today
+        target = now.replace(hour=PEAK_END, minute=0, second=0, microsecond=0)
+    elif h >= PEAK_END:
+        # Off-peak evening — flip tomorrow at PEAK_START
+        from datetime import timedelta
+        target = now.replace(hour=PEAK_START, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    else:
+        # Off-peak morning — flip at PEAK_START today
+        target = now.replace(hour=PEAK_START, minute=0, second=0, microsecond=0)
+
+    mins = max(0, int((target - now).total_seconds()) // 60)
+    hrs, m = divmod(mins, 60)
+    countdown = f"{hrs}h{m:02d}m"
+
+    if peak:
+        return f"\033[0;31mPeak\033[0;90m({countdown})\033[0m"
+    if mins < 60:
+        return f"\033[0;33mOffPk\033[0;90m({countdown})\033[0m"
+    if mins < 300:
+        return f"\033[0;32mOffPk\033[0;90m({countdown})\033[0m"
+    return f"\033[0;32mOffPk\033[0m"
+
+
 def _render_sessions(cwd: str, now: float) -> str:
     """Active sessions: distinct projects from history in last 15 min."""
     if not _on("SESSIONS"):
@@ -675,7 +798,8 @@ def _render_session(
         used_int = math.ceil(float(used))
         used_k = (ctx_size * used_int + 99999) // 100000
         total_k = (ctx_size + 999) // 1000
-        parts.append(f"\033[0;90m{used_k}k/{total_k}k\033[0m")
+        total_str = f"{total_k // 1000}M" if total_k >= 1000 else f"{total_k}k"
+        parts.append(f"\033[0;90m{used_k}k/{total_str}\033[0m")
 
     if not parts:
         return ""
@@ -687,6 +811,7 @@ def _render_session(
 
 
 def main() -> None:
+    _t_start = time.monotonic()
     test_mode = "-t" in sys.argv
 
     if test_mode:
@@ -738,8 +863,9 @@ def main() -> None:
 
     now_epoch = time.time()
 
-    # Start git commands (non-blocking) — runs while we do in-process work
+    # Start external commands (non-blocking) — runs while we do in-process work
     git_procs = _start_git(cwd)
+    macmon_proc = _start_macmon()
     try:
         # In-process: usage cache + dcat library (no subprocess)
         usage_data = _fetch_usage(session_id, cwd)
@@ -749,17 +875,40 @@ def main() -> None:
                 usage_data = compute_costs(session_id=session_id, cwd=cwd)
             except Exception:  # noqa: BLE001
                 pass
+        # Merge fresh cost data from cost summary cache (updated by compute_costs)
+        if usage_data and _on("HISTORIC_COST"):
+            try:
+                from cache_db import read_cost_summary
+                cost_summary = read_cost_summary(max_age=900)
+                if cost_summary:
+                    for k in (
+                        "six_hour_cost", "twelve_hour_cost", "twenty_four_hour_cost",
+                        "seven_day_cost", "thirty_day_cost", "all_time_cost",
+                        "six_hour_project_cost", "twelve_hour_project_cost",
+                        "twenty_four_hour_project_cost", "seven_day_project_cost",
+                        "thirty_day_project_cost", "all_time_project_cost",
+                    ):
+                        if k in cost_summary:
+                            usage_data[k] = cost_summary[k]
+            except Exception:  # noqa: BLE001
+                pass
         # Always compute project costs from cwd (independent of shared cache)
         if cwd and _on("HISTORIC_COST") and usage_data:
             usage_data.update(compute_project_rolling_costs(cwd))
         dcat_data = _fetch_dcat(cwd)
 
-        # Collect git results
+        # Collect git results and macmon data
         git_status, stash_out, toplevel, branch, git_ins, git_del = _collect_git(git_procs)
+        macmon_data = _collect_macmon(macmon_proc)
     finally:
         for p in git_procs.values():
             try:
                 p.kill()
+            except OSError:
+                pass
+        if macmon_proc:
+            try:
+                macmon_proc.kill()
             except OSError:
                 pass
 
@@ -794,6 +943,7 @@ def main() -> None:
         chat_cost,
     )
     sessions = _render_sessions(cwd, now_epoch)
+    macmon_str = _render_macmon(macmon_data)
     usage_session_rl, usage_rl, usage_cost = _render_usage(usage_data, now_epoch)
 
     # Show failure indicator when usage is empty and fetch is in error backoff
@@ -803,14 +953,15 @@ def main() -> None:
         upd = _parse_iso_epoch(str(usage_data.get("last_updated", "") or ""))
         if upd is not None and (now_epoch - upd) >= 3600:
             usage_stale_1h = True
-    if usage_stale_1h or (not usage_session_rl and not usage_rl and not usage_cost and check_fetch_backoff()):
+    if usage_stale_1h or (not usage_session_rl and (check_fetch_backoff() or not usage_data.get("session_percent"))):
         usage_session_rl = (
             f"\033[0;34m[\033[0m\033[0;31musage fetch failed\033[0m\033[0;34m]\033[0m"
         )
 
     top = [s for s in top if s]
     top_str = " ".join(top)
-    session_parts = [s for s in [session, sessions] if s]
+    peak_str = _render_peak(now_epoch)
+    session_parts = [s for s in [session, peak_str] if s]
     session_str = " ".join(session_parts) if session_parts else ""
     usage_parts = [s for s in [usage_session_rl, usage_rl, usage_cost] if s]
     usage_str = " ".join(usage_parts) if usage_parts else ""
@@ -835,6 +986,15 @@ def main() -> None:
         if rest:
             lines.append(" ".join(rest))
 
+    _t_elapsed = time.monotonic() - _t_start
+    # macmon + timer + sessions on their own last line
+    last_parts: list[str] = []
+    if macmon_str:
+        last_parts.append(macmon_str)
+    last_parts.append(f"\033[0;34m[\033[0;90m{_t_elapsed:.3f}s\033[0;34m]\033[0m")
+    if sessions:
+        last_parts.append(sessions)
+    lines.append(" ".join(last_parts))
     print("\n".join(lines))
 
 

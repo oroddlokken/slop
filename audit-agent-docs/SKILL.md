@@ -140,14 +140,30 @@ Read all discovered files and pass their contents (with their paths relative to 
 
 ### Step 3: Launch Agents
 
-Launch selected lens agents **in parallel** using the Agent tool. Each agent receives:
-- The full content of all documentation files (with filenames)
-- Its specific lens instructions (from the Lenses section above)
-- The key principle (agent docs, not human docs — skip code-derivable stuff)
+Use the agent template (`audit-agent.md`). The template places shared content (key principle, documentation snapshot, output format) before the `---` divider to form a cacheable prompt prefix.
 
-For domain lens (#7): also instruct the agent to scan relevant source directories and compare patterns found in code vs what's documented.
+**Launch strategy** — Ask the user:
+
+- **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
+- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+
+If the user doesn't specify, use **Sequential**.
+
+**Placeholder resolution:**
+1. In `audit-agent.md`: replace `{docs_snapshot}` with all discovered documentation file contents (with filenames and line numbers)
+2. In `audit-agent.md`: replace `{path}` with the project root
+3. In `audit-agent.md`: replace `{discovered_tools}` with the tools report from Step 2e
+
+For each selected lens:
+1. Read `audit-agent.md` from this skill's directory
+2. Replace shared placeholders as above
+3. Replace `{lens}` with the lens name (e.g., `Redundancy`)
+4. Replace `{lens_instructions}` with the lens-specific instructions from the Lenses section above
+5. Pass the result as the agent prompt
 
 Use `subagent_type: "Explore"` for all agents so they can read source files if needed.
+
+For the Domain lens: also instruct the agent to scan relevant source directories and compare patterns found in code vs what's documented.
 
 ### Step 4: Distill
 
@@ -195,7 +211,7 @@ After all agents complete, analyze the combined output:
 
 ## Rules
 
-- **Always run selected lenses in parallel** — never sequentially
+- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential for cost savings.
 - **Each agent audits independently** — don't share findings between them
 - **Distill runs after all agents complete**
 - **Propose edits, don't auto-apply** — the user decides what to change

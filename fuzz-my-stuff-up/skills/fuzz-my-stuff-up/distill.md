@@ -22,7 +22,7 @@ After all fuzzer agents complete, analyze the combined output:
 
 3. Deduplicate using the following algorithm:
    - **Pass 1 — File match**: Group findings that reference the same file and line range (within 10 lines). These are almost certainly the same issue seen from different attack angles.
-   - **Pass 2 — Defense match**: Within the same module, merge findings that all point to the same missing defense (e.g., three fuzzers all finding that `parse_input()` has no validation — that's one fix, not three issues).
+   - **Pass 2 — Pattern match**: Within the same module, merge findings that all point to the same missing defense (e.g., three fuzzers all finding that `parse_input()` has no validation — that's one fix, not three issues).
    - **Pass 3 — Systemic match**: Across different files, merge findings that describe the same systemic gap (e.g., "no input validation" flagged by empty-inputs, type-confusion, and malformed-input pointing at different endpoints — that's a pattern, not separate issues). Systemic issues are typically flagged by 3+ fuzzers from different angles. If only 1-2 agents flag it, keep findings separate unless the code path is identical.
    - After merging, mark cross-fuzzer consensus with "flagged by N/{total}" where {total} is the number of fuzzers run.
    - Extract the `## Findings Summary` table from each agent's output as the primary dedup input. If an agent's output lacks this table, extract findings from the prose and note reduced confidence.
