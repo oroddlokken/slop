@@ -95,7 +95,7 @@ Read `scan-steps.md` from this skill's directory and follow its scan procedure. 
 
 ### Step 3: Launch Agents
 
-Use the agent template (`test-agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a cacheable prompt prefix.
+Use the agent template (`test-agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
 
 **Launch strategy** — Ask the user:
 
@@ -104,21 +104,25 @@ Use the agent template (`test-agent.md`). The template places shared content (co
 
 If the user doesn't specify, use **Sequential**.
 
-**Placeholder resolution:**
-1. In `test-agent.md`: replace `{codebase_snapshot}` with the snapshot from Step 2.5
-2. In `test-agent.md`: replace `{path}`, `{languages}`, `{focus}`, `{known_issues}`
+**Cache structure** — The `---` divider in test-agent.md is the cache boundary. Everything above it is the shared prefix (identical for all agents). Everything below is per-agent. API prompt caching matches byte-for-byte prefixes, so:
+- Shared prefix placeholders (`{codebase_snapshot}`, `{path}`, `{languages}`, `{focus}`, `{known_issues}`) resolve to the **same value** for all agents. Resolve these once and reuse the identical string.
+- Per-agent placeholders (`{reviewer}`, `{reviewer_criteria}`) differ per agent. These go below `---` and do not affect cache matching.
+- **Never insert per-agent content above the `---` line.** This includes scope boundary rules — append those after `{reviewer_criteria}`, not in the shared prefix.
 
-For each reviewer:
+**Build the shared prefix once:**
 1. Read `test-agent.md` from this skill's directory
-2. Replace `{codebase_snapshot}` with the snapshot
-3. Replace `{path}` with the target path
+2. Replace `{path}` with the target path
+3. Replace `{codebase_snapshot}` with the snapshot from Step 2.5
 4. Replace `{languages}` with the confirmed language list
-5. Read the reviewer's criteria file from `reviewers/{reviewer}.md`. If the file does not exist, skip that reviewer and warn the user. Replace `{reviewer_criteria}` with the file contents.
-6. Replace `{reviewer}` with the reviewer name
-7. If the user specified a focus area, replace `{focus}` with the focus block below. If no focus, replace with empty string.
-8. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with empty string.
-9. For overlapping reviewers, append the relevant scope boundary rule from the Scope Boundaries section to the agent prompt.
-10. Pass the result as the agent prompt
+5. If the user specified a focus area, replace `{focus}` with the focus block below. Otherwise replace with an empty string.
+6. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with an empty string.
+7. Store this as the **resolved template** — the content above `---` is now fixed and identical for all agents.
+
+**For each reviewer, resolve per-agent content:**
+1. In the resolved template, replace `{reviewer}` with the reviewer name (e.g., `coverage-gaps`)
+2. Read `reviewers/{reviewer}.md`. If the file does not exist, skip that reviewer and warn the user. Replace `{reviewer_criteria}` with the file contents.
+3. For overlapping reviewers (coverage-gaps/happy-path-only, error-paths/boundary-values, assertion-quality/happy-path-only, mock-debt/fragile-tests, data-realism/boundary-values), append the relevant scope boundary rule from the Scope Boundaries section **after** `{reviewer_criteria}` (below `---`).
+4. Pass the result as the agent prompt
 
 **Focus block** (inserted when focus is set — replace `{area}` with the user's focus area):
 ```

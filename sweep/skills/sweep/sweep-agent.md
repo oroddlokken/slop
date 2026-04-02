@@ -10,6 +10,8 @@ The orchestrator has already scanned the codebase. Here are the files:
 
 Read files and run targeted searches (Grep, Glob, Read) only. Do not modify, create, or delete files, execute code, or make network requests. The snapshot is your primary input; use tools only to verify specific issues deeper. Restrict all searches to `{path}` and its subdirectories. Skip sensitive files (`.env*`, `*.secrets`, `*credentials*.json`, `*.key`, `*.pem`) — report paths only.
 
+{known_issues}
+
 ### What to Look For
 
 When analyzing each UI file, note:
@@ -40,6 +42,10 @@ End your review with a structured findings table:
 
 Severity levels: Critical, High, Medium, Low
 Every finding MUST reference a real file path and line number. No vague suggestions.
+
+<!-- CACHE BOUNDARY: Everything above this line is the shared prefix — identical
+     across all reviewer agents. Everything below is per-agent. Do not insert
+     per-agent content (reviewer name, criteria, scope rules) above this line. -->
 
 ---
 

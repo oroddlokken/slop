@@ -35,6 +35,10 @@ End your review with a structured findings table. Use the format specified in yo
 
 Severity levels: Critical, High, Medium, Low
 
+<!-- CACHE BOUNDARY: Everything above this line is the shared prefix — identical
+     across all reviewer agents. Everything below is per-agent. Do not insert
+     per-agent content (reviewer name, criteria, scope rules) above this line. -->
+
 ---
 
 # Your Assignment: {reviewer}

@@ -41,6 +41,10 @@ End your review with a structured findings table:
 - **Medium**: Existing test with significant quality gaps (weak assertions, unrealistic data)
 - **Low**: Minor test improvement that would increase confidence
 
+<!-- CACHE BOUNDARY: Everything above this line is the shared prefix — identical
+     across all reviewer agents. Everything below is per-agent. Do not insert
+     per-agent content (reviewer name, criteria, scope rules) above this line. -->
+
 ---
 
 # Your Assignment: {reviewer}

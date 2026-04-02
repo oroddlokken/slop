@@ -49,6 +49,10 @@ After the table, write a brief **Attack Narrative** (3-5 sentences max):
 - If critical findings exist: describe the most dangerous attack chain and how a real attacker or confused user would exploit it.
 - If no critical findings: summarize the strongest defensive pattern observed and note what minor gaps remain.
 
+<!-- CACHE BOUNDARY: Everything above this line is the shared prefix — identical
+     across all fuzzer agents. Everything below is per-agent. Do not insert
+     per-agent content (fuzzer name, attack angle, scope rules) above this line. -->
+
 ---
 
 # Your Assignment: {fuzzer}

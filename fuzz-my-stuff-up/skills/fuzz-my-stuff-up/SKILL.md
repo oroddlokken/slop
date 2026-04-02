@@ -97,16 +97,34 @@ Read `scan-steps.md` from this skill's directory and follow its scan procedure. 
 
 ### Step 5: Launch Agents
 
-Read `fuzzer-agent.md` from this skill's directory. For each selected fuzzer:
+Use the agent template (`fuzzer-agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
 
-1. Replace `{fuzzer}` with the fuzzer name (e.g., `empty-inputs`)
-2. Replace `{attack_angle}` with the attack angle description from the table above
-3. Replace `{path}` with the target path
+**Launch strategy** — Ask the user:
+
+- **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
+- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+
+If the user doesn't specify, use **Sequential**.
+
+**Cache structure** — The `---` divider in fuzzer-agent.md is the cache boundary. Everything above it is the shared prefix (identical for all agents). Everything below is per-agent. API prompt caching matches byte-for-byte prefixes, so:
+- Shared prefix placeholders (`{codebase_snapshot}`, `{path}`, `{languages}`, `{focus}`, `{known_issues}`) resolve to the **same value** for all agents. Resolve these once and reuse the identical string.
+- Per-agent placeholders (`{fuzzer}`, `{attack_angle}`) differ per agent. These go below `---` and do not affect cache matching.
+- **Never insert per-agent content above the `---` line.** This includes scope boundary rules — append those after per-agent content, not in the shared prefix.
+
+**Build the shared prefix once:**
+1. Read `fuzzer-agent.md` from this skill's directory
+2. Replace `{path}` with the target path
+3. Replace `{codebase_snapshot}` with the snapshot from Step 4.5
 4. Replace `{languages}` with the confirmed language list
-5. Replace `{codebase_snapshot}` with the snapshot from Step 4.5
-6. If the user specified a focus area, replace `{focus}` with the focus block below, replacing `{area}` within it with the user's specified area. If no focus was specified, replace `{focus}` with empty string.
-7. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with empty string.
-8. Launch agents using the cache-optimized stagger described below
+5. If the user specified a focus area, replace `{focus}` with the focus block below, replacing `{area}` within it with the user's specified area. Otherwise replace `{focus}` with an empty string.
+6. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with an empty string.
+7. Store this as the **resolved template** — the content above `---` is now fixed and identical for all agents.
+
+**For each fuzzer, resolve per-agent content:**
+1. In the resolved template, replace `{fuzzer}` with the fuzzer name (e.g., `empty-inputs`)
+2. Replace `{attack_angle}` with the attack angle description from the table above
+3. For overlapping fuzzers (path-traversal/filesystem-edge, injection/malformed-input, empty-inputs/type-confusion, api-abuse/adversarial-user), append the relevant scope boundary rule from the Scope Boundaries section **after** the per-agent content (below `---`).
+4. Pass the result as the agent prompt
 
 **Focus block** (inserted when focus is set — replace `{area}` with the user's focus area):
 ```
@@ -116,13 +134,6 @@ Concentrate your fuzzing primarily on **{area}**. Go deeper on {area}-related co
 
 Other areas are still worth probing but give {area} roughly 3x the attention.
 ```
-
-**Launch strategy** — The agent template places all shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider so it forms a cacheable prompt prefix. Ask the user:
-
-- **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
-- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
-
-If the user doesn't specify, use **Sequential**.
 
 ### Step 6: Distill
 
