@@ -295,7 +295,7 @@ def _fetch_usage(session_id: str, cwd: str) -> dict:
     if script.exists():
         try:
             subprocess.Popen(
-                [sys.executable, str(script), "--session", session_id, "--cwd", cwd],
+                [sys.executable, str(script), "--wait-timeout", "4", "--session", session_id, "--cwd", cwd],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -515,10 +515,10 @@ def _usage_section(label: str, pct_s: str, reset_iso: str, now: float) -> str:
 
 
 def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
-    """Weekly pace indicator: compare actual usage % to expected % based on day of week.
+    """Weekly pace indicator: compare actual usage % to expected % based on elapsed time.
 
-    Expected = how far through the 7-day window we are.
-    Delta thresholds: >+15 Overcooking, >+5 Warm, ±5 On Pace, <-5 Cool, <-15 Underusing.
+    Expected = how far through the 7-day window we are (time-based, not day-based).
+    Display: "{el_d}d{el_h}h/7d {sign}{delta}%"
     """
     if not _on("WEEKLY_PACE"):
         return ""
@@ -532,21 +532,36 @@ def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
     except ValueError:
         return ""
     week_start = reset_epoch - 7 * 86400
-    elapsed = (now - week_start) / (7 * 86400)
+    elapsed_s = now - week_start
+    elapsed = elapsed_s / (7 * 86400)
     if elapsed <= 0 or elapsed > 1:
         return ""
     expected = elapsed * 100
     delta = actual - expected
-    day = max(1, min(7, math.ceil(elapsed * 7)))
+    # Compact elapsed time: "3d14h" or "0d5h" or "6d"
+    el_d = int(elapsed_s // 86400)
+    el_h = int((elapsed_s % 86400) // 3600)
+    if el_h > 0:
+        elapsed_str = f"{el_d}d{el_h}h"
+    else:
+        elapsed_str = f"{el_d}d"
+    # Remaining time until reset
+    remain_s = int(reset_epoch - now)
+    if remain_s > 0:
+        cd = _usage_countdown(reset_iso, now)
+        time_part = f"{elapsed_str}/7d({cd})"
+    else:
+        time_part = f"{elapsed_str}/7d"
     d_round = round(delta)
     sign = "+" if d_round >= 0 else ""
-    return f"\033[0;90mD{day}/7 {sign}{d_round}%\033[0m"
+    return f"\033[0;90m{time_part} {sign}{d_round}%\033[0m"
 
 
 def _usage_combined(
     label: str, pct_s: str, reset_iso: str, cost_s: str, now: float,
+    *, pace: str = "",
 ) -> str:
-    """Render compact usage: S:17% $7 3h3m"""
+    """Render compact usage: W:26% $293 1d6h/7d 5d17h"""
     if not pct_s:
         return ""
     try:
@@ -562,9 +577,12 @@ def _usage_combined(
                 parts.append(f"\033[0;90m${rounded}\033[0m")
         except ValueError:
             pass
-    cd = _usage_countdown(reset_iso, now)
-    if cd:
-        parts.append(f"\033[0;90m{cd}\033[0m")
+    if pace:
+        parts.append(pace)
+    else:
+        cd = _usage_countdown(reset_iso, now)
+        if cd:
+            parts.append(f"\033[0;90m{cd}\033[0m")
     return " ".join(parts)
 
 
@@ -747,17 +765,14 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
         if s:
             rl_inners.append(s)
 
+        pace = _weekly_pace(w_pct, usage.get("week_reset", ""), now)
         s = _usage_combined(
             "W", w_pct, usage.get("week_reset", ""),
             str(usage.get("week_cost", "") or ""), now,
+            pace=pace,
         )
         if s:
             rl_inners.append(s)
-
-        # Weekly pace indicator
-        pace = _weekly_pace(w_pct, usage.get("week_reset", ""), now)
-        if pace:
-            rl_inners.append(pace)
 
         # Sonnet (hidden below threshold)
         so_pct_raw = usage.get("sonnet_percent", "")

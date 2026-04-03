@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-SETUP_DIR="${SETUP_DIR:-$(dirname "${0:A}")/..}"
+SETUP_DIR="${SETUP_DIR:-$HOME/git/macsetup}"
 
 # --- Fetch usage JSON ---
 
@@ -184,6 +184,62 @@ ccu_reset_fmt() {
   fi
 }
 
+# Weekly pace: compare actual usage % to expected % based on time elapsed in window.
+ccu_pace() {
+  local actual=$1 reset_iso=$2
+  [[ -z "$actual" || -z "$reset_iso" ]] && return 0
+  local reset_epoch
+  reset_epoch=$(ccu_iso_to_epoch "$reset_iso")
+  [[ -z "$reset_epoch" ]] && return 0
+
+  local now_epoch week_start elapsed_s total_s
+  now_epoch=$(date +%s)
+  week_start=$(( reset_epoch - 7 * 86400 ))
+  elapsed_s=$(( now_epoch - week_start ))
+  total_s=$(( 7 * 86400 ))
+
+  (( elapsed_s <= 0 || elapsed_s > total_s )) && return 0
+
+  local expected=$(( elapsed_s * 100 / total_s ))
+  local delta=$(( actual - expected ))
+
+  # Elapsed time display using ccu_countdown style
+  local el_d=$(( elapsed_s / 86400 ))
+  local el_h=$(( (elapsed_s % 86400) / 3600 ))
+  local elapsed_str=""
+  if (( el_d > 0 && el_h > 0 )); then
+    elapsed_str="${el_d}d ${el_h}h"
+  elif (( el_d > 0 )); then
+    elapsed_str="${el_d}d"
+  else
+    elapsed_str="${el_h}h"
+  fi
+
+  local abs_delta=${delta#-}
+  local label color
+  if (( delta > 15 )); then
+    label="ahead"; color="0;31"   # red — overcooking
+  elif (( delta > 5 )); then
+    label="ahead"; color="0;33"   # yellow — warm
+  elif (( delta >= -5 )); then
+    label="on pace"; color="0;32" # green
+  elif (( delta >= -15 )); then
+    label="behind"; color="0;36"  # cyan — cool
+  else
+    label="behind"; color="0;90"  # dim — underusing
+  fi
+
+  local sign=""
+  (( delta >= 0 )) && sign="+"
+  if [[ "$label" == "on pace" ]]; then
+    printf '\033[0;90m%s into 7-day window — %d%% expected, \033[%sm%s%d%% on pace\033[0m\n' \
+      "$elapsed_str" "$expected" "$color" "$sign" "$delta"
+  else
+    printf '\033[0;90m%s into 7-day window — %d%% expected, \033[%sm%s%d%% %s\033[0m\n' \
+      "$elapsed_str" "$expected" "$color" "$sign" "$delta" "$label"
+  fi
+}
+
 # Render one usage section: title, bar, percentage, reset info.
 ccu_section() {
   local title=$1 pct=$2 reset_iso=${3:-} extra_info=${4:-}
@@ -220,6 +276,7 @@ ccu_section "Current session" "$s_pct" "$s_reset"
 if [[ -n "$w_pct" ]]; then
   echo
   ccu_section "Current week (all models)" "$w_pct" "$w_reset"
+  ccu_pace "$w_pct" "$w_reset"
 fi
 if [[ -n "$so_pct" ]]; then
   echo

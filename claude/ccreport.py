@@ -12,12 +12,13 @@ update CLAUDE.md to match.
 """
 
 import argparse
+import calendar
 import hashlib
 import json
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import orjson
@@ -325,6 +326,11 @@ def load_all_records(
 # --- Formatting ---
 
 console = Console(soft_wrap=True)
+NARROW_WIDTH = 100
+
+
+def _is_narrow() -> bool:
+    return console.width < NARROW_WIDTH
 
 
 def fmt_tokens(n: int) -> str:
@@ -373,8 +379,13 @@ def short_model(model: str) -> str:
     return m
 
 
-def _add_token_columns(table: Table, *, compact: bool = False) -> None:
+def _add_token_columns(table: Table, *, compact: bool = False, narrow: bool = False) -> None:
     """Add the standard token + cost columns to a table."""
+    if narrow:
+        table.add_column("Cost", justify="right", no_wrap=True)
+        table.add_column("Tokens", justify="right", style="bold", no_wrap=True)
+        table.add_column("Calls", justify="right", style="dim", no_wrap=True)
+        return
     table.add_column("Input", justify="right", style="cyan", no_wrap=True)
     table.add_column("Output", justify="right", style="cyan", no_wrap=True)
     if not compact:
@@ -396,9 +407,11 @@ def _fmt_cache_read(t: TokenCounts) -> str:
     return s
 
 
-def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False) -> list:
+def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False, narrow: bool = False) -> list:
     """Build the token/cost cells for a bucket."""
     cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
+    if narrow:
+        return [cost_text, fmt_tokens(b.tokens.total), str(b.count)]
     row = [
         fmt_tokens(b.tokens.input),
         fmt_tokens(b.tokens.output),
@@ -418,6 +431,7 @@ def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False
 
 def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
     """Print daily usage report."""
+    narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
     model_buckets: dict[str, dict[str, AggBucket]] = defaultdict(lambda: defaultdict(AggBucket))
 
@@ -438,15 +452,18 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
 
     table = Table(title=f"Daily Usage ({len(buckets)} days)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
     table.add_column("Date", style="white", no_wrap=True)
-    _add_token_columns(table)
-    table.add_column("Models", style="dim", no_wrap=True)
+    _add_token_columns(table, narrow=narrow)
+    if not narrow:
+        table.add_column("Models", style="dim", no_wrap=True)
 
     total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
     for day in sorted(buckets):
         b = buckets[day]
-        models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(day, *_token_row(b, total_cost), models_str)
+        row = [day, *_token_row(b, total_cost, narrow=narrow)]
+        if not narrow:
+            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+        table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
@@ -455,26 +472,35 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
         if breakdown:
             for model in sorted(model_buckets[day]):
                 mb = model_buckets[day][model]
-                table.add_row(f"  [dim]{short_model(model)}[/dim]", *_token_row(mb, total_cost), "")
+                brow = [f"  [dim]{short_model(model)}[/dim]", *_token_row(mb, total_cost, narrow=narrow)]
+                if not narrow:
+                    brow.append("")
+                table.add_row(*brow)
 
     table.add_section()
-    table.add_row(
-        Text("TOTAL", style="bold"),
-        *_token_row(total_agg),
-        f"{len(total_agg.models)} models",
-        style="bold",
-    )
+    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, narrow=narrow)]
+    if not narrow:
+        total_row.append(f"{len(total_agg.models)} models")
+    table.add_row(*total_row, style="bold")
     n = len(buckets)
     if n > 1:
         avg_cost = total_agg.cost / n
-        table.add_row(
-            Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
-            Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "", "",
-            "per day",
-            style="dim",
-        )
+        if narrow:
+            table.add_row(
+                Text("AVG", style="dim bold"),
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                style="dim",
+            )
+        else:
+            table.add_row(
+                Text("AVERAGE", style="dim bold"),
+                "", "", "", "", "",
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                "per day",
+                style="dim",
+            )
 
     console.print()
     console.print(table)
@@ -483,6 +509,7 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
 
 def report_monthly(records: list[UsageRecord]) -> None:
     """Print monthly usage report."""
+    narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
 
     for rec in records:
@@ -496,38 +523,104 @@ def report_monthly(records: list[UsageRecord]) -> None:
 
     table = Table(title=f"Monthly Usage ({len(buckets)} months)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
     table.add_column("Month", style="white", no_wrap=True)
-    _add_token_columns(table)
-    table.add_column("Models", style="dim", no_wrap=True)
+    _add_token_columns(table, narrow=narrow)
+    if not narrow:
+        table.add_column("Models", style="dim", no_wrap=True)
 
     total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
     for month in sorted(buckets):
         b = buckets[month]
-        models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(month, *_token_row(b, total_cost), models_str)
+        row = [month, *_token_row(b, total_cost, narrow=narrow)]
+        if not narrow:
+            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+        table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
         total_agg.models |= b.models
 
     table.add_section()
-    table.add_row(
-        Text("TOTAL", style="bold"),
-        *_token_row(total_agg),
-        f"{len(total_agg.models)} models",
-        style="bold",
-    )
+    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, narrow=narrow)]
+    if not narrow:
+        total_row.append(f"{len(total_agg.models)} models")
+    table.add_row(*total_row, style="bold")
     n = len(buckets)
     if n > 1:
         avg_cost = total_agg.cost / n
-        table.add_row(
-            Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
-            Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "", "",
-            "per month",
-            style="dim",
-        )
+        if narrow:
+            table.add_row(
+                Text("AVG", style="dim bold"),
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                style="dim",
+            )
+        else:
+            table.add_row(
+                Text("AVERAGE", style="dim bold"),
+                "", "", "", "", "",
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                "per month",
+                style="dim",
+            )
+
+    # Projected cost for the current (latest) partial month
+    latest_month = max(buckets)
+    today = datetime.now().astimezone()
+    current_month_key = today.strftime("%Y-%m")
+    if latest_month == current_month_key:
+        table.add_section()
+        days_elapsed = today.day
+        days_in_month = calendar.monthrange(today.year, today.month)[1]
+        if days_elapsed < days_in_month:
+            projected = buckets[latest_month].cost / days_elapsed * days_in_month
+            if narrow:
+                table.add_row(
+                    Text("PROJ", style="dim bold italic"),
+                    Text(fmt_cost(projected), style=cost_style(projected)),
+                    "", "",
+                    style="dim",
+                )
+            else:
+                table.add_row(
+                    Text("PROJECTED", style="dim bold italic"),
+                    "", "", "", "", "",
+                    Text(fmt_cost(projected), style=cost_style(projected)),
+                    "", "",
+                    f"({days_elapsed}/{days_in_month} days in {today.strftime('%B')})",
+                    style="dim",
+                )
+
+            # Projected based on trailing 14-day daily average
+            # Window: the 14 days ending yesterday (today is incomplete)
+            window = 14
+            end_14d = today.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_14d = end_14d - timedelta(days=window)
+            cost_14d = 0.0
+            for rec in records:
+                rec_local = rec.timestamp.astimezone()
+                if start_14d <= rec_local < end_14d:
+                    cost_14d += record_cost(rec)
+            if cost_14d > 0:
+                avg_daily_14d = cost_14d / window
+                projected_14d = avg_daily_14d * days_in_month
+                if narrow:
+                    table.add_row(
+                        Text("PROJ 14d", style="dim bold italic"),
+                        Text(fmt_cost(projected_14d), style=cost_style(projected_14d)),
+                        "", "",
+                        style="dim",
+                    )
+                else:
+                    table.add_row(
+                        Text("PROJECTED", style="dim bold italic"),
+                        "", "", "", "", "",
+                        Text(fmt_cost(projected_14d), style=cost_style(projected_14d)),
+                        "", "",
+                        f"Last {window} days avg",
+                        style="dim",
+                    )
 
     console.print()
     console.print(table)
@@ -536,6 +629,7 @@ def report_monthly(records: list[UsageRecord]) -> None:
 
 def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     """Print per-project usage report."""
+    narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
 
     for rec in records:
@@ -555,51 +649,68 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
 
     table = Table(title=f"Projects ({shown})", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
     table.add_column("Project", style="magenta", no_wrap=True)
-    _add_token_columns(table, compact=True)
-    table.add_column("Models", style="dim", no_wrap=True)
+    _add_token_columns(table, compact=True, narrow=narrow)
+    if not narrow:
+        table.add_column("Models", style="dim", no_wrap=True)
 
     total_cost = sum(buckets[p].cost for p in sorted_projects)
     total_agg = AggBucket()
     for proj in sorted_projects:
         b = buckets[proj]
-        models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(proj, *_token_row(b, total_cost, compact=True), models_str)
+        row = [proj, *_token_row(b, total_cost, compact=True, narrow=narrow)]
+        if not narrow:
+            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+        table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
         total_agg.models |= b.models
 
     table.add_section()
-    table.add_row(
-        Text("TOTAL", style="bold"),
-        *_token_row(total_agg, compact=True),
-        f"{len(total_agg.models)} models",
-        style="bold",
-    )
+    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, compact=True, narrow=narrow)]
+    if not narrow:
+        total_row.append(f"{len(total_agg.models)} models")
+    table.add_row(*total_row, style="bold")
     n = len(sorted_projects)
     if n > 1:
         avg_cost = total_agg.cost / n
-        table.add_row(
-            Text("AVERAGE", style="dim bold"),
-            "", "", "",
-            Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "", "",
-            f"per project (top {n})",
-            style="dim",
-        )
+        if narrow:
+            table.add_row(
+                Text("AVG", style="dim bold"),
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                style="dim",
+            )
+        else:
+            table.add_row(
+                Text("AVERAGE", style="dim bold"),
+                "", "", "",
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                f"per project (top {n})",
+                style="dim",
+            )
     # Average across ALL projects
     all_n = len(buckets)
     if all_n > 1:
         all_cost = sum(b.cost for b in buckets.values())
         all_avg = all_cost / all_n
-        table.add_row(
-            Text("AVERAGE", style="dim bold"),
-            "", "", "",
-            Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-            "", "",
-            f"per project (all {all_n})",
-            style="dim",
-        )
+        if narrow:
+            table.add_row(
+                Text("AVG", style="dim bold"),
+                Text(fmt_cost(all_avg), style=cost_style(all_avg)),
+                f"all {all_n}", "",
+                style="dim",
+            )
+        else:
+            table.add_row(
+                Text("AVERAGE", style="dim bold"),
+                "", "", "",
+                Text(fmt_cost(all_avg), style=cost_style(all_avg)),
+                "", "",
+                f"per project (all {all_n})",
+                style="dim",
+            )
 
     console.print()
     console.print(table)
@@ -608,6 +719,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
 
 def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
     """Print per-session usage report."""
+    narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
     session_meta: dict[str, dict] = {}
 
@@ -636,80 +748,122 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         shown = str(len(buckets))
 
     table = Table(title=f"Sessions ({shown})", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
-    table.add_column("Session", style="dim", no_wrap=True)
-    table.add_column("Project", style="magenta", no_wrap=True)
-    table.add_column("Date", style="white", no_wrap=True)
-    table.add_column("Input", justify="right", style="cyan", no_wrap=True)
-    table.add_column("Output", justify="right", style="cyan", no_wrap=True)
-    table.add_column("Total", justify="right", style="bold", no_wrap=True)
-    table.add_column("Cost", justify="right", no_wrap=True)
-    table.add_column("%", justify="right", style="dim", no_wrap=True)
-    table.add_column("Calls", justify="right", style="dim", no_wrap=True)
-    table.add_column("Models", style="dim", no_wrap=True)
+    if narrow:
+        table.add_column("Project", style="magenta", no_wrap=True)
+        table.add_column("Date", style="white", no_wrap=True)
+        _add_token_columns(table, narrow=True)
+    else:
+        table.add_column("Session", style="dim", no_wrap=True)
+        table.add_column("Project", style="magenta", no_wrap=True)
+        table.add_column("Date", style="white", no_wrap=True)
+        table.add_column("Input", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Output", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Total", justify="right", style="bold", no_wrap=True)
+        table.add_column("Cost", justify="right", no_wrap=True)
+        table.add_column("%", justify="right", style="dim", no_wrap=True)
+        table.add_column("Calls", justify="right", style="dim", no_wrap=True)
+        table.add_column("Models", style="dim", no_wrap=True)
 
     total_cost = sum(buckets[s].cost for s in sorted_sessions)
     total_agg = AggBucket()
     for sid in sorted_sessions:
         b = buckets[sid]
         meta = session_meta[sid]
-        short_sid = sid[-8:] if len(sid) > 8 else sid
         cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
-        models_str = ", ".join(sorted(short_model(m) for m in b.models))
-        table.add_row(
-            short_sid,
-            meta["project"],
-            meta["last"].astimezone().strftime("%Y-%m-%d %H:%M"),
-            fmt_tokens(b.tokens.input),
-            fmt_tokens(b.tokens.output),
-            fmt_tokens(b.tokens.total),
-            cost_text,
-            fmt_pct(b.cost, total_cost),
-            str(b.count),
-            models_str,
-        )
+        if narrow:
+            table.add_row(
+                meta["project"],
+                meta["last"].astimezone().strftime("%m-%d %H:%M"),
+                cost_text,
+                fmt_tokens(b.tokens.total),
+                str(b.count),
+            )
+        else:
+            short_sid = sid[-8:] if len(sid) > 8 else sid
+            models_str = ", ".join(sorted(short_model(m) for m in b.models))
+            table.add_row(
+                short_sid,
+                meta["project"],
+                meta["last"].astimezone().strftime("%Y-%m-%d %H:%M"),
+                fmt_tokens(b.tokens.input),
+                fmt_tokens(b.tokens.output),
+                fmt_tokens(b.tokens.total),
+                cost_text,
+                fmt_pct(b.cost, total_cost),
+                str(b.count),
+                models_str,
+            )
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
         total_agg.count += b.count
 
     table.add_section()
     total_cost_text = Text(fmt_cost(total_agg.cost), style=cost_style(total_agg.cost))
-    table.add_row(
-        Text("TOTAL", style="bold"),
-        "",
-        f"({shown})",
-        fmt_tokens(total_agg.tokens.input),
-        fmt_tokens(total_agg.tokens.output),
-        fmt_tokens(total_agg.tokens.total),
-        total_cost_text,
-        "",
-        str(total_agg.count),
-        "",
-        style="bold",
-    )
+    if narrow:
+        table.add_row(
+            Text("TOTAL", style="bold"),
+            f"({shown})",
+            total_cost_text,
+            fmt_tokens(total_agg.tokens.total),
+            str(total_agg.count),
+            style="bold",
+        )
+    else:
+        table.add_row(
+            Text("TOTAL", style="bold"),
+            "",
+            f"({shown})",
+            fmt_tokens(total_agg.tokens.input),
+            fmt_tokens(total_agg.tokens.output),
+            fmt_tokens(total_agg.tokens.total),
+            total_cost_text,
+            "",
+            str(total_agg.count),
+            "",
+            style="bold",
+        )
     n = len(sorted_sessions)
     if n > 1:
         avg_cost = total_agg.cost / n
-        table.add_row(
-            Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
-            Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-            "", "",
-            f"per session (top {n})",
-            style="dim",
-        )
+        if narrow:
+            table.add_row(
+                Text("AVG", style="dim bold"),
+                "",
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                style="dim",
+            )
+        else:
+            table.add_row(
+                Text("AVERAGE", style="dim bold"),
+                "", "", "", "", "",
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                f"per session (top {n})",
+                style="dim",
+            )
     # Average across ALL sessions
     all_n = len(buckets)
     if all_n > 1:
         all_cost = sum(b.cost for b in buckets.values())
         all_avg = all_cost / all_n
-        table.add_row(
-            Text("AVERAGE", style="dim bold"),
-            "", "", "", "", "",
-            Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-            "", "",
-            f"per session (all {all_n})",
-            style="dim",
-        )
+        if narrow:
+            table.add_row(
+                Text("AVG", style="dim bold"),
+                f"all {all_n}",
+                Text(fmt_cost(all_avg), style=cost_style(all_avg)),
+                "", "",
+                style="dim",
+            )
+        else:
+            table.add_row(
+                Text("AVERAGE", style="dim bold"),
+                "", "", "", "", "",
+                Text(fmt_cost(all_avg), style=cost_style(all_avg)),
+                "", "",
+                f"per session (all {all_n})",
+                style="dim",
+            )
 
     console.print()
     console.print(table)

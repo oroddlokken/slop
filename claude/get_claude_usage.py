@@ -225,6 +225,14 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
 def main() -> None:
     """Fetch and print Claude usage data, using cache when fresh."""
     force = "--force" in sys.argv
+    wait_timeout = 30  # default: wait up to 30s for another fetch
+    if "--wait-timeout" in sys.argv:
+        idx = sys.argv.index("--wait-timeout")
+        if idx + 1 < len(sys.argv):
+            try:
+                wait_timeout = int(sys.argv[idx + 1])
+            except ValueError:
+                pass
     session_id_arg: str | None = None
     if "--session" in sys.argv:
         idx = sys.argv.index("--session")
@@ -259,6 +267,23 @@ def main() -> None:
     # Acquire fetch lock to prevent duplicate fetches
     acquired_lock = force or try_acquire_fetch_lock()
     if not acquired_lock:
+        # Another process is fetching — wait for fresh cache to appear
+        for _ in range(wait_timeout * 2):  # poll every 0.5s
+            time.sleep(0.5)
+            cached = read_usage_cache(CACHE_MAX_AGE)
+            if cached:
+                try:
+                    costs = compute_costs(
+                        session_id=session_id_arg, cwd=cwd_arg,
+                        session_reset_iso=cached.get("session_reset"),
+                        week_reset_iso=cached.get("week_reset"),
+                    )
+                    cached.update(costs)
+                except Exception:  # noqa: BLE001
+                    pass
+                cached.update(compute_peak_info())
+                print(json.dumps(cached, indent=2))
+                sys.exit(0)
         sys.exit(0)
 
     try:

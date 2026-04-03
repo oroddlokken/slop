@@ -3,7 +3,8 @@
 
 export CLAUDE_STATUSLINE_HOSTNAME=0
 export CLAUDE_STATUSLINE_CHANGES=0
-export CLAUDE_STATUSLINE_12H_COST=1
+export CLAUDE_STATUSLINE_12H_COST=0
+export CLAUDE_STATUSLINE_24H_COST=0
 
 # Detect terminal width via /dev/tty (stdin/stdout are pipes from Claude Code)
 COLUMNS=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
