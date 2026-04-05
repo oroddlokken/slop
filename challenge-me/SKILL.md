@@ -1,6 +1,6 @@
 ---
 name: challenge-me
-description: "Quick sanity check on your current approach. Spawns a fast Haiku agent to challenge whether you're solving the right problem the right way. Use after building something, before committing to a direction, or when something feels off."
+description: "Quick sanity check on your current approach. Spawns a fast Sonnet agent to challenge whether you're solving the right problem the right way. Use after building something, before committing to a direction, or when something feels off."
 args:
   - name: target
     description: What to challenge — a file, plan, or recent work (optional)
@@ -10,7 +10,7 @@ user-invocable: true
 
 # Challenge Me
 
-Fast approach validation. Gather context, spawn a Haiku agent to poke holes, report back.
+Fast approach validation. Gather context, spawn a Sonnet agent to poke holes, report back.
 
 ## Rules
 
@@ -41,4 +41,4 @@ Spawn with `model: "sonnet"`.
 
 ### Step 3: Report
 
-Return the Haiku agent's response directly to the user.
+Return the Sonnet agent's response directly to the user.
