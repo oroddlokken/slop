@@ -31,6 +31,8 @@ Pick from:
 - Failure mode not handled (what breaks when X is down/slow/wrong?)
 - Edge case that invalidates the approach (empty state, concurrent access, scale)
 - Assumption that isn't verified (API behavior, data shape, ordering guarantee)
+- Operations happening in the wrong order — can users/callers reach a state that shouldn't be possible? (auth bypass, double-spend, skipped validation)
+- Operational blind spot — what's missing for production? (no alerting, no observability, cost under load, degraded-mode behavior, cold-start latency)
 - Would you be embarrassed if this broke in production? Why?
 
 **3. TRADEOFFS** — What is this approach silently trading away? (performance, simplicity, flexibility, future extensibility). One sentence. If nothing meaningful, skip.
