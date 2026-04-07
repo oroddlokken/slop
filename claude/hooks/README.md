@@ -9,4 +9,54 @@ PreToolUse hooks for Claude Code's Bash tool. Guard against command patterns tha
 
 ## Installation
 
-Tell your agent to read this repository and ask it to help you integrate the hooks into your Claude Code setup.
+1. Copy the hook scripts somewhere persistent (e.g. `~/.claude/hooks/`):
+
+```bash
+cp block-quoted-flags.sh block-git-stash-worktree.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/block-*.sh
+```
+
+2. Add them to your project's `.claude/settings.json` (or `~/.claude/settings.json` for global use) under `hooks.PreToolUse`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/block-git-stash-worktree.sh",
+            "statusMessage": "Checking for blocked git commands..."
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/block-quoted-flags.sh",
+            "statusMessage": "Checking for quoted flag patterns..."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The `matcher` field controls which tool triggers the hook — `"Bash"` runs them before every Bash tool call. Each hook receives the tool input as JSON on stdin and can block execution by exiting non-zero with a message on stderr.
+
+## Configuration
+
+**block-quoted-flags.sh** has one optional feature flag:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BLOCK_COMPOUND_COMMANDS` | `0` | Set to `1` to also block `&&`, `||`, and `;` chains |
+
+To enable it, set the env var in the hook command:
+
+```json
+{
+  "type": "command",
+  "command": "BLOCK_COMPOUND_COMMANDS=1 ~/.claude/hooks/block-quoted-flags.sh"
+}
+```
