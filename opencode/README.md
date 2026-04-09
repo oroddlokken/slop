@@ -2,7 +2,7 @@
 
 ## OCReport — OpenCode Report
 
-Analyzes OpenCode token usage and costs from local JSON session logs. Parses the message files in `~/.local/share/opencode/storage/` to produce rich terminal reports.
+Analyzes OpenCode token usage and costs from local session data. Reads from both the SQLite database (`~/.local/share/opencode/opencode.db`) and legacy JSON files in `~/.local/share/opencode/storage/` to produce rich terminal reports.
 
 Only GitHub Copilot usage is included. Supported model families: Claude, GPT, and Gemini.
 
@@ -19,8 +19,8 @@ Features:
 
 * Tiered pricing support (base vs 200K+ context rates)
 * Prompt cache token tracking (cache write and cache read)
-* Per-model cost calculation for Claude (Opus, Sonnet, Haiku), GPT (5-mini), and Gemini (3 Pro)
-* Deduplication across message files
+* Per-model cost calculation for Claude (Opus, Sonnet, Haiku), GPT (5-mini, 5-codex, 5.2-codex, 5.3-codex), and Gemini (3 Pro)
+* Deduplication across data sources
 * Filter by date range (`--since` / `--until`) and project (`--project`)
 * JSON output (`--json`) for programmatic use
 
