@@ -25,7 +25,7 @@ Launch parallel code-quality agents, each analyzing the codebase through a diffe
 
 Ask the user which mode they want:
 
-- **Full** — Run all 12 reviewers in parallel, then distill.
+- **Full** — Run all 12 reviewers in parallel, then distill (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, dead-code, naming, dep-hygiene, test-gaps, type-structs).
 - **Quick** — Run 5 high-risk reviewers (duplicates, complexity, error-gaps, hardcoded, type-structs), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
@@ -118,7 +118,7 @@ Use the agent template (`agent.md`). The template places shared content (codebas
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
-- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+- **1+Parallel** — Launch one agent first to prime the cache, then launch remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Nearly as cheap as Sequential, much faster.
 
 If the user doesn't specify, use **Sequential**.
 

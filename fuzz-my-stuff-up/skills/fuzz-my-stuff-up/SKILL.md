@@ -26,7 +26,7 @@ Launch ~20 parallel adversarial agents, each trying to break the codebase from a
 
 Ask the user which mode they want:
 
-- **Full** — Run all 20 fuzzers in parallel, then distill. Maximum chaos.
+- **Full** — Run all 20 fuzzers in parallel, then distill (empty-inputs, boundary-values, type-confusion, unicode-chaos, concurrency, path-traversal, injection, state-machine, resource-exhaustion, time-travel, permission-escalation, malformed-input, network-failure, config-chaos, dependency-failure, locale-chaos, filesystem-edge, api-abuse, upgrade-path, adversarial-user). Maximum chaos.
 - **Quick** — Run 7 high-impact fuzzers (empty-inputs, type-confusion, injection, state-machine, malformed-input, api-abuse, adversarial-user), then distill. Faster.
 - **Pick** — Let the user choose which fuzzers to run.
 
@@ -102,7 +102,7 @@ Use the agent template (`fuzzer-agent.md`). The template places shared content (
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
-- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+- **1+Parallel** — Launch one agent first to prime the cache, then launch remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Nearly as cheap as Sequential, much faster.
 
 If the user doesn't specify, use **Sequential**.
 

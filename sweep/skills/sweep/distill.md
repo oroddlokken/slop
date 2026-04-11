@@ -59,6 +59,6 @@ Rules for distilling:
 - One line per fix — say what to change concretely
 - No duplicates — if multiple reviewers flagged the same thing, merge into one item with consensus count
 - Severity is based on user impact, not how many reviewers mentioned it
-- Skip style-only feedback unless it affects usability or consistency significantly
+- Include style-only feedback only when it affects usability or consistency
 
 After outputting, ask the user if they want to start working on any of the items (or run the suggested `/skill` on specific items).

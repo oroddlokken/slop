@@ -12,6 +12,12 @@ Read files and run targeted searches (Grep, Glob, Read) only. Do not modify, cre
 
 {known_issues}
 
+## Design Principles Reference
+
+Your assigned review skill (audit, critique, polish, layout, typeset, colorize, etc.) is built on top of a shared ruleset: absolute bans (side-stripe borders, gradient text), AI-slop tells, typography / color / spatial principles, and the DO/DON'T lists. The audit skill's anti-pattern dimension explicitly says "Check against ALL the DON'T guidelines in the impeccable skill" — those guidelines are below. Treat this block as the authoritative criteria for anything your assigned skill file delegates to the impeccable principles.
+
+{design_principles}
+
 ### What to Look For
 
 When analyzing each UI file, note:

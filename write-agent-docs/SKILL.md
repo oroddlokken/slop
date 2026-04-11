@@ -16,7 +16,7 @@ Agent docs are for AI agents, not humans. Agents can read source code. Only docu
 - Safety boundaries and destructive-action guardrails
 - Cross-cutting conventions that aren't enforced by tooling
 
-Do NOT document: function signatures, file structure, config options, standard language conventions, or anything a `cat` or `grep` would reveal.
+Skip content the agent can discover itself: function signatures, config options, standard language conventions, or anything a `cat` / `grep` would reveal. Document file structure only when it is genuinely non-obvious — a monorepo map or a surprising entry point pays for itself; a tree of `src/components/` is noise.
 
 ## Framing Rules
 
@@ -38,6 +38,14 @@ Rules with a "why" are stronger. Agents generalize from explanations to novel si
 
 - Weak: "Use complete sentences in voice responses"
 - Strong: "TTS engines cannot pronounce ellipses or markdown, so use complete sentences in voice responses"
+
+## Enable Self-Verification
+
+Tell the agent how to check its own work — the command to run, the file to diff against, the output to expect. Agents that can verify catch their own mistakes; agents that cannot, ship them. Anthropic's own guidance calls this the single highest-leverage thing to put in CLAUDE.md.
+
+- Name the test and lint commands, and the preview/diff variant of any destructive action (`ansible-playbook --check --diff`, `terraform plan`, `dns_records.py diff`)
+- Point at a canonical example file rather than describing the pattern in prose
+- For UI work, say what URL to open and what specifically to look for
 
 ## Avoid Weak Language
 
@@ -70,6 +78,7 @@ Put content in the right place:
 | Behavioral rules, workflow expectations | CLAUDE.md |
 | Rules for specific directories only | `.claude/rules/*.md` with `paths:` frontmatter |
 | Domain knowledge loaded on-demand | `.claude/skills/*/SKILL.md` |
+| Deterministic enforcement (format-on-save, lint-on-commit) | Hooks in `settings.json`, not prose |
 | System design, architecture | Architecture docs |
 | DB conventions | DB docs |
 

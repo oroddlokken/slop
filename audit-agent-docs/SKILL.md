@@ -31,7 +31,7 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
 
 4. **Actionability** — Find vague, weak, or unenforceable instructions. Flag these specific anti-patterns:
 
-   **Framing principle**: Positive directives outperform negative prohibitions. LLMs attend to what you mention — saying "NEVER use X" activates X in the model's attention, making it *more* likely (the "Pink Elephant" effect, documented in arxiv 2402.07896, 2503.22395). Anthropic's own docs say: "Tell Claude what to do instead of what not to do." Rewrite rules as positive directives with reasoning wherever possible.
+   **Framing principle**: Positive directives outperform negative prohibitions. LLMs attend to what you mention — saying "NEVER use X" activates X in the model's attention, making it *more* likely (the "Pink Elephant" effect). Anthropic's own prompting docs say: "Tell Claude what to do instead of what not to do." Rewrite rules as positive directives with reasoning wherever possible.
 
    - **Negative framing → positive rewrite**: "NEVER close issues without user approval" → "Wait for explicit user approval before closing any issue." "Do NOT combine these into one question" → "Always ask these as separate questions." "Don't use `any` type" → "Use interfaces and type guards for all function parameters." The only exception: keep NEVER/DO NOT for truly catastrophic, irreversible actions (force-push, deleting production data) where the shock value is warranted.
    - **Negative-only rules**: "don't do X" / "never do X" without stating what to do instead. Every prohibition MUST include the positive alternative — what the agent should do in that situation. A rule that only says "no" leaves the agent guessing.
@@ -58,6 +58,8 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
      Use integration tests with a real database for API routes.
      ```
      Flag instructions in CLAUDE.md that only apply to specific directories (e.g., "when working in `src/api/`...") — these waste tokens in every session and should be `.claude/rules/` files instead.
+   - **Stale rules globs**: For each `.claude/rules/*.md` file with `paths:` frontmatter, verify the glob patterns match at least one existing file in the project. Stale globs mean the rule silently stopped loading — dead weight that misleads anyone reading the rules directory.
+   - **Unscoped rules files**: Flag `.claude/rules/*.md` files that lack `paths:` frontmatter. These load every session regardless of which files the agent works on — same token cost as CLAUDE.md. Either add `paths:` to scope them, or move the content into CLAUDE.md where always-loaded rules belong.
    - **Skills boundary**: Claude Code skills (`.claude/skills/*/SKILL.md`) only load when invoked by the user. Flag domain knowledge in CLAUDE.md that loads every session but is only relevant sometimes — these should be skills instead.
    - **Broken `@` imports**: Verify that all `@path/to/file` references in CLAUDE.md actually resolve to existing files.
    - **Lost in the middle**: In documents >= 20 lines, check if critical rules are buried in the 40-60% zone of the file. LLMs pay more attention to the beginning and end of long documents (Liu et al., 2023). Recommend moving critical rules to the top or bottom.
@@ -111,7 +113,7 @@ Wait for the user's response before moving to Step 2.
 
 Use the user's target path as the **project root** for all resolution.
 
-**Scope boundary**: Only discover and audit files that exist on disk within the project root. Ignore everything outside it — global configs (`~/.claude/CLAUDE.md`, `~/.codex/instructions.md`), user home directories, and any content from the conversation context that was injected by Claude Code's own config loading (e.g., `@RTK.md` from a global CLAUDE.md). If you see references to files outside the project root, skip them entirely.
+**Scope boundary**: Only discover and audit files that exist on disk within the project root. Ignore everything outside it — global configs (`~/.claude/CLAUDE.md`, `~/.codex/instructions.md`), user home directories, and any content from the conversation context that was injected by Claude Code's own config loading (e.g., `@agents.md` from a global CLAUDE.md). If you see references to files outside the project root, skip them entirely.
 
 **2a. Find all agent instruction files across tools:**
 
@@ -145,7 +147,7 @@ Use the agent template (`audit-agent.md`). The template places shared content (k
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
-- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+- **1+Parallel** — Launch one agent first to prime the cache, then launch remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Nearly as cheap as Sequential, much faster.
 
 If the user doesn't specify, use **Sequential**.
 

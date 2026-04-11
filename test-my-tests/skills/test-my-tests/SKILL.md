@@ -26,7 +26,7 @@ Launch parallel test-quality agents, each analyzing the test suite through a dif
 
 Ask the user which mode they want:
 
-- **Full** — Run all 10 reviewers, then distill. Most thorough.
+- **Full** — Run all 10 reviewers, then distill (coverage-gaps, happy-path-only, user-flows, mock-debt, assertion-quality, fragile-tests, data-realism, error-paths, boundary-values, flaky-risks). Most thorough.
 - **Quick** — Run 5 high-impact reviewers (coverage-gaps, user-flows, happy-path-only, error-paths, assertion-quality), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
@@ -100,7 +100,7 @@ Use the agent template (`test-agent.md`). The template places shared content (co
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
-- **1+Parallel** — Launch one agent first, wait for it to complete, then launch all remaining in parallel. Nearly as cheap, much faster.
+- **1+Parallel** — Launch one agent first to prime the cache, then launch remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Nearly as cheap as Sequential, much faster.
 
 If the user doesn't specify, use **Sequential**.
 
