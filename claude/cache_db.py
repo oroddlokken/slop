@@ -12,13 +12,22 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 DB_PATH = Path.home() / ".cache" / "macsetup" / "claude" / "cache.db"
+
+# Snapshots live outside ~/.cache so aggressive cache cleanup can't take out
+# the live DB and all its backups in one sweep.
+_DEFAULT_SNAPSHOT_DIR = Path.home() / ".local" / "share" / "macsetup" / "claude" / "snapshots"
+_SNAPSHOT_KEEP_DEFAULT = 14
+_SANITY_DROP_THRESHOLD_PCT = 10.0
+_SANITY_MIN_PRIOR_COUNT = 100
 
 _conn: sqlite3.Connection | None = None
 
@@ -134,11 +143,15 @@ def get_connection() -> sqlite3.Connection:
     if _conn is not None:
         return _conn
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db_existed = DB_PATH.exists() and DB_PATH.stat().st_size > 0
     _conn = sqlite3.connect(str(DB_PATH), timeout=10)
     _conn.execute("PRAGMA journal_mode = WAL")
     _conn.execute("PRAGMA synchronous = NORMAL")
     _conn.execute("PRAGMA foreign_keys = ON")
     _conn.execute("PRAGMA cache_size = -2000")
+    # Snapshot before any schema changes or data migrations touch the DB.
+    if db_existed:
+        _maybe_snapshot(_conn)
     _conn.executescript(_SCHEMA_SQL)
     # Migrate: add project cost columns to existing usage tables
     for col in (
@@ -152,8 +165,132 @@ def get_connection() -> sqlite3.Connection:
             if "duplicate column" not in str(e).lower():
                 raise
     _run_migrations(_conn)
+    if db_existed:
+        _sanity_check(_conn)
     atexit.register(close_connection)
     return _conn
+
+
+# ---------------------------------------------------------------------------
+# Snapshot & sanity guard
+# ---------------------------------------------------------------------------
+#
+# One daily snapshot of the live DB, written with SQLite's online backup API
+# so WAL-mode writers won't corrupt it. Default location lives outside
+# ~/.cache/ so cache-cleanup sweeps can't take the backups out with the
+# original. The sanity guard runs after migrations and warns if the
+# irreplaceable ccreport_records table has lost a material fraction of its
+# rows compared to the most recent prior snapshot.
+#
+# Env overrides:
+#   CLAUDE_CACHE_SNAPSHOT_DIR       — destination directory
+#   CLAUDE_CACHE_SNAPSHOT_KEEP      — retention count (default 14)
+#   CLAUDE_CACHE_SNAPSHOT_DISABLE=1 — skip snapshots entirely
+#   CLAUDE_CACHE_SANITY_DISABLE=1   — skip sanity check
+#   CLAUDE_CACHE_SANITY_ABORT=1     — raise instead of warn on drop
+
+
+def _snapshot_dir() -> Path:
+    override = os.environ.get("CLAUDE_CACHE_SNAPSHOT_DIR")
+    return Path(override).expanduser() if override else _DEFAULT_SNAPSHOT_DIR
+
+
+def _snapshot_keep() -> int:
+    raw = os.environ.get("CLAUDE_CACHE_SNAPSHOT_KEEP")
+    if not raw:
+        return _SNAPSHOT_KEEP_DEFAULT
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _SNAPSHOT_KEEP_DEFAULT
+
+
+def _maybe_snapshot(conn: sqlite3.Connection) -> Path | None:
+    """Take today's snapshot if it doesn't already exist. Rotate old ones.
+
+    Returns the snapshot path on success (existing or newly written),
+    None if skipped or failed. Failures never raise — snapshots are a
+    safety net, not a prerequisite.
+    """
+    if os.environ.get("CLAUDE_CACHE_SNAPSHOT_DISABLE") == "1":
+        return None
+    snap_dir = _snapshot_dir()
+    today = datetime.now().strftime("%Y-%m-%d")
+    target = snap_dir / f"{today}.db"
+    if target.exists():
+        return target
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        dst = sqlite3.connect(str(tmp))
+        try:
+            conn.backup(dst)
+        finally:
+            dst.close()
+        tmp.replace(target)
+    except (sqlite3.Error, OSError) as e:
+        print(f"Warning: cache.db snapshot failed: {e}", file=sys.stderr)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    try:
+        snapshots = sorted(snap_dir.glob("????-??-??.db"))
+        keep = _snapshot_keep()
+        for old in snapshots[:-keep]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return target
+
+
+def _sanity_check(conn: sqlite3.Connection) -> None:
+    """Warn if ccreport_records count fell materially vs the prior snapshot.
+
+    Uses the most recent snapshot from a day before today so a same-run
+    snapshot can't mask a wipe. Requires a meaningful prior count before
+    acting so a small dev DB doesn't raise false alarms.
+    """
+    if os.environ.get("CLAUDE_CACHE_SANITY_DISABLE") == "1":
+        return
+    snap_dir = _snapshot_dir()
+    if not snap_dir.is_dir():
+        return
+    today_name = datetime.now().strftime("%Y-%m-%d") + ".db"
+    snapshots = sorted(snap_dir.glob("????-??-??.db"))
+    prior = [s for s in snapshots if s.name != today_name]
+    if not prior:
+        return
+    compare_snap = prior[-1]
+    try:
+        src = sqlite3.connect(f"file:{compare_snap}?mode=ro", uri=True)
+        try:
+            prev_count = src.execute(
+                "SELECT COUNT(*) FROM ccreport_records"
+            ).fetchone()[0]
+        finally:
+            src.close()
+    except sqlite3.Error:
+        return
+    if prev_count < _SANITY_MIN_PRIOR_COUNT:
+        return
+    cur_count = conn.execute("SELECT COUNT(*) FROM ccreport_records").fetchone()[0]
+    drop_pct = 100.0 * (prev_count - cur_count) / prev_count
+    if drop_pct < _SANITY_DROP_THRESHOLD_PCT:
+        return
+    msg = (
+        f"cache.db lost ccreport_records rows: "
+        f"{drop_pct:.1f}% drop ({prev_count} -> {cur_count}).\n"
+        f"  Prior snapshot: {compare_snap}\n"
+        f"  Restore with:   cp '{compare_snap}' '{DB_PATH}'"
+    )
+    if os.environ.get("CLAUDE_CACHE_SANITY_ABORT") == "1":
+        raise RuntimeError(msg)
+    print(f"Warning: {msg}", file=sys.stderr)
 
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
