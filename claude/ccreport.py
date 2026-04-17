@@ -30,15 +30,14 @@ from rich.text import Text
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
+    bulk_load_ccreport_cache,
     check_ccreport_valid,
-    get_ccreport_file,
     get_ccreport_orphaned_records,
-    get_ccreport_records,
     init_ccreport_meta,
     invalidate_ccreport,
     save_ccreport_file,
 )
-from pricing import calc_cost
+from pricing import calc_cost, extract_assistant_fields
 
 _PROJECT_ROOTS = (
     Path.home() / ".claude" / "projects",
@@ -204,25 +203,10 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                 except orjson.JSONDecodeError:
                     continue
 
-                if rec.get("type") != "assistant":
+                fields = extract_assistant_fields(rec)
+                if fields is None:
                     continue
-                msg = rec.get("message")
-                if not msg or not isinstance(msg, dict):
-                    continue
-                usage = msg.get("usage")
-                if not usage or not isinstance(usage, dict):
-                    continue
-
-                message_id = msg.get("id", "")
-                request_id = rec.get("requestId", "")
-
-                # Build composite dedup key (message_id:request_id).
-                # If either is missing, dedup_key is None → record is never
-                # considered a duplicate (matching ccusage behavior).
-                if message_id and request_id:
-                    dedup_key = f"{message_id}:{request_id}"
-                else:
-                    dedup_key = None
+                msg, usage, message_id, request_id, dedup_key, ts = fields
 
                 tokens = TokenCounts(
                     input=usage.get("input_tokens", 0),
@@ -231,15 +215,6 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                     cache_read=usage.get("cache_read_input_tokens", 0),
                 )
 
-                ts_str = rec.get("timestamp", "")
-                try:
-                    ts = datetime.fromisoformat(ts_str)
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                except (ValueError, TypeError):
-                    continue
-
-                # Pre-calculated cost from Claude Code (used in auto mode)
                 cost_usd = rec.get("costUSD")
                 if cost_usd is not None:
                     try:
@@ -280,16 +255,25 @@ def load_all_records(
     all_records: list[UsageRecord] = []
     live_paths: set[str] = set()
 
+    # Bulk-load cache (2 queries instead of N+1)
+    file_meta, records_by_file = bulk_load_ccreport_cache()
+
     for path in files:
         key = str(path)
         live_paths.add(key)
-        st = path.stat()
-        cached = get_ccreport_file(key)
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        cached = file_meta.get(key)
 
         if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-            records = _deserialize_records(get_ccreport_records(key))
+            records = _deserialize_records(records_by_file.get(key, []))
         else:
-            records = parse_jsonl_file(path)
+            try:
+                records = parse_jsonl_file(path)
+            except OSError:
+                continue
             save_ccreport_file(key, st.st_mtime_ns, st.st_size, _serialize_records(records))
 
         for rec in records:
@@ -379,6 +363,23 @@ def short_model(model: str) -> str:
     return m
 
 
+def _make_report_table(
+    title: str,
+    label_col: str,
+    *,
+    narrow: bool = False,
+    compact: bool = False,
+    label_style: str = "white",
+) -> Table:
+    """Create a standard report table with label + token + optional Models columns."""
+    table = Table(title=title, title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
+    table.add_column(label_col, style=label_style, no_wrap=True)
+    _add_token_columns(table, compact=compact, narrow=narrow)
+    if not narrow:
+        table.add_column("Models", style="dim", no_wrap=True)
+    return table
+
+
 def _add_token_columns(table: Table, *, compact: bool = False, narrow: bool = False) -> None:
     """Add the standard token + cost columns to a table."""
     if narrow:
@@ -429,6 +430,43 @@ def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False
 
 # --- Reports ---
 
+
+def _add_summary_rows(
+    table: Table,
+    total_agg: "AggBucket",
+    n_buckets: int,
+    *,
+    narrow: bool,
+    compact: bool = False,
+    avg_label: str = "",
+) -> None:
+    """Append TOTAL and optional AVG rows to a report table."""
+    table.add_section()
+    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, compact=compact, narrow=narrow)]
+    if not narrow:
+        total_row.append(f"{len(total_agg.models)} models")
+    table.add_row(*total_row, style="bold")
+    if n_buckets > 1:
+        avg_cost = total_agg.cost / n_buckets
+        if narrow:
+            table.add_row(
+                Text("AVG", style="dim bold"),
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                style="dim",
+            )
+        elif avg_label:
+            n_empty = 4 if not compact else 2
+            table.add_row(
+                Text("AVERAGE", style="dim bold"),
+                *[""] * n_empty, "",
+                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
+                "", "",
+                avg_label,
+                style="dim",
+            )
+
+
 def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
     """Print daily usage report."""
     narrow = _is_narrow()
@@ -450,11 +488,7 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
             mb.cost += record_cost(rec)
             mb.count += 1
 
-    table = Table(title=f"Daily Usage ({len(buckets)} days)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
-    table.add_column("Date", style="white", no_wrap=True)
-    _add_token_columns(table, narrow=narrow)
-    if not narrow:
-        table.add_column("Models", style="dim", no_wrap=True)
+    table = _make_report_table(f"Daily Usage ({len(buckets)} days)", "Date", narrow=narrow)
 
     total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
@@ -477,30 +511,7 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
                     brow.append("")
                 table.add_row(*brow)
 
-    table.add_section()
-    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, narrow=narrow)]
-    if not narrow:
-        total_row.append(f"{len(total_agg.models)} models")
-    table.add_row(*total_row, style="bold")
-    n = len(buckets)
-    if n > 1:
-        avg_cost = total_agg.cost / n
-        if narrow:
-            table.add_row(
-                Text("AVG", style="dim bold"),
-                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                style="dim",
-            )
-        else:
-            table.add_row(
-                Text("AVERAGE", style="dim bold"),
-                "", "", "", "", "",
-                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                "per day",
-                style="dim",
-            )
+    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per day")
 
     console.print()
     console.print(table)
@@ -521,11 +532,7 @@ def report_monthly(records: list[UsageRecord]) -> None:
             b.models.add(rec.model)
         b.count += 1
 
-    table = Table(title=f"Monthly Usage ({len(buckets)} months)", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
-    table.add_column("Month", style="white", no_wrap=True)
-    _add_token_columns(table, narrow=narrow)
-    if not narrow:
-        table.add_column("Models", style="dim", no_wrap=True)
+    table = _make_report_table(f"Monthly Usage ({len(buckets)} months)", "Month", narrow=narrow)
 
     total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
@@ -540,30 +547,7 @@ def report_monthly(records: list[UsageRecord]) -> None:
         total_agg.count += b.count
         total_agg.models |= b.models
 
-    table.add_section()
-    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, narrow=narrow)]
-    if not narrow:
-        total_row.append(f"{len(total_agg.models)} models")
-    table.add_row(*total_row, style="bold")
-    n = len(buckets)
-    if n > 1:
-        avg_cost = total_agg.cost / n
-        if narrow:
-            table.add_row(
-                Text("AVG", style="dim bold"),
-                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                style="dim",
-            )
-        else:
-            table.add_row(
-                Text("AVERAGE", style="dim bold"),
-                "", "", "", "", "",
-                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                "per month",
-                style="dim",
-            )
+    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per month")
 
     # Projected cost for the current (latest) partial month
     latest_month = max(buckets)
@@ -647,11 +631,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     else:
         shown = str(len(sorted_projects))
 
-    table = Table(title=f"Projects ({shown})", title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
-    table.add_column("Project", style="magenta", no_wrap=True)
-    _add_token_columns(table, compact=True, narrow=narrow)
-    if not narrow:
-        table.add_column("Models", style="dim", no_wrap=True)
+    table = _make_report_table(f"Projects ({shown})", "Project", narrow=narrow, compact=True, label_style="magenta")
 
     total_cost = sum(buckets[p].cost for p in sorted_projects)
     total_agg = AggBucket()
@@ -666,30 +646,8 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
         total_agg.count += b.count
         total_agg.models |= b.models
 
-    table.add_section()
-    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, compact=True, narrow=narrow)]
-    if not narrow:
-        total_row.append(f"{len(total_agg.models)} models")
-    table.add_row(*total_row, style="bold")
-    n = len(sorted_projects)
-    if n > 1:
-        avg_cost = total_agg.cost / n
-        if narrow:
-            table.add_row(
-                Text("AVG", style="dim bold"),
-                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                style="dim",
-            )
-        else:
-            table.add_row(
-                Text("AVERAGE", style="dim bold"),
-                "", "", "",
-                Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                f"per project (top {n})",
-                style="dim",
-            )
+    _add_summary_rows(table, total_agg, len(sorted_projects), narrow=narrow, compact=True,
+                      avg_label=f"per project (top {len(sorted_projects)})")
     # Average across ALL projects
     all_n = len(buckets)
     if all_n > 1:
@@ -892,10 +850,16 @@ def report_json(records: list[UsageRecord]) -> None:
 
 def parse_date(s: str) -> datetime:
     """Parse YYYYMMDD or YYYY-MM-DD into a timezone-aware datetime (local midnight)."""
+    from zoneinfo import ZoneInfo
+
     s = s.replace("-", "")
     dt = datetime.strptime(s, "%Y%m%d")
-    local_tz = datetime.now(tz=timezone.utc).astimezone().tzinfo
-    return dt.replace(tzinfo=local_tz)
+    try:
+        from pricing import _local_tz
+        tz = _local_tz()
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("UTC")
+    return dt.replace(tzinfo=tz)
 
 
 def main() -> None:

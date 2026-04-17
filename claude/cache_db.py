@@ -87,9 +87,9 @@ CREATE TABLE IF NOT EXISTS cache_stats (
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS session_costs (
-    session_id TEXT PRIMARY KEY,
-    file_size  INTEGER NOT NULL,
-    cost       REAL NOT NULL
+    session_id  TEXT PRIMARY KEY,
+    fingerprint INTEGER NOT NULL,
+    cost        REAL NOT NULL
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS ccreport_files (
@@ -116,6 +116,11 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
 
 CREATE INDEX IF NOT EXISTS idx_ccr_file ON ccreport_records(file_path);
 CREATE INDEX IF NOT EXISTS idx_ccr_ts ON ccreport_records(ts);
+
+CREATE TABLE IF NOT EXISTS extra_usage_snapshots (
+    ts    REAL PRIMARY KEY,
+    spent REAL NOT NULL
+) WITHOUT ROWID;
 """
 
 
@@ -143,8 +148,9 @@ def get_connection() -> sqlite3.Connection:
     ):
         try:
             _conn.execute(f"ALTER TABLE usage ADD COLUMN {col} REAL")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
     _run_migrations(_conn)
     atexit.register(close_connection)
     return _conn
@@ -157,7 +163,7 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
     # used inflated tiered rates. Only clear those — older files had correct
     # pricing and their JSONL sources may already be purged from disk.
     if not _get_meta(conn, "migrated_flat_pricing_2026_03_13"):
-        cutoff_ns = 1773273600000000000  # 2026-03-12T00:00 UTC in nanoseconds
+        cutoff_ns = 1773424800000000000  # 2026-03-13T18:00 UTC in nanoseconds
         conn.execute("DELETE FROM file_costs WHERE mtime_ns >= ?", (cutoff_ns,))
         conn.execute("DELETE FROM session_costs")
         conn.execute("DELETE FROM meta WHERE key IN ('cost_summary', 'cost_summary_time')")
@@ -177,6 +183,15 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM session_costs")
         conn.execute("DELETE FROM meta WHERE key IN ('cost_summary', 'cost_summary_time')")
         _set_meta(conn, "migrated_flat_pricing_ccreport", "1")
+        conn.commit()
+
+    # Migration 3: Rename misleading file_size → fingerprint in session_costs
+    if not _get_meta(conn, "migrated_rename_fingerprint"):
+        try:
+            conn.execute("ALTER TABLE session_costs RENAME COLUMN file_size TO fingerprint")
+        except sqlite3.OperationalError:
+            pass  # Column already renamed or table structure differs
+        _set_meta(conn, "migrated_rename_fingerprint", "1")
         conn.commit()
 
 
@@ -282,17 +297,56 @@ _BACKOFF_SCHEDULE = [45, 120, 240]  # seconds, indexed by consecutive failures
 _LOCK_STALE_TIMEOUT = 30  # seconds before a held lock is considered abandoned
 
 
+_lock_owner: str | None = None  # UUID token set when this process holds the lock
+
+
+def _check_backoff_in_txn(conn: sqlite3.Connection, now: float) -> bool:
+    """Check if we're in error backoff. Must be called inside a transaction."""
+    count_str = _get_meta(conn, "fetch_fail_count")
+    if not count_str:
+        return False
+    try:
+        count = int(count_str)
+    except ValueError:
+        return False
+    if count <= 0:
+        return False
+    fail_time_str = _get_meta(conn, "fetch_fail_time")
+    if not fail_time_str:
+        return False
+    try:
+        elapsed = now - float(fail_time_str)
+    except ValueError:
+        return False
+    idx = min(count - 1, len(_BACKOFF_SCHEDULE) - 1)
+    return elapsed < _BACKOFF_SCHEDULE[idx]
+
+
 def try_acquire_fetch_lock() -> bool:
-    """Atomically acquire fetch lock. Returns True if acquired.
+    """Atomically acquire fetch lock with backoff check. Returns True if acquired.
 
     Uses BEGIN IMMEDIATE to serialise concurrent writers so the
     read-check-write is atomic.  A lock older than _LOCK_STALE_TIMEOUT
     is treated as abandoned (e.g. crashed process).
+
+    The backoff check is folded into the same transaction to prevent
+    a failure being recorded between the two checks.
+
+    An owner token (UUID) is stored alongside the lock so that only
+    the process that acquired the lock can release it.
     """
+    import uuid
+
+    global _lock_owner
+
     conn = get_connection()
     now = time.time()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if _check_backoff_in_txn(conn, now):
+            conn.execute("COMMIT")
+            return False
+
         locked_at_str = _get_meta(conn, "fetch_lock_time")
         if locked_at_str:
             try:
@@ -300,9 +354,15 @@ def try_acquire_fetch_lock() -> bool:
                     conn.execute("COMMIT")
                     return False
             except ValueError:
-                pass
+                # Corrupt lock timestamp — treat as stale and allow acquisition
+                import sys
+                print(f"Warning: corrupt fetch_lock_time {locked_at_str!r}, treating as stale",
+                      file=sys.stderr)
+        owner = str(uuid.uuid4())
         _set_meta(conn, "fetch_lock_time", str(now))
+        _set_meta(conn, "fetch_lock_owner", owner)
         conn.execute("COMMIT")
+        _lock_owner = owner
         return True
     except Exception:
         conn.execute("ROLLBACK")
@@ -310,10 +370,21 @@ def try_acquire_fetch_lock() -> bool:
 
 
 def release_fetch_lock() -> None:
-    """Release the fetch lock."""
+    """Release the fetch lock only if this process owns it."""
+    global _lock_owner
+
     conn = get_connection()
-    conn.execute("DELETE FROM meta WHERE key = 'fetch_lock_time'")
+    if _lock_owner is not None:
+        stored = _get_meta(conn, "fetch_lock_owner")
+        if stored != _lock_owner:
+            # Not our lock — another process took over after staleness timeout
+            _lock_owner = None
+            return
+    conn.execute(
+        "DELETE FROM meta WHERE key IN ('fetch_lock_time', 'fetch_lock_owner')"
+    )
     conn.commit()
+    _lock_owner = None
 
 
 def record_fetch_failure() -> None:
@@ -380,13 +451,17 @@ def read_usage_for_statusline() -> dict[str, Any] | None:
     """Fast read of usage data for statusline (same validation as read_usage_cache).
 
     When cache is expired but a fetch is blocked (lock held or error backoff),
-    returns stale data to avoid spawning a pointless subprocess.
+    returns stale data with a ``_stale`` flag to avoid spawning a pointless
+    subprocess while letting callers show a staleness indicator.
     """
     result = read_usage_cache(600)
     if result is not None:
         return result
     if _is_fetch_blocked():
-        return read_usage_stale()
+        stale = read_usage_stale()
+        if stale is not None:
+            stale["_stale"] = True
+        return stale
     return None
 
 
@@ -407,7 +482,58 @@ def write_usage_cache(data: dict[str, Any]) -> None:
         f"INSERT OR REPLACE INTO usage ({cols}) VALUES ({placeholders})",
         [1, *vals, meta_json],
     )
+
+    # Record extra_spent snapshot for per-window delta tracking
+    es = data.get("extra_spent")
+    if es is not None:
+        now_ts = time.time()
+        conn.execute(
+            "INSERT OR REPLACE INTO extra_usage_snapshots (ts, spent) VALUES (?, ?)",
+            (now_ts, float(es)),
+        )
+        # Prune snapshots older than 31 days
+        cutoff = now_ts - 31 * 86400
+        conn.execute("DELETE FROM extra_usage_snapshots WHERE ts < ?", (cutoff,))
+
     conn.commit()
+
+
+def compute_extra_window_deltas(
+    current_spent: float,
+    session_window_start_epoch: float | None,
+    week_window_start_epoch: float | None,
+) -> dict[str, float | None]:
+    """Compute extra usage deltas for session and week windows.
+
+    Looks up the snapshot closest to (but <=) each window start and returns
+    the difference from current_spent.  Returns None for a window if no
+    snapshot predates it.  A billing-reset (spent drops) yields 0.
+    """
+    conn = get_connection()
+    result: dict[str, float | None] = {
+        "extra_session_delta": None,
+        "extra_week_delta": None,
+    }
+
+    for key, start_epoch in (
+        ("extra_session_delta", session_window_start_epoch),
+        ("extra_week_delta", week_window_start_epoch),
+    ):
+        if start_epoch is None:
+            continue
+        row = conn.execute(
+            "SELECT spent FROM extra_usage_snapshots "
+            "WHERE ts <= ? ORDER BY ts DESC LIMIT 1",
+            (start_epoch,),
+        ).fetchone()
+        if row is not None:
+            baseline = row[0]
+            delta = current_spent - baseline
+            # Billing reset: spent dropped below baseline → show 0
+            result[key] = max(0.0, delta)
+        # No pre-window snapshot → leave as None (unknown, not zero)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -459,21 +585,6 @@ def load_cost_cache(week_key: str, month_key: str) -> dict[str, dict[str, Any]]:
         result[path] = entry
     return result
 
-
-def load_all_dedup_keys() -> set[str]:
-    """Bulk load all dedup keys into a Python set."""
-    conn = get_connection()
-    rows = conn.execute("SELECT dk FROM dedup_keys").fetchall()
-    return {r[0] for r in rows}
-
-
-def load_dedup_keys_for_file(path: str) -> list[str]:
-    """Load dedup keys for a single file."""
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT dk FROM dedup_keys WHERE file_path = ?", (path,)
-    ).fetchall()
-    return [r[0] for r in rows]
 
 
 def bulk_save_file_costs(
@@ -555,23 +666,25 @@ def write_cache_stats(
 # Session costs
 # ---------------------------------------------------------------------------
 
-def read_session_cost(session_id: str) -> tuple[int, float] | None:
-    """Read (file_size, cost) or None."""
+def read_session_cost(session_id: str) -> tuple[str, float] | None:
+    """Read (fingerprint, cost) or None."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT file_size, cost FROM session_costs WHERE session_id = ?",
+        "SELECT fingerprint, cost FROM session_costs WHERE session_id = ?",
         (session_id,),
     ).fetchone()
-    return row
+    if row is None:
+        return None
+    return (str(row[0]), row[1])
 
 
-def write_session_cost(session_id: str, file_size: int, cost: float) -> None:
-    """Upsert session cost entry."""
+def write_session_cost(session_id: str, fingerprint: str, cost: float) -> None:
+    """Upsert session cost entry keyed by fingerprint."""
     conn = get_connection()
     conn.execute(
-        "INSERT OR REPLACE INTO session_costs (session_id, file_size, cost) "
+        "INSERT OR REPLACE INTO session_costs (session_id, fingerprint, cost) "
         "VALUES (?, ?, ?)",
-        (session_id, file_size, cost),
+        (session_id, fingerprint, cost),
     )
     conn.commit()
 
@@ -580,31 +693,50 @@ def write_session_cost(session_id: str, file_size: int, cost: float) -> None:
 # ccreport cache
 # ---------------------------------------------------------------------------
 
+# Bump this when schema or serialization changes in cache_db.py affect
+# the format of stored ccreport records (macsetup-2tt1).
+CACHE_SCHEMA_SALT = "1"
+
+
 def check_ccreport_valid(version: int, script_hash: str) -> bool:
-    """Check if ccreport cache is valid (version + script_hash match)."""
+    """Check if ccreport cache is valid (version + script_hash + schema salt)."""
     conn = get_connection()
     stored_version = _get_meta(conn, "ccreport_version")
     stored_hash = _get_meta(conn, "ccreport_script_hash")
-    return stored_version == str(version) and stored_hash == script_hash
+    stored_salt = _get_meta(conn, "ccreport_schema_salt")
+    return (
+        stored_version == str(version)
+        and stored_hash == script_hash
+        and stored_salt == CACHE_SCHEMA_SALT
+    )
 
 
 def invalidate_ccreport() -> None:
-    """Invalidate ccreport cache, preserving orphaned records.
+    """Invalidate ccreport cache, forcing re-parse of live files.
 
-    Resets mtime_ns/size so all live files get re-parsed on the next run,
-    but keeps records from files no longer on disk (orphans) intact.
+    Resets mtime_ns/size to 0 so all live files get re-parsed on the next run.
+    NULLs out cached costs so they recompute with current pricing logic.
+    Preserves orphaned records (from JSONL files already purged by Claude Code)
+    since those are irrecoverable from disk (macsetup-qn0k).
     """
     conn = get_connection()
+    # Reset fingerprints so live files fail the mtime/size check and get
+    # re-parsed.  Orphaned files (no longer on disk) keep their records
+    # intact — load_all_records skips them for live processing but
+    # get_ccreport_orphaned_records still returns them.
     conn.execute("UPDATE ccreport_files SET mtime_ns = 0, size = 0")
-    conn.execute("DELETE FROM meta WHERE key IN ('ccreport_version', 'ccreport_script_hash')")
+    # NULL out cached costs so they recompute with current pricing.
+    conn.execute("UPDATE ccreport_records SET cost = NULL")
+    conn.execute("DELETE FROM meta WHERE key IN ('ccreport_version', 'ccreport_script_hash', 'ccreport_schema_salt')")
     conn.commit()
 
 
 def init_ccreport_meta(version: int, script_hash: str) -> None:
-    """Set version and script_hash in meta table."""
+    """Set version, script_hash, and schema salt in meta table."""
     conn = get_connection()
     _set_meta(conn, "ccreport_version", str(version))
     _set_meta(conn, "ccreport_script_hash", script_hash)
+    _set_meta(conn, "ccreport_schema_salt", CACHE_SCHEMA_SALT)
     conn.commit()
 
 
@@ -632,14 +764,15 @@ def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, li
         return {}, {}
     # All records
     rec_rows = conn.execute(
-        "SELECT file_path, model, ts, dk, cost, "
-        "input_tokens, output_tokens, cache_create, cache_read, sid "
+        "SELECT file_path, mid, model, ts, sid, project, dk, cost, "
+        "input_tokens, output_tokens, cache_create, cache_read "
         "FROM ccreport_records"
     ).fetchall()
     records_by_file: dict[str, list[dict]] = {}
-    for fp, model, ts, dk, cost, inp, out, cc, cr, sid in rec_rows:
-        rec = {"model": model, "ts": ts, "dk": dk, "cost": cost,
-               "t": [inp, out, cc, cr], "sid": sid}
+    for fp, mid, model, ts, sid, project, dk, cost, inp, out, cc, cr in rec_rows:
+        rec = {"mid": mid, "model": model, "ts": ts, "sid": sid,
+               "project": project, "dk": dk, "cost": cost,
+               "t": [inp, out, cc, cr]}
         records_by_file.setdefault(fp, []).append(rec)
     return file_meta, records_by_file
 
@@ -696,20 +829,6 @@ def save_ccreport_file(
     conn.commit()
 
 
-def delete_ccreport_stale(live_paths: set[str]) -> bool:
-    """Delete entries for files not in live_paths. Returns True if any deleted."""
-    conn = get_connection()
-    rows = conn.execute("SELECT path FROM ccreport_files").fetchall()
-    stale = [r[0] for r in rows if r[0] not in live_paths]
-    if not stale:
-        return False
-    conn.executemany(
-        "DELETE FROM ccreport_files WHERE path = ?", [(p,) for p in stale]
-    )
-    conn.commit()
-    return True
-
-
 def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
     """Fetch cached records for files no longer on disk.
 
@@ -721,28 +840,44 @@ def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
     orphaned = [r[0] for r in rows if r[0] not in live_paths]
     if not orphaned:
         return []
-    all_records: list[dict] = []
-    for path in orphaned:
-        all_records.extend(get_ccreport_records(path))
-    return all_records
+    placeholders = ",".join("?" * len(orphaned))
+    rows = conn.execute(
+        f"SELECT mid, model, ts, sid, project, dk, cost, "
+        f"input_tokens, output_tokens, cache_create, cache_read "
+        f"FROM ccreport_records WHERE file_path IN ({placeholders})",
+        orphaned,
+    ).fetchall()
+    return [
+        {
+            "mid": r[0], "model": r[1], "ts": r[2], "sid": r[3],
+            "project": r[4], "dk": r[5], "cost": r[6],
+            "t": [r[7], r[8], r[9], r[10]],
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
 # Cost summary cache (written by compute_costs, read by statusline)
 # ---------------------------------------------------------------------------
 
-def write_cost_summary(costs: dict[str, Any]) -> None:
-    """Cache the latest compute_costs() result for fast statusline reads."""
+def write_cost_summary(costs: dict[str, Any], cwd: str | None = None) -> None:
+    """Cache the latest compute_costs() result for fast statusline reads.
+
+    Scoped by project (cwd) to prevent cross-contamination between terminals.
+    """
     conn = get_connection()
-    _set_meta(conn, "cost_summary", json.dumps(costs))
-    _set_meta(conn, "cost_summary_time", str(time.time()))
+    suffix = f":{cwd.replace('/', '-')}" if cwd else ""
+    _set_meta(conn, f"cost_summary{suffix}", json.dumps(costs))
+    _set_meta(conn, f"cost_summary_time{suffix}", str(time.time()))
     conn.commit()
 
 
-def read_cost_summary(max_age: int = 600) -> dict[str, Any] | None:
-    """Read cached cost summary if fresh enough."""
+def read_cost_summary(max_age: int = 600, cwd: str | None = None) -> dict[str, Any] | None:
+    """Read cached cost summary if fresh enough, scoped by project."""
     conn = get_connection()
-    ts_str = _get_meta(conn, "cost_summary_time")
+    suffix = f":{cwd.replace('/', '-')}" if cwd else ""
+    ts_str = _get_meta(conn, f"cost_summary_time{suffix}")
     if not ts_str:
         return None
     try:
@@ -750,7 +885,7 @@ def read_cost_summary(max_age: int = 600) -> dict[str, Any] | None:
             return None
     except ValueError:
         return None
-    raw = _get_meta(conn, "cost_summary")
+    raw = _get_meta(conn, f"cost_summary{suffix}")
     if not raw:
         return None
     try:

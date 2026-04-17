@@ -22,7 +22,6 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from cache_db import (
-    check_fetch_backoff,
     clear_fetch_failures,
     read_usage_cache,
     record_fetch_failure,
@@ -63,26 +62,30 @@ def _list_keychain_candidates() -> list[str]:
     try:
         raw = subprocess.run(
             ["security", "dump-keychain"],
-            capture_output=True, text=True, timeout=10,
-            # 8MB max to match reference implementation
+            capture_output=True, timeout=10,
         )
         if raw.returncode != 0:
             return []
     except (subprocess.TimeoutExpired, OSError):
         return []
 
+    # Decode with replacement to handle non-UTF8 output (macsetup-60yx)
+    output = raw.stdout.decode("utf-8", errors="replace")
+
     import re
     services: list[tuple[str, str | None]] = []
-    blocks = raw.stdout.split("keychain:")
-    for block in blocks:
-        svc_m = re.search(r'"svce"<blob>="([^"]+)"', block)
+    # Split on individual keychain item boundaries instead of keychain file
+    # boundaries, so multiple entries within one keychain are found (macsetup-1ypj)
+    items = re.split(r'(?=class:)', output)
+    for item in items:
+        svc_m = re.search(r'"svce"<blob>="([^"]+)"', item)
         if not svc_m:
             continue
         svc = svc_m.group(1)
         if not svc.startswith(CREDENTIALS_SERVICE) or svc == CREDENTIALS_SERVICE:
             continue
         # Extract modification date for sorting
-        mdat_m = re.search(r'"mdat"<timedate>=(?:0x[0-9A-Fa-f]+\s+)?"([^"]+)"', block)
+        mdat_m = re.search(r'"mdat"<timedate>=(?:0x[0-9A-Fa-f]+\s+)?"([^"]+)"', item)
         mdat = mdat_m.group(1).replace("\\000", "").strip() if mdat_m else None
         services.append((svc, mdat))
 
@@ -149,7 +152,12 @@ def compute_peak_info() -> dict[str, Any]:
     elif is_peak:
         target = now.replace(hour=peak_end, minute=0, second=0, microsecond=0)
     elif h >= peak_end:
-        target = now.replace(hour=peak_start, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        # After peak ends — next peak is tomorrow, unless tomorrow is a weekend
+        days_ahead = 1
+        next_wd = (wd + 1) % 7
+        if next_wd >= 5:  # Saturday or Sunday
+            days_ahead = 7 - wd  # skip to Monday
+        target = now.replace(hour=peak_start, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
     else:
         target = now.replace(hour=peak_start, minute=0, second=0, microsecond=0)
 
@@ -185,34 +193,35 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
     data: dict[str, Any] = {}
 
     # five_hour → session
-    fh = body.get("five_hour", {})
-    if fh.get("utilization") is not None:
-        data["session_percent"] = int(fh["utilization"])
-    if fh.get("resets_at"):
-        data["session_reset"] = fh["resets_at"]
+    five_hour = body.get("five_hour", {})
+    if five_hour.get("utilization") is not None:
+        data["session_percent"] = int(five_hour["utilization"])
+    if five_hour.get("resets_at"):
+        data["session_reset"] = five_hour["resets_at"]
 
     # seven_day → week
-    sd = body.get("seven_day", {})
-    if sd.get("utilization") is not None:
-        data["week_percent"] = int(sd["utilization"])
-    if sd.get("resets_at"):
-        data["week_reset"] = sd["resets_at"]
+    seven_day = body.get("seven_day", {})
+    if seven_day.get("utilization") is not None:
+        data["week_percent"] = int(seven_day["utilization"])
+    if seven_day.get("resets_at"):
+        data["week_reset"] = seven_day["resets_at"]
 
     # seven_day_sonnet → sonnet
-    so = body.get("seven_day_sonnet", {})
-    if so and so.get("utilization") is not None:
-        data["sonnet_percent"] = int(so["utilization"])
-    if so and so.get("resets_at"):
-        data["sonnet_reset"] = so["resets_at"]
+    sonnet = body.get("seven_day_sonnet", {})
+    if sonnet and sonnet.get("utilization") is not None:
+        data["sonnet_percent"] = int(sonnet["utilization"])
+    if sonnet and sonnet.get("resets_at"):
+        data["sonnet_reset"] = sonnet["resets_at"]
 
     # extra_usage
-    eu = body.get("extra_usage", {})
-    if eu.get("utilization") is not None:
-        data["extra_percent"] = int(eu["utilization"])
-    if eu.get("used_credits") is not None and eu.get("monthly_limit") is not None:
+    extra = body.get("extra_usage", {})
+    if extra.get("utilization") is not None:
+        data["extra_percent"] = int(extra["utilization"])
+    if extra.get("used_credits") is not None:
         # API returns cents; convert to dollars for our format
-        data["extra_spent"] = eu["used_credits"] / 100
-        data["extra_limit"] = eu["monthly_limit"] / 100
+        data["extra_spent"] = extra["used_credits"] / 100
+    if extra.get("monthly_limit") is not None:
+        data["extra_limit"] = extra["monthly_limit"] / 100
 
     return data
 
@@ -222,10 +231,32 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    """Fetch and print Claude usage data, using cache when fresh."""
+def _enrich_and_emit(
+    data: dict[str, Any],
+    session_id: str | None,
+    cwd: str | None,
+    *,
+    warn_on_error: bool = True,
+) -> None:
+    """Merge cost info and peak info into *data*, then print as JSON."""
+    try:
+        costs = compute_costs(
+            session_id=session_id, cwd=cwd,
+            session_reset_iso=data.get("session_reset"),
+            week_reset_iso=data.get("week_reset"),
+        )
+        data.update(costs)
+    except Exception as e:  # noqa: BLE001
+        if warn_on_error:
+            print(f"Warning: cost computation failed: {e}", file=sys.stderr)
+    data.update(compute_peak_info())
+    print(json.dumps(data, indent=2))
+
+
+def _parse_cli_args() -> tuple[bool, int, str | None, str | None]:
+    """Parse CLI arguments. Returns (force, wait_timeout, session_id, cwd)."""
     force = "--force" in sys.argv
-    wait_timeout = 30  # default: wait up to 30s for another fetch
+    wait_timeout = 30
     if "--wait-timeout" in sys.argv:
         idx = sys.argv.index("--wait-timeout")
         if idx + 1 < len(sys.argv):
@@ -233,58 +264,56 @@ def main() -> None:
                 wait_timeout = int(sys.argv[idx + 1])
             except ValueError:
                 pass
-    session_id_arg: str | None = None
+    session_id: str | None = None
     if "--session" in sys.argv:
         idx = sys.argv.index("--session")
         if idx + 1 < len(sys.argv):
-            session_id_arg = sys.argv[idx + 1]
-    cwd_arg: str | None = None
+            session_id = sys.argv[idx + 1]
+    cwd: str | None = None
     if "--cwd" in sys.argv:
         idx = sys.argv.index("--cwd")
         if idx + 1 < len(sys.argv):
-            cwd_arg = sys.argv[idx + 1]
+            cwd = sys.argv[idx + 1]
+    return force, wait_timeout, session_id, cwd
+
+
+def _wait_for_leader(
+    wait_timeout: int,
+    session_id: str | None,
+    cwd: str | None,
+) -> None:
+    """Poll for fresh cache while another process is fetching. Exits on result."""
+    for _ in range(wait_timeout * 2):  # poll every 0.5s
+        time.sleep(0.5)
+        cached = read_usage_cache(CACHE_MAX_AGE)
+        if cached:
+            _enrich_and_emit(cached, session_id, cwd)
+            sys.exit(0)
+    # Leader failed — emit stale data if available (macsetup-348k)
+    from cache_db import read_usage_stale
+    stale = read_usage_stale()
+    if stale:
+        stale["_stale"] = True
+        _enrich_and_emit(stale, session_id, cwd)
+        sys.exit(0)
+    print("Error: fetch timed out waiting for leader", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> None:
+    """Fetch and print Claude usage data, using cache when fresh."""
+    force, wait_timeout, session_id_arg, cwd_arg = _parse_cli_args()
 
     if not force:
         cached = read_usage_cache(CACHE_MAX_AGE)
         if cached:
-            try:
-                costs = compute_costs(
-                    session_id=session_id_arg, cwd=cwd_arg,
-                    session_reset_iso=cached.get("session_reset"),
-                    week_reset_iso=cached.get("week_reset"),
-                )
-                cached.update(costs)
-            except Exception as e:  # noqa: BLE001
-                print(f"Warning: cost computation failed: {e}", file=sys.stderr)
-            cached.update(compute_peak_info())
-            print(json.dumps(cached, indent=2))
+            _enrich_and_emit(cached, session_id_arg, cwd_arg)
             return
 
-    # Check error backoff before attempting fetch
-    if not force and check_fetch_backoff():
-        sys.exit(0)
-
-    # Acquire fetch lock to prevent duplicate fetches
     acquired_lock = force or try_acquire_fetch_lock()
     if not acquired_lock:
-        # Another process is fetching — wait for fresh cache to appear
-        for _ in range(wait_timeout * 2):  # poll every 0.5s
-            time.sleep(0.5)
-            cached = read_usage_cache(CACHE_MAX_AGE)
-            if cached:
-                try:
-                    costs = compute_costs(
-                        session_id=session_id_arg, cwd=cwd_arg,
-                        session_reset_iso=cached.get("session_reset"),
-                        week_reset_iso=cached.get("week_reset"),
-                    )
-                    cached.update(costs)
-                except Exception:  # noqa: BLE001
-                    pass
-                cached.update(compute_peak_info())
-                print(json.dumps(cached, indent=2))
-                sys.exit(0)
-        sys.exit(0)
+        _wait_for_leader(wait_timeout, session_id_arg, cwd_arg)
+        return
 
     try:
         token = get_usage_token()

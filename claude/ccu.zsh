@@ -192,6 +192,9 @@ ccu_pace() {
   reset_epoch=$(ccu_iso_to_epoch "$reset_iso")
   [[ -z "$reset_epoch" ]] && return 0
 
+  local pace_days=${CLAUDE_CODE_PACE_DAYS:-7}
+  (( pace_days < 1 || pace_days > 7 )) && pace_days=7
+
   local now_epoch week_start elapsed_s total_s
   now_epoch=$(date +%s)
   week_start=$(( reset_epoch - 7 * 86400 ))
@@ -200,7 +203,9 @@ ccu_pace() {
 
   (( elapsed_s <= 0 || elapsed_s > total_s )) && return 0
 
-  local expected=$(( elapsed_s * 100 / total_s ))
+  # Expected usage: consume 100% in pace_days, not 7 (cap at 100)
+  local expected=$(( elapsed_s * 100 / (pace_days * 86400) ))
+  (( expected > 100 )) && expected=100
   local delta=$(( actual - expected ))
 
   # Elapsed time display using ccu_countdown style
@@ -215,29 +220,23 @@ ccu_pace() {
     elapsed_str="${el_h}h"
   fi
 
-  local abs_delta=${delta#-}
-  local label color
+  local color
   if (( delta > 15 )); then
-    label="ahead"; color="0;31"   # red — overcooking
+    color="0;31"   # red — overcooking
   elif (( delta > 5 )); then
-    label="ahead"; color="0;33"   # yellow — warm
+    color="0;33"   # yellow — warm
   elif (( delta >= -5 )); then
-    label="on pace"; color="0;32" # green
+    color="0;32"   # green — on pace
   elif (( delta >= -15 )); then
-    label="behind"; color="0;36"  # cyan — cool
+    color="0;36"   # cyan — cool
   else
-    label="behind"; color="0;90"  # dim — underusing
+    color="0;90"   # dim — underusing
   fi
 
   local sign=""
   (( delta >= 0 )) && sign="+"
-  if [[ "$label" == "on pace" ]]; then
-    printf '\033[0;90m%s into 7-day window — %d%% expected, \033[%sm%s%d%% on pace\033[0m\n' \
-      "$elapsed_str" "$expected" "$color" "$sign" "$delta"
-  else
-    printf '\033[0;90m%s into 7-day window — %d%% expected, \033[%sm%s%d%% %s\033[0m\n' \
-      "$elapsed_str" "$expected" "$color" "$sign" "$delta" "$label"
-  fi
+  printf '\033[0;90m%s into 7-day window (pace: %dd) — %d%% expected, \033[%sm%s%d%%\033[0m\n' \
+    "$elapsed_str" "$pace_days" "$expected" "$color" "$sign" "$delta"
 }
 
 # Render one usage section: title, bar, percentage, reset info.

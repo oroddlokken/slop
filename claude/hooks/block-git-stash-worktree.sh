@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # Block mutating git stash/worktree commands. Allow read-only: stash list/show, worktree list.
-cmd=$(jq -r '.tool_input.command')
+cmd=$(jq -r '.tool_input.command' 2>/dev/null) || { echo '{"decision":"allow"}'; exit 0; }
 if echo "$cmd" | grep -qE '\bgit\s+stash\b'; then
   if echo "$cmd" | grep -qE '\bgit\s+stash\s+(list|show)\b'; then
     echo '{"decision":"allow"}'
