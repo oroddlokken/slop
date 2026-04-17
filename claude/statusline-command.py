@@ -20,6 +20,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_SESSION_ID              — short session UUID
   CLAUDE_STATUSLINE_HOSTNAME                — green hostname
   CLAUDE_STATUSLINE_DIR                     — blue project directory
+  CLAUDE_STATUSLINE_SANDBOX                 — sbx/!sbx badge from merged Claude settings
   CLAUDE_STATUSLINE_GIT                     — branch + indicators
   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
   CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation)
@@ -427,6 +428,32 @@ def _render_dir(cwd: str, toplevel: str) -> str:
         rel = cwd.removeprefix(toplevel)
         return _c("0;34", f"{repo}{rel}")
     return _c("0;34", os.path.basename(cwd))
+
+
+def _render_sandbox(cwd: str, toplevel: str) -> str:
+    """Show sbx/!sbx from merged Claude settings.
+
+    Walks local → project → user settings; first file with sandbox.enabled wins.
+    Empty when unset everywhere (same state clax shows as "(unset)").
+    """
+    if not _on("SANDBOX"):
+        return ""
+    files: list[Path] = []
+    root = Path(toplevel) if toplevel else (Path(cwd) if cwd else None)
+    if root:
+        files.append(root / ".claude" / "settings.local.json")
+        files.append(root / ".claude" / "settings.json")
+    files.append(Path.home() / ".claude" / "settings.json")
+    for path in files:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        sb = data.get("sandbox")
+        if isinstance(sb, dict) and "enabled" in sb:
+            return _c("0;32", "sbx") if sb["enabled"] else f"{SUBDUED}!sbx{RST}"
+    return ""
 
 
 def _render_git(
@@ -1161,6 +1188,7 @@ def main() -> None:
     # Render all sections
     top = [
         _render_timestamp(),
+        _render_sandbox(inp.cwd, git.toplevel),
         _render_session_id(inp.session_id),
         _render_hostname(),
         _render_dir(inp.cwd, git.toplevel),

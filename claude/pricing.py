@@ -71,9 +71,6 @@ class UsageData(TypedDict, total=False):
 def _local_tz() -> ZoneInfo:
     """Return the system's local timezone using full zone rules (DST-aware)."""
     try:
-        import time
-        zone = time.tzname[0]
-        # Prefer IANA zone from TZ env or platform
         import os
         tz_env = os.environ.get("TZ")
         if tz_env:
@@ -93,7 +90,7 @@ def _local_tz() -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-02-22"
+LAST_CHECKED = "2026-04-16"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -155,6 +152,16 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             "claude-sonnet-4-6": {
                 "input": 3e-06, "output": 15e-06,
                 "cache_create": 3.75e-06, "cache_read": 0.3e-06,
+            },
+        },
+    },
+    {
+        # Opus 4.7 released 2026-04-16, same pricing as 4.6.
+        "effective": "2026-04-16",
+        "models": {
+            "claude-opus-4-7": {
+                "input": 5e-06, "output": 25e-06,
+                "cache_create": 6.25e-06, "cache_read": 0.5e-06,
             },
         },
     },
@@ -917,6 +924,7 @@ def compute_costs(
             )
 
             if ctx.file_unchanged:
+                assert cached_entry is not None  # file_unchanged implies cache hit
                 # Reuse cached summary for week/month/all_time/session
                 week_total += cached_entry.get("week_cost", 0.0)
                 month_total += cached_entry.get("month_cost", 0.0)

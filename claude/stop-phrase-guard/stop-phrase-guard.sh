@@ -87,10 +87,12 @@ VIOLATIONS=(
   # These fire when Claude stops to ask whether it should keep working on
   # something it was already asked to do. If the only possible answer from
   # the user is "yes, obviously" — don't ask.
-
-  "want to continue.*or :::Do not ask. The task is not done. Continue working."
-
-  "or save it for:::Do not ask. The task is not done. Continue working."
+  #
+  # Exception: if the message offers a real "A or B?" choice (prioritization
+  # between two valid next tasks), that's legitimate grown-up direction-
+  # seeking, not a dodge. Patterns marked as permission-seeking are skipped
+  # when an "or" follows the matched phrase on the same line. See the
+  # is_permission_pattern function below.
 
   "(should|shall) I (continue|proceed|keep going):::Do not ask permission to continue. The task is not done — continue working. The user will interrupt if they want you to stop."
 
@@ -140,12 +142,32 @@ if ! LC_ALL=C grep -iqE "$COMBINED" <<< "$MESSAGE"; then
   exit 0
 fi
 
+# Permission-seeking patterns are allowed when the match is part of a
+# prioritization question ("continue X or do Y?"). Listed by exact pattern
+# string so membership is a cheap case match.
+is_permission_pattern() {
+  case "$1" in
+    "(should|shall) I (continue|proceed|keep going)") return 0 ;;
+    "would you like (me to|to) continue") return 0 ;;
+    "want me to (keep going|continue)") return 0 ;;
+  esac
+  return 1
+}
+
 # A violation was detected. Walk the list to find which pattern matched
 # (first match wins). This only runs on the rare violation path.
 for entry in "${VIOLATIONS[@]}"; do
   pattern="${entry%%:::*}"
   correction="${entry#*:::}"
   if LC_ALL=C grep -iqE "$pattern" <<< "$MESSAGE"; then
+    # Permission-seeking override: if "or" follows the matched phrase on
+    # the same line, treat it as a legitimate "A or B?" prioritization ask
+    # rather than a yes/no dodge. Skip and let the next pattern (if any)
+    # decide.
+    if is_permission_pattern "$pattern" \
+      && LC_ALL=C grep -iqE "${pattern}.*\bor\b" <<< "$MESSAGE"; then
+      continue
+    fi
     # Output JSON decision to stdout — Claude Code reads this and forces
     # the assistant to continue with the reason as its next instruction.
     jq -n \

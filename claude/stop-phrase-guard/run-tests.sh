@@ -48,6 +48,8 @@ check "fp:come_back_legit"          $DIR/test_fp_come_back_legit.json     false
 check "fp:pause_legit"              $DIR/test_fp_pause_legit.json         false
 check "fp:existing_issue_legit"     $DIR/test_existing_issue_legit.json   false
 check "fp:existing_bug_legit"       $DIR/test_existing_bug_legit.json     false
+check "fp:prioritization_legit"     $DIR/test_fp_prioritization_legit.json false
+check "fp:meta_quoting_legit"       $DIR/test_fp_meta_quoting_legit.json   false
 
 # -- True positive tests (SHOULD block) --
 check "tp:known_issue_dodge"        $DIR/test_fp_known_issue_dodge.json   true
