@@ -20,6 +20,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import orjson
 from rich import box
@@ -37,6 +38,7 @@ from cache_db import (
     invalidate_ccreport,
     save_ccreport_file,
 )
+from exchange import get_rate, load_rates, to_oslo_date
 from pricing import calc_cost, extract_assistant_fields
 
 _PROJECT_ROOTS = (
@@ -136,6 +138,8 @@ class UsageRecord:
 class AggBucket:
     tokens: TokenCounts = field(default_factory=TokenCounts)
     cost: float = 0.0
+    cost_nok: float = 0.0
+    nok_estimated: bool = False
     models: set[str] = field(default_factory=set)
     count: int = 0
 
@@ -149,6 +153,51 @@ def record_cost(rec: UsageRecord) -> float:
         rec.tokens.cache_create, rec.tokens.cache_read,
         rec.model, rec.timestamp,
     )
+
+
+def record_cost_nok(rec: UsageRecord, rates: dict[str, float], cost_usd: float, max_rate_date: str | None = None) -> tuple[float | None, bool]:
+    """Convert a record's USD cost to NOK+MVA using its day's exchange rate.
+
+    Applies 25% Norwegian VAT (MVA) on top of the converted amount.
+    Returns (nok_amount_incl_mva, estimated) where estimated is True only at the
+    trailing edge of rate data (the true rate is not yet known).
+    """
+    d = to_oslo_date(rec.timestamp)
+    rate, estimated = get_rate(rates, d, _max_date=max_rate_date)
+    if rate is None:
+        return None, False
+    return cost_usd * rate * 1.25, estimated
+
+
+def _accum_nok(bucket: "AggBucket", rec: UsageRecord, rates: dict[str, float], cost_usd: float, max_rate_date: str | None = None) -> None:
+    """Accumulate NOK cost into a bucket, setting estimated flag if needed."""
+    nok, estimated = record_cost_nok(rec, rates, cost_usd, max_rate_date)
+    if nok is not None:
+        bucket.cost_nok += nok
+        if estimated:
+            bucket.nok_estimated = True
+
+
+def load_rates_for_records(records: list[UsageRecord]) -> tuple[dict[str, float], bool, str | None]:
+    """Bulk-load exchange rates for all record dates.
+
+    Returns (rates_dict, has_full_coverage, max_rate_date).
+    """
+    from datetime import date as date_type
+    if not records:
+        return {}, False, None
+    dates: set[date_type] = {to_oslo_date(r.timestamp) for r in records}
+    rates = load_rates(dates)
+    if not rates:
+        return {}, False, None
+    max_rate_date = max(rates)
+    # Check coverage: every unique date must resolve via walkback
+    missing = 0
+    for d in dates:
+        rate, _ = get_rate(rates, d, _max_date=max_rate_date)
+        if rate is None:
+            missing += 1
+    return rates, missing == 0, max_rate_date
 
 
 def project_display_name(project_dir: str) -> str:
@@ -333,6 +382,16 @@ def fmt_cost(c: float) -> str:
     return f"${c:.4f}"
 
 
+def fmt_nok(c: float, estimated: bool = False) -> str:
+    """Format cost in NOK incl. MVA. Appends * when rate is estimated."""
+    star = "*" if estimated else ""
+    if c >= 10.0:
+        return f"kr {c:.0f}{star}"
+    if c >= 1.0:
+        return f"kr {c:.1f}{star}"
+    return f"kr {c:.2f}{star}"
+
+
 def fmt_pct(cost: float, total: float) -> str:
     """Format cost as percentage of total."""
     if total <= 0:
@@ -370,20 +429,24 @@ def _make_report_table(
     narrow: bool = False,
     compact: bool = False,
     label_style: str = "white",
+    has_nok: bool = False,
 ) -> Table:
     """Create a standard report table with label + token + optional Models columns."""
     table = Table(title=title, title_style="bold", box=box.ROUNDED, expand=False, show_lines=False)
     table.add_column(label_col, style=label_style, no_wrap=True)
-    _add_token_columns(table, compact=compact, narrow=narrow)
+    _add_token_columns(table, compact=compact, narrow=narrow, has_nok=has_nok)
     if not narrow:
         table.add_column("Models", style="dim", no_wrap=True)
     return table
 
 
-def _add_token_columns(table: Table, *, compact: bool = False, narrow: bool = False) -> None:
+def _add_token_columns(table: Table, *, compact: bool = False, narrow: bool = False, has_nok: bool = False) -> None:
     """Add the standard token + cost columns to a table."""
+    cost_label = "USD" if has_nok else "Cost"
     if narrow:
-        table.add_column("Cost", justify="right", no_wrap=True)
+        table.add_column(cost_label, justify="right", no_wrap=True)
+        if has_nok:
+            table.add_column("NOK+MVA", justify="right", style="cyan", no_wrap=True)
         table.add_column("Tokens", justify="right", style="bold", no_wrap=True)
         table.add_column("Calls", justify="right", style="dim", no_wrap=True)
         return
@@ -393,7 +456,9 @@ def _add_token_columns(table: Table, *, compact: bool = False, narrow: bool = Fa
         table.add_column("Cache W", justify="right", style="blue", no_wrap=True)
         table.add_column("Cache R", justify="right", style="blue", no_wrap=True)
     table.add_column("Total", justify="right", style="bold", no_wrap=True)
-    table.add_column("Cost", justify="right", no_wrap=True)
+    table.add_column(cost_label, justify="right", no_wrap=True)
+    if has_nok:
+        table.add_column("NOK+MVA", justify="right", style="cyan", no_wrap=True)
     table.add_column("%", justify="right", style="dim", no_wrap=True)
     table.add_column("Calls", justify="right", style="dim", no_wrap=True)
 
@@ -408,11 +473,15 @@ def _fmt_cache_read(t: TokenCounts) -> str:
     return s
 
 
-def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False, narrow: bool = False) -> list:
+def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False, narrow: bool = False, has_nok: bool = False) -> list:
     """Build the token/cost cells for a bucket."""
     cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
     if narrow:
-        return [cost_text, fmt_tokens(b.tokens.total), str(b.count)]
+        cells = [cost_text]
+        if has_nok:
+            cells.append(Text(fmt_nok(b.cost_nok, b.nok_estimated), style="cyan"))
+        cells += [fmt_tokens(b.tokens.total), str(b.count)]
+        return cells
     row = [
         fmt_tokens(b.tokens.input),
         fmt_tokens(b.tokens.output),
@@ -422,6 +491,10 @@ def _token_row(b: "AggBucket", total_cost: float = 0.0, *, compact: bool = False
     row += [
         fmt_tokens(b.tokens.total),
         cost_text,
+    ]
+    if has_nok:
+        row.append(Text(fmt_nok(b.cost_nok, b.nok_estimated), style="cyan"))
+    row += [
         fmt_pct(b.cost, total_cost),
         str(b.count),
     ]
@@ -439,35 +512,40 @@ def _add_summary_rows(
     narrow: bool,
     compact: bool = False,
     avg_label: str = "",
+    has_nok: bool = False,
 ) -> None:
     """Append TOTAL and optional AVG rows to a report table."""
     table.add_section()
-    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, compact=compact, narrow=narrow)]
+    total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, compact=compact, narrow=narrow, has_nok=has_nok)]
     if not narrow:
         total_row.append(f"{len(total_agg.models)} models")
     table.add_row(*total_row, style="bold")
     if n_buckets > 1:
         avg_cost = total_agg.cost / n_buckets
+        avg_nok = total_agg.cost_nok / n_buckets if has_nok else 0.0
         if narrow:
-            table.add_row(
+            cells = [
                 Text("AVG", style="dim bold"),
                 Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
+            cells += ["", ""]
+            table.add_row(*cells, style="dim")
         elif avg_label:
             n_empty = 4 if not compact else 2
-            table.add_row(
+            cells = [
                 Text("AVERAGE", style="dim bold"),
                 *[""] * n_empty, "",
                 Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                avg_label,
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
+            cells += ["", "", avg_label]
+            table.add_row(*cells, style="dim")
 
 
-def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
+def report_daily(records: list[UsageRecord], breakdown: bool = False, rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None) -> None:
     """Print daily usage report."""
     narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
@@ -477,7 +555,10 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
         day = rec.timestamp.astimezone().strftime("%Y-%m-%d")
         b = buckets[day]
         b.tokens += rec.tokens
-        b.cost += record_cost(rec)
+        cost = record_cost(rec)
+        b.cost += cost
+        if has_nok and rates is not None:
+            _accum_nok(b, rec, rates, cost, max_rate_date)
         if rec.model != "<synthetic>":
             b.models.add(rec.model)
         b.count += 1
@@ -486,39 +567,44 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False) -> None:
             mb = model_buckets[day][rec.model]
             mb.tokens += rec.tokens
             mb.cost += record_cost(rec)
+            if has_nok and rates is not None:
+                _accum_nok(mb, rec, rates, cost, max_rate_date)
             mb.count += 1
 
-    table = _make_report_table(f"Daily Usage ({len(buckets)} days)", "Date", narrow=narrow)
+    table = _make_report_table(f"Daily Usage ({len(buckets)} days)", "Date", narrow=narrow, has_nok=has_nok)
 
     total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
     for day in sorted(buckets):
         b = buckets[day]
-        row = [day, *_token_row(b, total_cost, narrow=narrow)]
+        row = [day, *_token_row(b, total_cost, narrow=narrow, has_nok=has_nok)]
         if not narrow:
             row.append(", ".join(sorted(short_model(m) for m in b.models)))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
+        total_agg.cost_nok += b.cost_nok
+        if b.nok_estimated:
+            total_agg.nok_estimated = True
         total_agg.count += b.count
         total_agg.models |= b.models
 
         if breakdown:
             for model in sorted(model_buckets[day]):
                 mb = model_buckets[day][model]
-                brow = [f"  [dim]{short_model(model)}[/dim]", *_token_row(mb, total_cost, narrow=narrow)]
+                brow = [f"  [dim]{short_model(model)}[/dim]", *_token_row(mb, total_cost, narrow=narrow, has_nok=has_nok)]
                 if not narrow:
                     brow.append("")
                 table.add_row(*brow)
 
-    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per day")
+    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per day", has_nok=has_nok)
 
     console.print()
     console.print(table)
     console.print()
 
 
-def report_monthly(records: list[UsageRecord]) -> None:
+def report_monthly(records: list[UsageRecord], rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None) -> None:
     """Print monthly usage report."""
     narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
@@ -527,91 +613,115 @@ def report_monthly(records: list[UsageRecord]) -> None:
         month = rec.timestamp.astimezone().strftime("%Y-%m")
         b = buckets[month]
         b.tokens += rec.tokens
-        b.cost += record_cost(rec)
+        cost = record_cost(rec)
+        b.cost += cost
+        if has_nok and rates is not None:
+            _accum_nok(b, rec, rates, cost, max_rate_date)
         if rec.model != "<synthetic>":
             b.models.add(rec.model)
         b.count += 1
 
-    table = _make_report_table(f"Monthly Usage ({len(buckets)} months)", "Month", narrow=narrow)
+    table = _make_report_table(f"Monthly Usage ({len(buckets)} months)", "Month", narrow=narrow, has_nok=has_nok)
 
     total_cost = sum(b.cost for b in buckets.values())
     total_agg = AggBucket()
     for month in sorted(buckets):
         b = buckets[month]
-        row = [month, *_token_row(b, total_cost, narrow=narrow)]
+        row = [month, *_token_row(b, total_cost, narrow=narrow, has_nok=has_nok)]
         if not narrow:
             row.append(", ".join(sorted(short_model(m) for m in b.models)))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
+        total_agg.cost_nok += b.cost_nok
+        if b.nok_estimated:
+            total_agg.nok_estimated = True
         total_agg.count += b.count
         total_agg.models |= b.models
 
-    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per month")
+    _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per month", has_nok=has_nok)
 
     # Projected cost for the current (latest) partial month
     latest_month = max(buckets)
     today = datetime.now().astimezone()
     current_month_key = today.strftime("%Y-%m")
+    latest_est = buckets[latest_month].nok_estimated if has_nok else False
     if latest_month == current_month_key:
         table.add_section()
         days_elapsed = today.day
         days_in_month = calendar.monthrange(today.year, today.month)[1]
         if days_elapsed < days_in_month:
             projected = buckets[latest_month].cost / days_elapsed * days_in_month
+            projected_nok = buckets[latest_month].cost_nok / days_elapsed * days_in_month if has_nok else 0.0
             if narrow:
-                table.add_row(
+                cells = [
                     Text("PROJ", style="dim bold italic"),
                     Text(fmt_cost(projected), style=cost_style(projected)),
-                    "", "",
-                    style="dim",
-                )
+                ]
+                if has_nok:
+                    cells.append(Text(fmt_nok(projected_nok, latest_est), style="dim cyan"))
+                cells += ["", ""]
+                table.add_row(*cells, style="dim")
             else:
-                table.add_row(
+                cells = [
                     Text("PROJECTED", style="dim bold italic"),
                     "", "", "", "", "",
                     Text(fmt_cost(projected), style=cost_style(projected)),
+                ]
+                if has_nok:
+                    cells.append(Text(fmt_nok(projected_nok, latest_est), style="dim cyan"))
+                cells += [
                     "", "",
                     f"({days_elapsed}/{days_in_month} days in {today.strftime('%B')})",
-                    style="dim",
-                )
+                ]
+                table.add_row(*cells, style="dim")
 
             # Projected based on trailing 14-day daily average
-            # Window: the 14 days ending yesterday (today is incomplete)
             window = 14
             end_14d = today.replace(hour=0, minute=0, second=0, microsecond=0)
             start_14d = end_14d - timedelta(days=window)
             cost_14d = 0.0
+            nok_14d_bucket = AggBucket()
             for rec in records:
                 rec_local = rec.timestamp.astimezone()
                 if start_14d <= rec_local < end_14d:
-                    cost_14d += record_cost(rec)
+                    c = record_cost(rec)
+                    cost_14d += c
+                    if has_nok and rates is not None:
+                        _accum_nok(nok_14d_bucket, rec, rates, c, max_rate_date)
             if cost_14d > 0:
                 avg_daily_14d = cost_14d / window
                 projected_14d = avg_daily_14d * days_in_month
+                projected_14d_nok = (nok_14d_bucket.cost_nok / window) * days_in_month if has_nok else 0.0
                 if narrow:
-                    table.add_row(
+                    cells = [
                         Text("PROJ 14d", style="dim bold italic"),
                         Text(fmt_cost(projected_14d), style=cost_style(projected_14d)),
-                        "", "",
-                        style="dim",
-                    )
+                    ]
+                    if has_nok:
+                        cells.append(Text(fmt_nok(projected_14d_nok, nok_14d_bucket.nok_estimated), style="dim cyan"))
+                    cells += ["", ""]
+                    table.add_row(*cells, style="dim")
                 else:
-                    table.add_row(
+                    cells = [
                         Text("PROJECTED", style="dim bold italic"),
                         "", "", "", "", "",
                         Text(fmt_cost(projected_14d), style=cost_style(projected_14d)),
+                    ]
+                    if has_nok:
+                        cells.append(Text(fmt_nok(projected_14d_nok, nok_14d_bucket.nok_estimated), style="dim cyan"))
+                    cells += [
                         "", "",
                         f"Last {window} days avg",
-                        style="dim",
-                    )
+                    ]
+                    table.add_row(*cells, style="dim")
 
     console.print()
     console.print(table)
     console.print()
 
 
-def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
+def report_project(records: list[UsageRecord], limit: int | None = 20, rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None) -> None:
     """Print per-project usage report."""
     narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
@@ -619,7 +729,10 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     for rec in records:
         b = buckets[rec.project]
         b.tokens += rec.tokens
-        b.cost += record_cost(rec)
+        cost = record_cost(rec)
+        b.cost += cost
+        if has_nok and rates is not None:
+            _accum_nok(b, rec, rates, cost, max_rate_date)
         if rec.model != "<synthetic>":
             b.models.add(rec.model)
         b.count += 1
@@ -631,51 +744,60 @@ def report_project(records: list[UsageRecord], limit: int | None = 20) -> None:
     else:
         shown = str(len(sorted_projects))
 
-    table = _make_report_table(f"Projects ({shown})", "Project", narrow=narrow, compact=True, label_style="magenta")
+    table = _make_report_table(f"Projects ({shown})", "Project", narrow=narrow, compact=True, label_style="magenta", has_nok=has_nok)
 
     total_cost = sum(buckets[p].cost for p in sorted_projects)
     total_agg = AggBucket()
     for proj in sorted_projects:
         b = buckets[proj]
-        row = [proj, *_token_row(b, total_cost, compact=True, narrow=narrow)]
+        row = [proj, *_token_row(b, total_cost, compact=True, narrow=narrow, has_nok=has_nok)]
         if not narrow:
             row.append(", ".join(sorted(short_model(m) for m in b.models)))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
+        total_agg.cost_nok += b.cost_nok
+        if b.nok_estimated:
+            total_agg.nok_estimated = True
         total_agg.count += b.count
         total_agg.models |= b.models
 
     _add_summary_rows(table, total_agg, len(sorted_projects), narrow=narrow, compact=True,
-                      avg_label=f"per project (top {len(sorted_projects)})")
+                      avg_label=f"per project (top {len(sorted_projects)})", has_nok=has_nok)
     # Average across ALL projects
     all_n = len(buckets)
+    all_any_est = any(b.nok_estimated for b in buckets.values()) if has_nok else False
     if all_n > 1:
         all_cost = sum(b.cost for b in buckets.values())
         all_avg = all_cost / all_n
+        all_nok = sum(b.cost_nok for b in buckets.values())
+        all_avg_nok = all_nok / all_n if has_nok else 0.0
         if narrow:
-            table.add_row(
+            cells = [
                 Text("AVG", style="dim bold"),
                 Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-                f"all {all_n}", "",
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
+            cells += [f"all {all_n}", ""]
+            table.add_row(*cells, style="dim")
         else:
-            table.add_row(
+            cells = [
                 Text("AVERAGE", style="dim bold"),
                 "", "", "",
                 Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-                "", "",
-                f"per project (all {all_n})",
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
+            cells += ["", "", f"per project (all {all_n})"]
+            table.add_row(*cells, style="dim")
 
     console.print()
     console.print(table)
     console.print()
 
 
-def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
+def report_session(records: list[UsageRecord], limit: int | None = 20, rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None) -> None:
     """Print per-session usage report."""
     narrow = _is_narrow()
     buckets: dict[str, AggBucket] = defaultdict(AggBucket)
@@ -685,7 +807,10 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         sid = rec.session_id
         b = buckets[sid]
         b.tokens += rec.tokens
-        b.cost += record_cost(rec)
+        cost = record_cost(rec)
+        b.cost += cost
+        if has_nok and rates is not None:
+            _accum_nok(b, rec, rates, cost, max_rate_date)
         if rec.model != "<synthetic>":
             b.models.add(rec.model)
         b.count += 1
@@ -709,7 +834,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
     if narrow:
         table.add_column("Project", style="magenta", no_wrap=True)
         table.add_column("Date", style="white", no_wrap=True)
-        _add_token_columns(table, narrow=True)
+        _add_token_columns(table, narrow=True, has_nok=has_nok)
     else:
         table.add_column("Session", style="dim", no_wrap=True)
         table.add_column("Project", style="magenta", no_wrap=True)
@@ -717,7 +842,9 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         table.add_column("Input", justify="right", style="cyan", no_wrap=True)
         table.add_column("Output", justify="right", style="cyan", no_wrap=True)
         table.add_column("Total", justify="right", style="bold", no_wrap=True)
-        table.add_column("Cost", justify="right", no_wrap=True)
+        table.add_column("USD" if has_nok else "Cost", justify="right", no_wrap=True)
+        if has_nok:
+            table.add_column("NOK+MVA", justify="right", style="cyan", no_wrap=True)
         table.add_column("%", justify="right", style="dim", no_wrap=True)
         table.add_column("Calls", justify="right", style="dim", no_wrap=True)
         table.add_column("Models", style="dim", no_wrap=True)
@@ -729,17 +856,19 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
         meta = session_meta[sid]
         cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
         if narrow:
-            table.add_row(
+            cells = [
                 meta["project"],
                 meta["last"].astimezone().strftime("%m-%d %H:%M"),
                 cost_text,
-                fmt_tokens(b.tokens.total),
-                str(b.count),
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(b.cost_nok, b.nok_estimated), style="cyan"))
+            cells += [fmt_tokens(b.tokens.total), str(b.count)]
+            table.add_row(*cells)
         else:
             short_sid = sid[-8:] if len(sid) > 8 else sid
             models_str = ", ".join(sorted(short_model(m) for m in b.models))
-            table.add_row(
+            cells = [
                 short_sid,
                 meta["project"],
                 meta["last"].astimezone().strftime("%Y-%m-%d %H:%M"),
@@ -747,27 +876,36 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
                 fmt_tokens(b.tokens.output),
                 fmt_tokens(b.tokens.total),
                 cost_text,
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(b.cost_nok, b.nok_estimated), style="cyan"))
+            cells += [
                 fmt_pct(b.cost, total_cost),
                 str(b.count),
                 models_str,
-            )
+            ]
+            table.add_row(*cells)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
+        total_agg.cost_nok += b.cost_nok
+        if b.nok_estimated:
+            total_agg.nok_estimated = True
         total_agg.count += b.count
 
     table.add_section()
     total_cost_text = Text(fmt_cost(total_agg.cost), style=cost_style(total_agg.cost))
     if narrow:
-        table.add_row(
+        cells = [
             Text("TOTAL", style="bold"),
             f"({shown})",
             total_cost_text,
-            fmt_tokens(total_agg.tokens.total),
-            str(total_agg.count),
-            style="bold",
-        )
+        ]
+        if has_nok:
+            cells.append(Text(fmt_nok(total_agg.cost_nok, total_agg.nok_estimated), style="bold cyan"))
+        cells += [fmt_tokens(total_agg.tokens.total), str(total_agg.count)]
+        table.add_row(*cells, style="bold")
     else:
-        table.add_row(
+        cells = [
             Text("TOTAL", style="bold"),
             "",
             f"({shown})",
@@ -775,64 +913,75 @@ def report_session(records: list[UsageRecord], limit: int | None = 20) -> None:
             fmt_tokens(total_agg.tokens.output),
             fmt_tokens(total_agg.tokens.total),
             total_cost_text,
-            "",
-            str(total_agg.count),
-            "",
-            style="bold",
-        )
+        ]
+        if has_nok:
+            cells.append(Text(fmt_nok(total_agg.cost_nok, total_agg.nok_estimated), style="bold cyan"))
+        cells += ["", str(total_agg.count), ""]
+        table.add_row(*cells, style="bold")
     n = len(sorted_sessions)
     if n > 1:
         avg_cost = total_agg.cost / n
+        avg_nok = total_agg.cost_nok / n if has_nok else 0.0
         if narrow:
-            table.add_row(
+            cells = [
                 Text("AVG", style="dim bold"),
                 "",
                 Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
+            cells += ["", ""]
+            table.add_row(*cells, style="dim")
         else:
-            table.add_row(
+            cells = [
                 Text("AVERAGE", style="dim bold"),
                 "", "", "", "", "",
                 Text(fmt_cost(avg_cost), style=cost_style(avg_cost)),
-                "", "",
-                f"per session (top {n})",
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
+            cells += ["", "", f"per session (top {n})"]
+            table.add_row(*cells, style="dim")
     # Average across ALL sessions
     all_n = len(buckets)
+    all_any_est = any(b.nok_estimated for b in buckets.values()) if has_nok else False
     if all_n > 1:
         all_cost = sum(b.cost for b in buckets.values())
         all_avg = all_cost / all_n
+        all_nok = sum(b.cost_nok for b in buckets.values())
+        all_avg_nok = all_nok / all_n if has_nok else 0.0
         if narrow:
-            table.add_row(
+            cells = [
                 Text("AVG", style="dim bold"),
                 f"all {all_n}",
                 Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-                "", "",
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
+            cells += ["", ""]
+            table.add_row(*cells, style="dim")
         else:
-            table.add_row(
+            cells = [
                 Text("AVERAGE", style="dim bold"),
                 "", "", "", "", "",
                 Text(fmt_cost(all_avg), style=cost_style(all_avg)),
-                "", "",
-                f"per session (all {all_n})",
-                style="dim",
-            )
+            ]
+            if has_nok:
+                cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
+            cells += ["", "", f"per session (all {all_n})"]
+            table.add_row(*cells, style="dim")
 
     console.print()
     console.print(table)
     console.print()
 
 
-def report_json(records: list[UsageRecord]) -> None:
+def report_json(records: list[UsageRecord], rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None) -> None:
     """Output all records as JSON for programmatic use."""
     output = []
     for rec in records:
-        output.append({
+        cost = record_cost(rec)
+        entry: dict[str, Any] = {
             "message_id": rec.message_id,
             "model": rec.model,
             "timestamp": rec.timestamp.isoformat(),
@@ -843,8 +992,15 @@ def report_json(records: list[UsageRecord]) -> None:
             "cache_creation_tokens": rec.tokens.cache_create,
             "cache_read_tokens": rec.tokens.cache_read,
             "total_tokens": rec.tokens.total,
-            "cost_usd": round(record_cost(rec), 6),
-        })
+            "cost_usd": round(cost, 6),
+        }
+        if has_nok and rates is not None:
+            nok, estimated = record_cost_nok(rec, rates, cost, max_rate_date)
+            if nok is not None:
+                entry["cost_nok"] = round(nok, 4)
+                if estimated:
+                    entry["cost_nok_estimated"] = True
+        output.append(entry)
     print(json.dumps(output, indent=2))
 
 
@@ -906,28 +1062,34 @@ def main() -> None:
         print("No usage records found.", file=sys.stderr)
         sys.exit(1)
 
+    # Bulk-load exchange rates for all records
+    rates, has_full_coverage, max_rate_date = load_rates_for_records(records)
+    has_nok = bool(rates)
+    if has_nok and not has_full_coverage:
+        print("⚠ Some dates lack exchange rate data; NOK values are partial.", file=sys.stderr)
+
     if hasattr(args, "json") and args.json:
-        report_json(records)
+        report_json(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
         return
 
     command = args.command
 
     if command == "daily":
-        report_daily(records, breakdown=args.breakdown)
+        report_daily(records, breakdown=args.breakdown, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
     elif command == "monthly":
-        report_monthly(records)
+        report_monthly(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
     elif command == "project":
         lim = args.limit if args.limit != 0 else None
-        report_project(records, limit=lim)
+        report_project(records, limit=lim, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
     elif command == "session":
         lim = args.limit if args.limit != 0 else None
-        report_session(records, limit=lim)
+        report_session(records, limit=lim, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
     else:
         # No subcommand: show daily + monthly summary
-        report_daily(records)
-        report_monthly(records)
-        report_project(records)
-        report_session(records)
+        report_daily(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
+        report_monthly(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
+        report_project(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
+        report_session(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date)
 
 
 if __name__ == "__main__":

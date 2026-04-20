@@ -130,6 +130,11 @@ CREATE TABLE IF NOT EXISTS extra_usage_snapshots (
     ts    REAL PRIMARY KEY,
     spent REAL NOT NULL
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    date  TEXT PRIMARY KEY,
+    rate  REAL NOT NULL
+) WITHOUT ROWID;
 """
 
 
