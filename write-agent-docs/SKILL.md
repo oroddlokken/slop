@@ -41,7 +41,7 @@ Rules with a "why" are stronger. Agents generalize from explanations to novel si
 
 ## Enable Self-Verification
 
-Tell the agent how to check its own work — the command to run, the file to diff against, the output to expect. Agents that can verify catch their own mistakes; agents that cannot, ship them. Anthropic's own guidance calls this the single highest-leverage thing to put in CLAUDE.md.
+Tell the agent how to check its own work — the command to run, the file to diff against, the output to expect. Agents that can verify catch their own mistakes; agents that cannot, ship them. Anthropic's guidance flags this as one of the highest-leverage additions to CLAUDE.md.
 
 - Name the test and lint commands, and the preview/diff variant of any destructive action (`ansible-playbook --check --diff`, `terraform plan`, `dns_records.py diff`)
 - Point at a canonical example file rather than describing the pattern in prose
@@ -104,11 +104,19 @@ State each fact once, in one canonical location. Duplicated information wastes t
 
 ## Guardrails
 
-- State safety boundaries explicitly — don't imply them
+- State safety boundaries explicitly with scope and reasoning, so the agent can apply them to novel situations
 - Frame as positive directives with scope ("Use `kubectl get/describe/logs` for cluster inspection. Present a plan and wait for approval before any resource modifications")
 - Include reasoning so the agent generalizes correctly
 - Consider whether a hook would enforce the rule more reliably than prose
 
 ## Cross-Tool Consistency
 
-If the project has instructions for multiple tools (CLAUDE.md, AGENTS.md, copilot-instructions.md), keep them consistent. Cross-tool contradictions are a common source of bugs.
+If the project has instructions for multiple tools (CLAUDE.md, AGENTS.md, copilot-instructions.md, .cursorrules), cross-tool contradictions produce silent bugs — each tool follows its own file, and any drift surfaces as agents making different choices in the same codebase.
+
+Common drift patterns:
+- Test framework mismatch (CLAUDE.md says pytest, AGENTS.md says unittest)
+- Lint / formatter command mismatch (one file says `ruff check`, another says `flake8`)
+- Safety rule mismatch (one file forbids force-push, another is silent on it)
+- Workflow step mismatch (one file says "run tests before committing", another omits it)
+
+Pick one file as the source of truth for behavioral rules and have the others forward to it or carry an identical copy. If you keep identical copies, add a pre-commit check that diffs them — the common failure mode is updating one file and forgetting the others.

@@ -84,6 +84,8 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
      - Note whether the project has any enforcement layer (hooks, deny rules, sandboxing) backing it up — if not, flag that the restriction is guidance only
      - Flag stacked negative prohibitions (3+ NEVER/DO NOT rules about tools) — compliance degrades as these accumulate
 
+### Full Lenses (add to core)
+
 9. **Cold Start** — Pretend to be a fresh agent with zero context. What assumptions does the documentation make that would confuse a first-time reader? Skip things derivable from code.
 
 10. **Domain: {area}** — Deep-dive gap analysis for a specific domain (e.g., "database", "frontend", "pipeline", "testing"). Reads both docs AND relevant source code to find where the docs mislead or where non-obvious patterns aren't captured.
@@ -98,7 +100,7 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
 
 ### Step 1: Determine Target
 
-ALWAYS ask the user before proceeding — do not assume defaults or skip this step:
+Ask the user for target path and scope before launching agents — running on assumed defaults misfires because doc layouts vary too widely to guess:
 - **Path**: Which files/directories to audit? (suggest: the project root — discovery will find CLAUDE.md files, agent_docs/, etc. automatically)
 - **Scope**: Ask the user to pick one:
   - `standard` (recommended) — runs the 8 core checks: duplicated info, conflicting instructions, missing context, vague rules, misplaced content, file size/structure issues, secrets/stale content, and guardrails/prohibitions
@@ -214,8 +216,8 @@ After all agents complete, analyze the combined output:
 ## Rules
 
 - **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential for cost savings.
-- **Each agent audits independently** — don't share findings between them
-- **Distill runs after all agents complete**
-- **Propose edits, don't auto-apply** — the user decides what to change
-- **Be aggressive about filtering out code-derivable stuff** — if an agent can `cat` a file to learn something, it doesn't need to be documented
-- **Respect the doc hierarchy**: CLAUDE.md = behavioral rules; architecture/system docs = what the system is; DB docs = DB conventions. Don't suggest documenting things that belong in a different layer.
+- **Each agent audits independently** — crossing findings between agents biases the later runs; cross-lens agreement at the distill step is the signal that a finding is robust.
+- **Distill runs after all agents complete** — multiple lenses often flag the same issue from different angles, and deduplication needs all findings in hand.
+- **Propose edits and wait for user approval before applying them** — the user is the arbiter of which changes are worth the code churn.
+- **Filter aggressively for code-derivable content** — if an agent can `cat` a file to learn something, it doesn't belong in docs; every such line costs tokens on every session.
+- **Respect the doc hierarchy**: CLAUDE.md = behavioral rules; architecture/system docs = what the system is; DB docs = DB conventions. Routing a finding to the wrong file just moves the noise without reducing it.
