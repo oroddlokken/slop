@@ -116,13 +116,6 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
     - Prescribed reasoning structure ("first analyze X, then Y") — often beats the model's native strategy in the wrong direction.
     - Output-shape constraints bleeding into the reasoning trace — constrain only the final answer, leave the trace free.
 
-20. **Injection Resilience** — For agents that concatenate user content into prompts or route user content into tool calls:
-    - Is user content wrapped in clearly-named tags (`<user_input>`) with a sentence telling the model the contents are data, not instructions?
-    - Are critical rules placed in the system prompt (more injection-resistant) rather than only in the user turn?
-    - Is there a named detection phrase the agent uses when user content looks like an instruction, so the attempt surfaces instead of being complied with?
-    - Are destructive tool calls gated by capability scoping or human confirmation, not by prose guidance alone?
-    Flag prompts that rely on prose-only defenses for injection-critical actions — 2026 consensus (OWASP LLM01:2025) is that token-level defenses raise the bar but are not security boundaries.
-
 ## Workflow
 
 ### Step 1: Determine Target
@@ -132,7 +125,7 @@ Ask the user for target path and scope before launching agents — running on as
 - **Path**: Point at the directory containing the agent prompt (or a single file if the whole prompt is one file). The skill will auto-discover system prompt, tool descriptions, examples, and guardrail files.
 - **Scope**: Ask the user to pick one:
   - `standard` (recommended) — runs the 12 core lenses: framing, reasoning, weak language, platitudes, redundancy, contradictions, persona, scope & redirect, clarification policy, output shape, uncertainty, guardrails
-  - `full` — everything above plus source hierarchy, escalation, tool descriptions, examples audit, self-verification, cold start, reasoning-model fit, injection resilience
+  - `full` — everything above plus source hierarchy, escalation, tool descriptions, examples audit, self-verification, cold start, reasoning-model fit
   - Or the user can name specific areas (e.g., "just check framing and weak language")
 
 Present as a simple choice — do NOT list lens numbers or internal names.

@@ -160,10 +160,6 @@ Quick test: read the prompt as if you had never seen the product. Any sentence w
 
 On reasoning-capable models (Claude Opus 4.7 extended thinking, o3, DeepSeek R1, Gemini thinking): skip meta-instructions like "think step by step" (native to the trace), minimize few-shot on reasoning-heavy tasks (anchors the trace and suppresses exploration), avoid prescribed reasoning structure (degrades native strategy), and constrain only the final-answer format — leave the reasoning trace free. These caveats don't apply to classification, extraction, or grounded QA.
 
-## Prompt Injection Defense
-
-Token-level defenses raise the bar but aren't security boundaries — OWASP LLM01:2025 treats prompt injection as an architectural problem. The prompt can segregate user input in `<user_input>` tags and put critical rules in the system prompt (more injection-resistant than user-turn rules). Destructive tool calls need gating at the architecture layer — capability scoping, human confirmation, or runtime filters — not prose.
-
 ## Self-Verification Without a Test Suite
 
 Coding agents can "run the tests". General agents have weaker equivalents, but naming them improves compliance materially:
