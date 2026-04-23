@@ -313,6 +313,28 @@ def _try_cache_bypass() -> dict | None:
     return read_usage_for_statusline()
 
 
+def _adjust_passed_resets(data: dict, now: float) -> dict:
+    """Zero out percentages for rate limit windows whose reset time has passed.
+
+    When stale data shows e.g. S:80% but the session has already reset,
+    the actual utilization is near 0. Showing the old value is misleading.
+    """
+    if not data:
+        return data
+    for pct_key, reset_key in [
+        ("session_percent", "session_reset"),
+        ("week_percent", "week_reset"),
+        ("sonnet_percent", "sonnet_reset"),
+    ]:
+        reset_iso = data.get(reset_key)
+        if reset_iso:
+            epoch = _parse_iso_epoch(str(reset_iso))
+            if epoch is not None and epoch <= now:
+                data[pct_key] = 0
+                del data[reset_key]
+    return data
+
+
 def _fetch_usage(session_id: str, cwd: str) -> dict:
     """Get usage data: env var → cache bypass → detached get_claude_usage.py.
 
@@ -320,15 +342,16 @@ def _fetch_usage(session_id: str, cwd: str) -> dict:
     the parent being killed by the statusline framework (e.g. tmux interval).
     Stale cached data is returned for this render; fresh data appears next call.
     """
+    now = time.time()
     pre = os.environ.get("CLAUDE_STATUSLINE_USAGE_JSON", "")
     if pre:
         try:
-            return json.loads(pre)
+            return _adjust_passed_resets(json.loads(pre), now)
         except json.JSONDecodeError:
             return {}
     cached = _try_cache_bypass()
     if cached is not None:
-        return cached
+        return _adjust_passed_resets(cached, now)
     # Cache is stale — spawn detached fetch (survives parent kill)
     script = Path(__file__).resolve().parent / "get_claude_usage.py"
     if script.exists():
@@ -342,7 +365,7 @@ def _fetch_usage(session_id: str, cwd: str) -> dict:
         except OSError:
             pass
     # Return stale data for this render; fresh data will be in cache next call
-    return read_usage_stale() or {}
+    return _adjust_passed_resets(read_usage_stale() or {}, now)
 
 
 # --- Dcat status ---

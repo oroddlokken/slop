@@ -142,8 +142,9 @@ if ! LC_ALL=C grep -iqE "$COMBINED" <<< "$MESSAGE"; then
   exit 0
 fi
 
-# Permission-seeking patterns are allowed when the match is part of a
-# prioritization question ("continue X or do Y?"). Listed by exact pattern
+# Permission-seeking patterns are allowed when the match is followed on
+# the same line by either a prioritization "or", or a gate-action keyword
+# that indicates an authorized confirmation gate. Listed by exact pattern
 # string so membership is a cheap case match.
 is_permission_pattern() {
   case "$1" in
@@ -154,24 +155,33 @@ is_permission_pattern() {
   return 1
 }
 
+# Gate-action keywords that indicate a legitimate confirmation ask rather
+# than a dodge. Project rules (git-commit-craft, CLAUDE.md Closing Issues,
+# Infrastructure Safety) require asking before these destructive/visible
+# actions, so "shall I proceed with the commit?" is correct behavior — not
+# a stop-phrase violation. Matched after "with (the|this|these)?" so the
+# keyword must be the object of the continuation, not an incidental word.
+PERMISSION_ESCAPE_RE='\bor\b|with (the |this |these )?(commit|push|deploy|merge|pr|pull request|rebase|force push|release|deletion|removal)\b'
+
 # A violation was detected. Walk the list to find which pattern matched
 # (first match wins). This only runs on the rare violation path.
 for entry in "${VIOLATIONS[@]}"; do
   pattern="${entry%%:::*}"
   correction="${entry#*:::}"
   if LC_ALL=C grep -iqE "$pattern" <<< "$MESSAGE"; then
-    # Permission-seeking override: if "or" follows the matched phrase on
-    # the same line, treat it as a legitimate "A or B?" prioritization ask
-    # rather than a yes/no dodge. Skip and let the next pattern (if any)
-    # decide.
+    # Permission-seeking override: if the match is followed by "or" (A/B
+    # prioritization) or a gate-action keyword (authorized confirmation
+    # gate), treat as legitimate and let the next pattern (if any) decide.
     if is_permission_pattern "$pattern" \
-      && LC_ALL=C grep -iqE "${pattern}.*\bor\b" <<< "$MESSAGE"; then
+      && LC_ALL=C grep -iqE "${pattern}.*(${PERMISSION_ESCAPE_RE})" <<< "$MESSAGE"; then
       continue
     fi
     # Output JSON decision to stdout — Claude Code reads this and forces
     # the assistant to continue with the reason as its next instruction.
+    # Surface the matched regex so the user can identify which rule fired
+    # (useful for tuning false positives).
     jq -n \
-      --arg reason "STOP HOOK VIOLATION: $correction" \
+      --arg reason "STOP HOOK VIOLATION: $correction [matched: $pattern]" \
       '{
         decision: "block",
         reason: $reason

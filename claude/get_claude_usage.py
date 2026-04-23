@@ -34,8 +34,13 @@ from pricing import compute_costs
 CACHE_MAX_AGE = 600  # 10 minutes
 
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
-USAGE_API_TIMEOUT = 5  # seconds
+USAGE_API_TIMEOUT = 5  # seconds per attempt
+USAGE_API_RETRIES = 2  # max retries on transient errors
+USAGE_API_RETRY_DELAY = 1.0  # seconds between retries
 CREDENTIALS_SERVICE = "Claude Code-credentials"
+
+# HTTP status codes worth retrying
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +183,7 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
     """Fetch usage data from the Anthropic API.
 
     Returns dict with session_percent, week_percent, etc. mapped to our format.
-    Raises on HTTP/network errors.
+    Raises on HTTP/network errors after exhausting retries for transient failures.
     """
     req = Request(
         USAGE_API_URL,
@@ -187,8 +192,33 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
             "anthropic-beta": "oauth-2025-04-20",
         },
     )
-    resp = urlopen(req, timeout=USAGE_API_TIMEOUT)  # noqa: S310
-    body = json.loads(resp.read().decode())
+
+    last_exc: Exception | None = None
+    for attempt in range(1 + USAGE_API_RETRIES):
+        try:
+            resp = urlopen(req, timeout=USAGE_API_TIMEOUT)  # noqa: S310
+            body = json.loads(resp.read().decode())
+            break
+        except HTTPError as e:
+            if e.code not in _RETRYABLE_STATUS or attempt == USAGE_API_RETRIES:
+                raise
+            last_exc = e
+            delay = USAGE_API_RETRY_DELAY
+            # Respect Retry-After header (seconds only)
+            retry_after = e.headers.get("Retry-After") if e.headers else None
+            if retry_after:
+                try:
+                    delay = max(delay, min(float(retry_after), 5.0))
+                except ValueError:
+                    pass
+            time.sleep(delay)
+        except (URLError, OSError, TimeoutError) as e:
+            if attempt == USAGE_API_RETRIES:
+                raise
+            last_exc = e
+            time.sleep(USAGE_API_RETRY_DELAY)
+    else:
+        raise last_exc  # type: ignore[misc]
 
     data: dict[str, Any] = {}
 
@@ -350,8 +380,14 @@ def main() -> None:
         print(json.dumps(data, indent=2))
 
     except HTTPError as e:
-        record_fetch_failure()
-        print(f"Error: API returned {e.code}", file=sys.stderr)
+        # Don't enter backoff for permanent auth errors — the token is bad,
+        # retrying with the same token won't help, but a fresh token (after
+        # re-login) should work immediately.
+        if e.code in (401, 403):
+            print(f"Error: API returned {e.code} (auth)", file=sys.stderr)
+        else:
+            record_fetch_failure()
+            print(f"Error: API returned {e.code}", file=sys.stderr)
         sys.exit(1)
     except (URLError, OSError, json.JSONDecodeError) as e:
         record_fetch_failure()

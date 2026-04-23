@@ -22,8 +22,14 @@ check() {
     fi
   fi
 
-  local status
-  if [ "$expect_block" = "$got_block" ]; then
+  local status reason_ok="true"
+  # When blocking, the reason must surface the matched regex so false
+  # positives can be identified and tuned.
+  if [ "$got_block" = "true" ] && ! grep -q '\[matched: ' <<< "$detail"; then
+    reason_ok="false"
+  fi
+
+  if [ "$expect_block" = "$got_block" ] && [ "$reason_ok" = "true" ]; then
     pass=$((pass + 1))
     status="PASS"
   else
@@ -50,6 +56,9 @@ check "fp:existing_issue_legit"     $DIR/test_existing_issue_legit.json   false
 check "fp:existing_bug_legit"       $DIR/test_existing_bug_legit.json     false
 check "fp:prioritization_legit"     $DIR/test_fp_prioritization_legit.json false
 check "fp:meta_quoting_legit"       $DIR/test_fp_meta_quoting_legit.json   false
+check "fp:commit_confirmation"      $DIR/test_fp_commit_confirmation_legit.json false
+check "fp:push_confirmation"        $DIR/test_fp_push_confirmation_legit.json   false
+check "fp:pr_confirmation"          $DIR/test_fp_pr_confirmation_legit.json     false
 
 # -- True positive tests (SHOULD block) --
 check "tp:known_issue_dodge"        $DIR/test_fp_known_issue_dodge.json   true
@@ -58,6 +67,7 @@ check "tp:come_back_dodge"          $DIR/test_fp_come_back_dodge.json     true
 check "tp:pause_dodge"              $DIR/test_fp_pause_dodge.json         true
 check "tp:consolidated_shall"       $DIR/test_consolidated_shall.json     true
 check "tp:consolidated_should"      $DIR/test_consolidated_should.json    true
+check "tp:refactor_dodge"           $DIR/test_fp_refactor_dodge.json      true
 
 printf "\n%d passed, %d failed\n" "$pass" "$fail"
 exit $fail
