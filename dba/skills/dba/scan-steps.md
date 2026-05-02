@@ -1,6 +1,6 @@
 ## Prescan the Codebase (orchestrator step)
 
-This file is executed by the **orchestrator** (the main Claude Code session), NOT by individual review agents. The orchestrator reads files once and passes the results to all agents as a snapshot.
+This file is executed by the **orchestrator** (the main Claude Code session), NOT by individual review agents. The orchestrator reads files once and passes the results to all agents as a snapshot. Your role is selection (which files to include) and faithful reproduction (each file verbatim); the agents do the analysis.
 
 ### Scan Procedure
 
@@ -33,7 +33,7 @@ This is a database-focused scan. Read broadly but prioritize database-related co
 10. Detect tests: look for database test fixtures, test factories, test database setup. Note whether tests use a real database, mocks, or in-memory DB.
 11. Check CI/CD: .github/workflows/, .gitlab-ci.yml, Jenkinsfile — look for migration steps, database seeding, schema validation
 12. Git history snapshot: run `git log --oneline -20` for general activity, then `git log --oneline -20 -- '**/migrations/**' '**/*.sql' '**/models*'` for recent schema changes
-13. Grep for risk patterns:
+13. Use these patterns to identify files worth including in the snapshot — match any pattern, add the file. The agents judge severity:
     - String interpolation in SQL: `f"SELECT`, `f"INSERT`, `f"UPDATE`, `f"DELETE`, `"SELECT.*" +`, `"SELECT.*" %`, `format(.*SELECT`
     - Raw SQL execution: `execute(`, `raw(`, `cursor.`, `db.query(`, `.rawQuery(`, `Repo.query(`
     - Transaction markers: `BEGIN`, `COMMIT`, `ROLLBACK`, `atomic`, `transaction`, `session.commit`, `.transacting(`
@@ -44,7 +44,7 @@ This is a database-focused scan. Read broadly but prioritize database-related co
 
 ### Build the Snapshot
 
-After reading, format ALL collected file contents into a single snapshot block. This is what gets passed to agents via the `{codebase_snapshot}` placeholder.
+After reading, reproduce each selected file verbatim — full content, no elisions, no commentary, no headings outside `### file:` blocks. The result is what gets passed to agents via the `{codebase_snapshot}` placeholder.
 
 Format each file as:
 
@@ -71,4 +71,4 @@ Omit:
 - Files matching `.env*`, `*.secrets`, `*credentials*.json`, `*.key`, `*.pem`, `secrets.yml` — list by name only
 - Binary files — list by name only
 
-**Snapshot size limit**: If the snapshot exceeds ~80K tokens (~400 source files), ask the user to narrow scope before proceeding.
+**Snapshot size limit**: Run `wc -c` on the selected file list. If the total exceeds ~1,250,000 bytes (≈300K tokens of code), ask the user to narrow scope. Drop whole files (prefer leaf modules; keep shared utilities); never abridge individual files to fit.

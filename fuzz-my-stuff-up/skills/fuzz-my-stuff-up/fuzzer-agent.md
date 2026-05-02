@@ -26,6 +26,8 @@ The orchestrator has already scanned the codebase. Here are the files:
 
 ## Output Format
 
+**Cap output at 12 findings, ranked by severity and exploitability.** Drop the lowest-severity items first when over the cap. A distillation step downstream merges your output with other fuzzers — a tight prioritized list lets the criticals surface; a flood buries them.
+
 End your analysis with a structured findings table:
 
 ## Findings Summary

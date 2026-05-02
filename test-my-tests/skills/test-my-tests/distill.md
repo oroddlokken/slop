@@ -1,33 +1,80 @@
-## Distillation Algorithm
+# Distill Test Quality Findings
 
-After all agents complete, analyze the combined output:
+You are a distillation agent. You receive structured `## Findings Summary` tables from multiple test-quality reviewers and produce a single prioritized action list.
 
-1. Read through every finding from every agent and classify:
-   - **Untested risk**: Critical code path with no test coverage at all
-   - **Shallow coverage**: Tests exist but miss important scenarios
-   - **Quality gap**: Tests cover the right scenarios but verify poorly
-   - **Structural issue**: Test architecture problems (fragility, flakiness, unrealistic mocks)
-   - **Noise**: Subjective preference or low-value test pedantry — skip
+## What you receive
 
-   **Severity → Tier mapping from agent output:**
-   - Agent "Critical" → Red
-   - Agent "High" → Red (if untested security/data path) or Orange (if missing user flow)
-   - Agent "Medium" → Yellow
-   - Agent "Low" → Green
+- One block per reviewer headed `### Reviewer: {name}`, containing the reviewer's findings table.
+- Which reviewers ran, which were skipped (and why).
+- A dcat issues list (if the orchestrator detected one).
+- A focus area (if the user specified one).
 
-2. Cross-reference with code: read only files explicitly referenced in findings to confirm line accuracy. Do not scan for additional patterns during distillation.
-   - **Hallucinated findings**: If a finding doesn't exist at the reported file:line (wrong code, line doesn't exist, or different logic), discard it and note the count.
-   - **Zero findings from an agent** is a valid result — note it as "{reviewer}: no issues found".
+You do not receive the codebase snapshot. Read specific file:line references on demand for validation; do not scan for new findings.
 
-3. Deduplicate using the following algorithm:
-   - **Pass 1 — File match**: Group findings that reference the same source file or test file and line range (within 10 lines). These are almost certainly the same gap seen from different angles.
-   - **Pass 2 — Pattern match**: Within the same module, merge findings that describe the same untested scenario (e.g., "no error handling test" flagged by error-paths and happy-path-only for the same endpoint — that's one missing test, not two issues).
-   - **Pass 3 — Systemic match**: Across different files, merge findings that describe the same systemic gap (e.g., "no integration tests for any API endpoint" flagged by multiple agents pointing at different routes). Systemic issues are typically flagged by 3+ reviewers. If only 1-2 flag it, keep findings separate unless the code path is identical.
-   - After merging, mark cross-reviewer consensus with "flagged by N/{total}" where {total} is the number of reviewers run.
-   - Extract the `## Findings Summary` table from each agent's output as the primary dedup input.
-   - **Conflict resolution**: When two lenses disagree on severity, use the higher severity. When they disagree on the fix, note both approaches.
+---
 
-4. Output as:
+## Pass 1: Validate, Classify, Dedupe (mechanical)
+
+Build a canonical list as an internal scratchpad. The user does not see this.
+
+### 1.1 Validate
+
+For each finding, read the cited file:line. If the code there does not match the description, mark the finding `hallucinated` and exclude from Pass 2. Keep a count.
+
+### 1.2 Classify
+
+Assign each surviving finding to one impact category:
+- **Untested risk** — critical code path with no test coverage at all
+- **Shallow coverage** — tests exist but miss important scenarios
+- **Quality gap** — tests cover the right scenarios but verify poorly
+- **Structural issue** — test architecture problems (fragility, flakiness, unrealistic mocks)
+- **Noise** — subjective preference or low-value test pedantry → drop
+
+### 1.3 Deduplicate
+
+Three passes:
+
+1. **File match** — same source or test file and line range (within ±10 lines) → one canonical finding.
+2. **Pattern match** — same module, same untested scenario (e.g., "no error handling test" flagged by error-paths and happy-path-only for the same endpoint) → one canonical finding.
+3. **Systemic match** — across files, same systemic gap (e.g., "no integration tests for any API endpoint") — when 3+ reviewers flag it, merge as one. With only 1-2 reviewers, keep separate unless the code path is identical.
+
+For each canonical finding, record `flagged_by` and `consensus` as `N/{total_run}`.
+
+### 1.4 Conflict notes
+
+When two reviewers disagree on severity, take the higher. When they disagree on the fix, attach a `[CONFLICT]` note quoting both.
+
+### Pass 1 output
+
+A structured internal list, one entry per canonical finding:
+`id, category, file:line(s), severity_votes, untested_scenario, suggestion, flagged_by, consensus, conflict_notes`
+
+---
+
+## Pass 2: Tier and Rank (judgment)
+
+Operate only on the Pass 1 list — not raw reviewer prose.
+
+### 2.1 Assign final tier
+
+- **Red — Untested Risks**: critical code paths with no test coverage. A bug here ships undetected.
+- **Orange — Missing Scenarios**: tests exist but skip important user flows, error paths, or edge cases.
+- **Yellow — Weak Tests**: tests cover the right scenarios but verify poorly or use unrealistic data/mocks.
+- **Green — Consider**: valid improvements, not urgent.
+
+A finding goes in exactly one tier. Red = no tests. Orange = tests miss scenarios. Yellow = tests exist but are weak. Green = nice-to-have.
+
+### 2.2 Rank within each tier
+
+By production risk magnitude, not consensus count.
+
+### 2.3 Filter known issues
+
+Drop findings that overlap an existing dcat tracked issue.
+
+### 2.4 Cap and format
+
+Cap at 25 action points across all tiers. Drop the lowest-impact items if over.
 
 ```
 ## Test Quality Results
@@ -35,10 +82,10 @@ After all agents complete, analyze the combined output:
 **{total_findings} findings from {num_reviewers} reviewers, distilled to {distilled_count} action points.**
 
 ### Red — Untested Risks
-Critical code paths with no test coverage. A bug here could ship undetected.
+Critical code paths with no test coverage.
 
 1. [ ] **{title}** — {one-line description}
-   `{source_file}:{line}` — {what scenario to test and what to assert} | Lens: `{reviewer}`
+   `{source_file}:{line}` — {what scenario to test and what to assert} | Lens: `{reviewer}` (or `flagged by N/{total}`)
 
 ### Orange — Missing Scenarios
 Tests exist but skip important user flows, error paths, or edge cases.
@@ -53,24 +100,17 @@ Tests cover the right scenarios but verify poorly or use unrealistic data/mocks.
    `{test_file}:{line}` — {what to strengthen} | Lens: `{reviewer}`
 
 ### Green — Consider
-Valid improvements worth adding but not urgent.
+Valid improvements, not urgent.
 
 4. [ ] **{title}** — {one-line description}
    `{file_path}:{line}` — {what to change} | Lens: `{reviewer}`
 
 ### Skipped
-{count} findings were minor pedantry or noise — ignored.
-{hallucinated_count} findings discarded (reported code not found at referenced locations).
+- {N} findings dropped as minor pedantry or noise.
+- {N} findings discarded as hallucinated (cited code did not match).
+- Reviewers run: {list}. Reviewers skipped: {list with reason}.
 ```
 
-Rules for distilling:
-- **Number items sequentially across all sections** (1, 2, 3... not restarting per section) so the user can reference them by number
-- If dcat issues were found earlier, exclude any action point that overlaps with an existing tracked issue
-- Each item must have a file path — reference the source file for untested code, the test file for weak tests
-- Each item must note which lens found it (or "flagged by N/{total}" if multiple)
-- One line per action — say what scenario to test and what to assert, concretely
-- Merge duplicates — if multiple reviewers flagged the same gap, combine into one item with consensus count
-- Severity is based on production risk, not how many reviewers mentioned it
-- A finding goes in exactly one section. Red = no tests. Orange = tests miss scenarios. Yellow = tests exist but are weak. Green = nice-to-have.
+Number items sequentially across all tiers. Reference the source file for untested code, the test file for weak tests. One line per action — say what scenario to test and what to assert.
 
-After outputting, ask the user if they want to start working on any of the items.
+After outputting, ask: "Want to start working on any of these items?"

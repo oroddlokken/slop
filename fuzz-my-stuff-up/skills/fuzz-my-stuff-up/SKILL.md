@@ -19,7 +19,6 @@ Launch ~20 parallel adversarial agents, each trying to break the codebase from a
 - **Agents inherit the default model** — do not override with a specific model.
 - **Agents analyze code without modifying files.** Users review findings before acting.
 - **Run distillation only after all agents complete.** Distillation needs the full picture to deduplicate and prioritize.
-
 ## Workflow
 
 ### Step 1: Choose Mode
@@ -82,9 +81,40 @@ Detect which languages are in scope so agents fuzz all of them:
 5. Ask: "These the right languages? Any that need extra attention despite low file count?"
 6. Pass the confirmed list to each agent
 
+### Step 3.5: Auto-Skip Irrelevant Fuzzers
+
+Drop fuzzers whose target patterns aren't in the codebase. Note each drop in the final output's "Fuzzers run / skipped" line.
+
+- **No async/threading/concurrency primitives** (no `async`, `await`, `threading`, `goroutine`, `Mutex`, `Lock`, `multiprocessing`, `Promise.all`) → drop `concurrency`. Note: "Skipped concurrency (no concurrent code detected)."
+- **No HTTP/network/external-service code** (no `requests`, `fetch`, `axios`, `http.Client`, `urllib`, `httpx`, no TCP socket usage) → drop `network-failure`. Note: "Skipped network-failure (no network code detected)."
+- **No locale/i18n code** (no `gettext`, `i18n`, `Intl`, `locale.`, no timezone libraries) → drop `locale-chaos`. Note: "Skipped locale-chaos (no locale-aware code detected)."
+- **No file I/O beyond simple read/write** (no path manipulation, no symlink handling, no `os.path.join` with user input, no file uploads) → drop `filesystem-edge` and `path-traversal`. Note: "Skipped filesystem-edge, path-traversal (no path-handling code detected)."
+- **No SQL queries or string-building of queries** → drop `injection`. Note: "Skipped injection (no query construction detected)."
+- **No timezone/datetime arithmetic** (no `tzinfo`, `pytz`, `moment-timezone`, `Date.toISOString` with offsets, no DST-aware code) → drop `time-travel`. Note: "Skipped time-travel (no timezone-aware code detected)."
+
 ### Step 4: Check for Existing Issue Tracker
 
-Check if the project uses **dcat**. Run `which dcat`. If the command succeeds AND a `.dogcats/` directory exists at the target path, run `dcat list --agent-only` to get tracked issues. Pass this list to each agent so they skip already-known problems. If either check fails, skip this step.
+Check if the project uses **dcat**. Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to each agent so they can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
+### Step 4.4: Check Snapshot Cache
+
+A prior run of this or another meta-skill may have already produced a snapshot of this codebase. Reuse it before re-reading ~200K of files.
+
+**Build the cache key**:
+1. `git_rev` = output of `git rev-parse HEAD` (or `no-git` if not a git repo)
+2. `dirty` = output of `git status --porcelain` (any uncommitted change → different state)
+3. `path` = absolute target path
+4. `langs` = sorted, comma-joined language list from Step 3
+5. `skill` = `fuzz-my-stuff-up`
+
+Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 hex chars of `sha256(...)` as `{hash}`.
+
+**Cache file**: `.claude-cache/fuzz-my-stuff-up-snapshot-{hash}.md` (relative to target path).
+
+**Check the cache**:
+- If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 4.5.
+- Otherwise, proceed to Step 4.5. After building the snapshot there, write it to `.claude-cache/fuzz-my-stuff-up-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
+
+The 1-hour TTL matches Anthropic's prompt-cache window — `/codehealth` followed by `/fuzz-my-stuff-up` 40 minutes later still hits both layers (this disk cache and the prompt cache when the next skill primes its first agent).
 
 ### Step 4.5: Prescan the Codebase (orchestrator does this once)
 
@@ -137,11 +167,19 @@ Other areas are still worth probing but give {area} roughly 3x the attention.
 
 ### Step 6: Distill
 
-After all agents complete, read `distill.md` from this skill's directory and follow the distillation algorithm.
+Spawn a fresh sub-agent for distillation:
+
+- **Model**: `sonnet`. A fresh agent prevents the synthesis from anchoring on whichever fuzzer wrote first or loudest, and Sonnet handles the structured-merge job competently at lower cost.
+- **Subagent type**: `Explore`. The agent reads files referenced by findings during validation; no other tool access needed.
+- **Instructions**: contents of `distill.md` from this skill's directory.
+- **Input**: the `## Findings Summary` table from each completed fuzzer, prefixed with `### Fuzzer: {name}`. Strip surrounding prose — tables only. Also include which fuzzers ran, which were skipped, the dcat issues list (if any), and the focus area (if any).
+- **Do not pass the codebase snapshot.** Distill works on structured findings; the snapshot would inflate input by ~200K tokens for no gain (file references in findings already point at the code).
+
+Return the agent's output to the user.
 
 ### Error Handling
 
-- If `git ls-files` fails (not a git repo, permissions), fall back to `find {path} -type f` and filter by extension.
+- If `git ls-files` fails (not a git repo, permissions), use the Glob tool (`**/*.{py,ts,...}` patterns) to enumerate files.
 - If an agent returns zero findings, that is a valid result — note "{fuzzer}: no issues found" in the distill summary.
 - If some agents fail or timeout, distill with available results and note which fuzzers were skipped.
 

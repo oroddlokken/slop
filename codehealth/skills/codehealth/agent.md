@@ -27,6 +27,8 @@ The orchestrator has already scanned the codebase. Here are the files:
 
 End your review with a structured findings table. Use the format specified in your review criteria's Output Format section. At minimum, every table must include these columns: **Severity**, **File:Line**, **Issue**, **Suggestion**.
 
+**Cap output at 12 findings, ranked by severity.** Drop the lowest-severity items first when over the cap. A distillation step downstream merges your output with other lenses — a tight prioritized list lets the criticals surface; a flood buries them.
+
 ## Findings Summary
 
 | # | Severity | File:Line | Issue | Suggestion |

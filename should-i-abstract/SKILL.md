@@ -17,7 +17,6 @@ Launch a single focused agent to review the codebase through a pragmatic DRY len
 - **The orchestrator prescans the codebase once and passes the snapshot to the agent.**
 - **The agent inherits the default model** — do not override with a specific model.
 - **Single agent, single pass.** This is a judgment-heavy review, not a mechanical scan. The agent needs the full picture to make good tradeoff calls.
-
 ## Workflow
 
 ### Step 1: Determine Target
@@ -41,7 +40,27 @@ Detect which languages are in scope:
 
 ### Step 3: Check for Existing Issue Tracker
 
-Check if the project uses **dcat**. Run `which dcat`. If the command succeeds (exit code 0) AND a `.dogcats/` directory exists at the target path, run `dcat list --agent-only` to get tracked issues. Pass this list to the agent so it can skip already-tracked concerns. If either check fails, skip this step.
+Check if the project uses **dcat**. Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to the agent so it can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
+### Step 3.5: Check Snapshot Cache
+
+A prior run of this or another meta-skill may have already produced a snapshot of this codebase. Reuse it before re-reading files.
+
+**Build the cache key**:
+1. `git_rev` = output of `git rev-parse HEAD` (or `no-git` if not a git repo)
+2. `dirty` = output of `git status --porcelain` (any uncommitted change → different state)
+3. `path` = absolute target path
+4. `langs` = sorted, comma-joined language list from Step 2
+5. `skill` = `should-i-abstract`
+
+Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 hex chars of `sha256(...)` as `{hash}`.
+
+**Cache file**: `.claude-cache/should-i-abstract-snapshot-{hash}.md` (relative to target path).
+
+**Check the cache**:
+- If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 4.
+- Otherwise, proceed to Step 4. After building the snapshot there, write it to `.claude-cache/should-i-abstract-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
+
+The 1-hour TTL matches Anthropic's prompt-cache window — `/codehealth` followed by `/should-i-abstract` 40 minutes later still hits both layers.
 
 ### Step 4: Prescan the Codebase
 
@@ -78,5 +97,5 @@ Return the agent's findings directly to the user. After presenting results, ask 
 
 ### Error Handling
 
-- If `git ls-files` fails (not a git repo, permissions), fall back to `find {path} -type f` and filter by extension.
+- If `git ls-files` fails (not a git repo, permissions), use the Glob tool (`**/*.{py,ts,...}` patterns) to enumerate files.
 - If the agent returns zero findings in all three sections, output "No abstraction issues found — DRY balance looks good."

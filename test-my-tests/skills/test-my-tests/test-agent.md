@@ -27,6 +27,8 @@ The orchestrator has already scanned both source and test code. Here are the fil
 
 ## Output Format
 
+**Cap output at 12 findings, ranked by severity.** Drop the lowest-severity items first when over the cap. A distillation step downstream merges your output with other lenses — a tight prioritized list lets the criticals surface; a flood buries them.
+
 End your review with a structured findings table:
 
 ## Findings Summary

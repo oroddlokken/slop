@@ -18,7 +18,6 @@ Launch parallel code-quality agents, each analyzing the codebase through a diffe
 - **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
 - **Agents inherit the default model** — do not override with a specific model.
 - **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
-
 ## Workflow
 
 ### Step 1: Choose Mode
@@ -85,10 +84,17 @@ Detect which languages are in scope so agents review all of them, not just the l
 
 **Important:** Do not retain or pass the file list from `git ls-files` to agents. It is only used here to identify languages.
 
+### Step 1.6: Auto-Skip Irrelevant Lenses
+
+Drop reviewers whose target patterns aren't in the codebase. Note each drop in the final output's "Reviewers run / skipped" line.
+
+- **No SQL/ORM detected** (no SQL keywords, no ORM imports, no `.sql` files in any in-scope language) → drop `query-smells`. Note: "Skipped query-smells (no SQL/ORM detected)."
+- **No external dependencies** (manifests are absent or empty — no `pyproject.toml`, no `package.json`, etc.) → drop `dep-hygiene`. Note: "Skipped dep-hygiene (no manifest files found)."
+- **No tests directory and no test framework imports** → drop `test-gaps`. Note: "Skipped test-gaps (no test infrastructure detected)."
+
 ### Step 1.75: Check for Existing Issue Tracker
 
-Check if the project uses **dcat** — a local issue tracker (CLI tool). Run `which dcat`. If the command succeeds (exit code 0) AND a `.dogcats/` directory exists at the target path, run `dcat list --agent-only` to get tracked issues. Pass this issue list to each agent so they can skip concerns that are already tracked. If either check fails, skip this step.
-
+Check if the project uses **dcat** — a local issue tracker (CLI tool). Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to each agent so they can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
 ### Step 2: Determine Target
 
 Ask the user (if not already clear):
@@ -97,10 +103,31 @@ Ask the user (if not already clear):
 
 ### Error Handling
 
-- If `git ls-files` fails (not a git repo, permissions), fall back to `find {path} -type f` and filter by extension.
+- If `git ls-files` fails (not a git repo, permissions), use the Glob tool (`**/*.{py,ts,...}` patterns) to enumerate files.
 - If a reviewer's criteria file does not exist at the expected path, skip that reviewer and warn the user.
 - If all agents return zero findings, output "No issues found" and skip the distill step.
 - If some agents fail or timeout, distill with available results and note which reviewers were skipped.
+
+### Step 2.4: Check Snapshot Cache
+
+A prior run of this or another meta-skill may have already produced a snapshot of this codebase. Reuse it before re-reading ~200K of files.
+
+**Build the cache key**:
+1. `git_rev` = output of `git rev-parse HEAD` (or `no-git` if not a git repo)
+2. `dirty` = output of `git status --porcelain` (any uncommitted change → different state)
+3. `path` = absolute target path
+4. `langs` = sorted, comma-joined language list from Step 1.5
+5. `skill` = `codehealth`
+
+Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 hex chars of `sha256(...)` as `{hash}`.
+
+**Cache file**: `.claude-cache/codehealth-snapshot-{hash}.md` (relative to target path).
+
+**Check the cache**:
+- If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 2.5.
+- Otherwise, proceed to Step 2.5. After building the snapshot there, write it to `.claude-cache/codehealth-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
+
+The 1-hour TTL matches Anthropic's prompt-cache window — `/dba` followed by `/codehealth` 40 minutes later still hits both layers (this disk cache and the prompt cache when the next skill primes its first agent).
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 
@@ -155,5 +182,13 @@ Other issues are still worth mentioning but give {area} roughly 3x the attention
 
 ### Step 4: Distill
 
-After all agents complete, read `distill.md` from this skill's directory and follow the distillation algorithm.
+Spawn a fresh sub-agent for distillation:
+
+- **Model**: `sonnet`. A fresh agent prevents the synthesis from anchoring on whichever reviewer wrote first or loudest, and Sonnet handles the structured-merge job competently at lower cost.
+- **Subagent type**: `Explore`. The agent reads files referenced by findings during validation; no other tool access needed.
+- **Instructions**: contents of `distill.md` from this skill's directory.
+- **Input**: the `## Findings Summary` table from each completed reviewer, prefixed with `### Reviewer: {name}`. Strip surrounding prose — tables only. Also include which reviewers ran, which were skipped, the dcat issues list (if any), and the focus area (if any).
+- **Do not pass the codebase snapshot.** Distill works on structured findings; the snapshot would inflate input by ~200K tokens for no gain (file references in findings already point at the code).
+
+Return the agent's output to the user.
 
