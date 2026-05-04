@@ -6,7 +6,11 @@
 # ///
 """Analyze OpenCode token usage and costs from local session data.
 
-Claude, GPT, and Gemini models via GitHub Copilot are included.
+GitHub Copilot: Claude, GPT, Gemini
+OpenCode Go: GLM-5, GLM-5.1, Kimi K2.5, Kimi K2.6, MiMo-V2-Pro, MiMo-V2-Omni,
+  MiMo-V2.5-Pro, MiMo-V2.5, Qwen3.5 Plus, Qwen3.6 Plus, MiniMax M2.5,
+  MiniMax M2.7, DeepSeek V4 Pro, DeepSeek V4 Flash
+
 Reads from both the legacy JSON file storage and the current SQLite database.
 """
 
@@ -26,7 +30,7 @@ import orjson
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
 # Each period lists models introduced or whose pricing changed on that date.
 # Lookup walks periods in reverse to find the most recent entry for a model.
-LAST_CHECKED = "2026-02-22"
+LAST_CHECKED = "2026-05-04"
 
 PRICING_HISTORY: list[dict] = [
     {
@@ -128,6 +132,79 @@ PRICING_HISTORY: list[dict] = [
             },
         },
     },
+    {
+        "effective": "2026-04-01",
+        "models": {
+            # --- Kimi ---
+            "kimi-k2.5": {
+                "input": 4.4e-07,
+                "output": 2e-06,
+            },
+            "kimi-k2.6": {
+                "input": 5.7e-07,
+                "output": 2.3e-06,
+            },
+            # --- Qwen ---
+            "qwen3.5-plus": {
+                "input": 4e-07,
+                "output": 2.4e-06,
+            },
+            "qwen3.6-plus": {
+                "input": 3.25e-07,
+                "output": 1.95e-06,
+            },
+            # --- GLM ---
+            "glm-5": {
+                "input": 1e-06,
+                "output": 3.2e-06,
+                "cache_read": 2e-07,
+            },
+            "glm-5.1": {
+                "input": 1e-06,
+                "output": 3.2e-06,
+                "cache_read": 2e-07,
+            },
+            # --- MiMo ---
+            "mimo-v2-pro": {
+                "input": 1e-06,
+                "output": 3e-06,
+            },
+            "mimo-v2-omni": {
+                "input": 4e-07,
+                "output": 2e-06,
+            },
+            "mimo-v2.5-pro": {
+                "input": 1e-06,
+                "output": 3e-06,
+            },
+            "mimo-v2.5": {
+                "input": 4e-07,
+                "output": 2e-06,
+            },
+            # --- MiniMax ---
+            "minimax-m2.5": {
+                "input": 3e-07,
+                "output": 1.2e-06,
+                "cache_create": 3.75e-07,
+                "cache_read": 3e-08,
+            },
+            "minimax-m2.7": {
+                "input": 3e-07,
+                "output": 1.2e-06,
+            },
+            # --- DeepSeek ---
+            "deepseek-v4-pro": {
+                "input": 1.74e-06,
+                "output": 3.48e-06,
+                "cache_read": 4.35e-07,
+            },
+            "deepseek-v4-flash": {
+                "input": 1.4e-07,
+                "output": 2.8e-07,
+                "cache_read": 2.8e-08,
+            },
+        },
+    },
 ]
 
 # OpenCode uses dot-notation model IDs (e.g. "claude-haiku-4.5");
@@ -139,10 +216,27 @@ MODEL_ALIASES: dict[str, str] = {
     "claude-sonnet-4.6": "claude-sonnet-4-6",
     "claude-sonnet-4": "claude-sonnet-4-20250514",
     "claude-haiku-4.5": "claude-haiku-4-5-20251001",
+    "kimi-k2.5": "kimi-k2.5",
+    "kimi-k2.6": "kimi-k2.6",
+    "qwen3.5-plus": "qwen3.5-plus",
+    "qwen3.6-plus": "qwen3.6-plus",
+    "glm-5": "glm-5",
+    "glm-5.1": "glm-5.1",
+    "mimo-v2-pro": "mimo-v2-pro",
+    "mimo-v2-omni": "mimo-v2-omni",
+    "mimo-v2.5-pro": "mimo-v2.5-pro",
+    "mimo-v2.5": "mimo-v2.5",
+    "minimax-m2.5": "minimax-m2.5",
+    "minimax-m2.7": "minimax-m2.7",
+    "deepseek-v4-pro": "deepseek-v4-pro",
+    "deepseek-v4-flash": "deepseek-v4-flash",
 }
 
 # Model families to include (prefix match).
-SUPPORTED_FAMILIES = ("claude-", "gpt-", "gemini-")
+SUPPORTED_FAMILIES = ("claude-", "gpt-", "gemini-", "kimi-", "qwen3.", "glm-", "mimo-", "deepseek-", "minimax-")
+
+# Providers to include (exact match).
+SUPPORTED_PROVIDERS = ("github-copilot", "opencode-go")
 
 TIER_THRESHOLD = 200_000
 
@@ -246,6 +340,11 @@ def calc_cost(tokens: TokenCounts, model: str, ts: datetime | None = None) -> fl
 def is_supported_model(model_id: str) -> bool:
     """Check if a model ID belongs to a supported family."""
     return any(model_id.startswith(prefix) for prefix in SUPPORTED_FAMILIES)
+
+
+def is_supported_provider(provider_id: str) -> bool:
+    """Check if a provider ID is supported."""
+    return provider_id in SUPPORTED_PROVIDERS
 
 
 def project_display_name(directory: str) -> str:
@@ -391,7 +490,7 @@ def _load_records_from_json(
 
             if data.get("role") != "assistant":
                 continue
-            if data.get("providerID") != "github-copilot":
+            if not is_supported_provider(data.get("providerID", "")):
                 continue
 
             model_id = data.get("modelID", "")
@@ -483,7 +582,7 @@ def _load_records_from_db(
 
             if data.get("role") != "assistant":
                 continue
-            if data.get("providerID") != "github-copilot":
+            if not is_supported_provider(data.get("providerID", "")):
                 continue
 
             model_id = data.get("modelID", "")
@@ -555,7 +654,8 @@ def load_all_records(
 
     Reads from both the legacy JSON file storage and the current SQLite
     database, deduplicating by message ID across both sources.
-    Only includes Claude, GPT, and Gemini models from GitHub Copilot.
+    GitHub Copilot: Claude, GPT, Gemini
+    OpenCode Go: GLM, Kimi, MiMo, Qwen, MiniMax, DeepSeek
     """
     storage_dir = _opencode_storage_dir()
     db_path = _opencode_db_path()
@@ -636,10 +736,10 @@ def cost_style(c: float) -> str:
 
 def short_model(model: str) -> str:
     """Shorten model name for display."""
-    for prefix in ("claude-", "gemini-"):
-        m = model.replace(prefix, "")
-        if m != model:
-            return m
+    if model.startswith("claude-"):
+        return model.replace("claude-", "")
+    if model.startswith("gpt-"):
+        return model.replace("gpt-", "")
     return model
 
 
@@ -1041,7 +1141,9 @@ def parse_date(s: str) -> datetime:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze OpenCode token usage and costs (Claude, GPT, Gemini via GitHub Copilot).",
+        description="Analyze OpenCode token usage and costs. "
+        "GitHub Copilot: Claude, GPT, Gemini. "
+        "OpenCode Go: GLM, Kimi, MiMo, Qwen, MiniMax, DeepSeek.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
         "  ocreport.py daily --since 20260201\n"
