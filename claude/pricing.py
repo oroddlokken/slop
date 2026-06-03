@@ -165,6 +165,16 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        # Opus 4.8 first seen 2026-05-29, same pricing as 4.7.
+        "effective": "2026-05-29",
+        "models": {
+            "claude-opus-4-8": {
+                "input": 5e-06, "output": 25e-06,
+                "cache_create": 6.25e-06, "cache_read": 0.5e-06,
+            },
+        },
+    },
 ]
 
 MODEL_ALIASES: dict[str, str] = {

@@ -16,11 +16,14 @@ Layout adapts to terminal width (detected via $COLUMNS or /dev/tty):
   <  130 columns: 4 lines (top | session | usage | costs)
 
 Toggle sections via environment variables (1=enabled, 0=disabled):
+  CLAUDE_STATUSLINE_MODEL_BANNER            — colored banner showing the active model
+  CLAUDE_STATUSLINE_HAIKU_RED               — recolor entire status line red when on Haiku
   CLAUDE_STATUSLINE_TIMESTAMP               — HH:MM invocation timestamp
   CLAUDE_STATUSLINE_SESSION_ID              — short session UUID
   CLAUDE_STATUSLINE_HOSTNAME                — green hostname
   CLAUDE_STATUSLINE_DIR                     — blue project directory
   CLAUDE_STATUSLINE_SANDBOX                 — sbx/!sbx badge from merged Claude settings
+  CLAUDE_STATUSLINE_DSP                     — orange DSP marker when started with --dangerously-skip-permissions
   CLAUDE_STATUSLINE_GIT                     — branch + indicators
   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
   CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation)
@@ -30,7 +33,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate %
   CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on 80% usable window (auto-compact threshold)
   CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon)
-  CLAUDE_STATUSLINE_PEAK                    — peak/off-peak indicator with countdown
+  CLAUDE_STATUSLINE_PEAK                    — peak/off-peak indicator with countdown (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
     CLAUDE_STATUSLINE_WEEKLY_PACE            — weekly pace indicator (D3/7: On Pace)
@@ -85,7 +88,7 @@ from pricing import compute_costs, compute_project_rolling_costs, compute_sessio
 TEMP_WARN_C = 75           # °C — yellow warning for CPU/GPU temp
 TEMP_CRIT_C = 90           # °C — red alert for CPU/GPU temp
 STALE_THRESHOLD_S = 3600   # seconds before usage data is considered too old
-LAYOUT_WIDE_COLS = 130     # terminal columns threshold for 2-line layout
+LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
 SESSION_WINDOW_MS = 900_000  # 15 min — active sessions lookback
 PEAK_WARN_MIN = 30         # minutes before peak: show yellow warning
 PEAK_SHOW_COUNTDOWN_MIN = 300  # minutes before peak: show green countdown
@@ -135,9 +138,34 @@ def _get_terminal_cols() -> int:
 SUBDUED = "\033[38;5;242m"  # 256-color dark grey — structural info
 RST = "\033[0m"
 
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
 
 def _c(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m"
+
+
+def _force_red(text: str) -> str:
+    """Strip existing ANSI color codes and recolor everything bold bright red."""
+    return f"\033[1;91m{_ANSI_RE.sub('', text)}\033[0m"
+
+
+def _model_banner(model: str) -> str:
+    """Render an inverse-color banner showing the active model family."""
+    if not _on("MODEL_BANNER", default=False) or not model:
+        return ""
+    m_low = model.lower()
+    if "haiku" in m_low:
+        # Different red than Opus when HAIKU_RED is on, magenta otherwise.
+        bg, label = ("48;5;196", "HAIKU") if _on("HAIKU_RED") else ("45", "HAIKU")
+    elif "sonnet" in m_low:
+        bg, label = "44", "SONNET"  # blue
+    elif "opus" in m_low:
+        bg, label = "48;5;93", "OPUS"    # deep purple
+    else:
+        bg = "100"  # bright black / grey fallback
+        label = re.sub(r"\s*\(.*\)\s*$", "", model).strip().upper()
+    return f"\033[1;97;{bg}m {label} \033[0m"
 
 
 # --- ISO timestamp helpers ---
@@ -303,6 +331,70 @@ def _render_macmon(data: dict) -> str:
     if not parts:
         return ""
     return " ".join(parts)
+
+
+# --- Permission mode ---
+
+
+def _start_dsp_check() -> subprocess.Popen[bytes] | None:
+    """Start ps to walk the ancestor chain for --dangerously-skip-permissions.
+
+    Claude Code may spawn the statusline through one or more shells, so the
+    immediate parent isn't necessarily the claude binary. ps -Aww gives us
+    untruncated args for every process; we walk pid→ppid until we hit init.
+    """
+    if not _on("DSP"):
+        return None
+    try:
+        return subprocess.Popen(
+            ["ps", "-Awwo", "pid=,ppid=,args="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def _collect_dsp(proc: subprocess.Popen[bytes] | None) -> bool:
+    if proc is None:
+        return False
+    try:
+        out, _ = proc.communicate(timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return False
+    if not out:
+        return False
+    procs: dict[int, tuple[int, str]] = {}
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, parts[2] if len(parts) > 2 else "")
+    cur = os.getppid()
+    while cur > 1:
+        entry = procs.get(cur)
+        if not entry:
+            break
+        ppid, args = entry
+        if "--dangerously-skip-permissions" in args:
+            return True
+        cur = ppid
+    return False
+
+
+def _render_dsp(active: bool) -> str:
+    if not active:
+        return ""
+    return "\033[38;5;208mDSP\033[0m"
 
 
 # --- Usage data ---
@@ -703,7 +795,7 @@ def _fmt_money(v: str) -> str:
 
 def _render_peak(_now_epoch: float) -> str:
     """Peak/off-peak indicator with countdown to next flip."""
-    if not _on("PEAK"):
+    if not _on("PEAK", default=False):
         return ""
     from get_claude_usage import compute_peak_info
 
@@ -714,12 +806,14 @@ def _render_peak(_now_epoch: float) -> str:
     countdown = f"{hrs}h{m:02d}m" if hrs else f"{m}m"
 
     if peak:
-        return f"\033[0;31mPeak\033[0;90m({countdown})\033[0m"
+        # Banner: white-on-red — peak is active, you're paying premium now
+        return f"\033[1;97;41m PEAK {countdown} \033[0m"
     if mins < PEAK_WARN_MIN:
-        return f"\033[0;33mOffPk\033[0;90m({countdown})\033[0m"
+        # Banner: black-on-yellow — peak imminent
+        return f"\033[1;30;43m OFFPK {countdown} \033[0m"
     if mins < PEAK_SHOW_COUNTDOWN_MIN:
-        return f"\033[0;32mOffPk\033[0;90m({countdown})\033[0m"
-    return f"\033[0;32mOffPk\033[0m"
+        return f"{SUBDUED}OffPk({countdown}){RST}"
+    return f"{SUBDUED}OffPk{RST}"
 
 
 def _render_sessions(cwd: str, now: float) -> str:
@@ -1083,6 +1177,8 @@ def _layout_and_print(
     sessions: str,
     now_epoch: float,
     _t_start: float,
+    force_red: bool = False,
+    model: str = "",
 ) -> None:
     """Assemble rendered sections into adaptive layout and print."""
     # Show failure/stale indicator when usage is empty or outdated
@@ -1133,6 +1229,11 @@ def _layout_and_print(
     if sessions:
         last_parts.append(sessions)
     lines.append(DOT.join(last_parts))
+    if force_red:
+        lines = [_force_red(line) for line in lines]
+    banner = _model_banner(model)
+    if banner and lines:
+        lines[0] = f"{banner} {lines[0]}"
     print("\n".join(lines))
 
 
@@ -1176,6 +1277,7 @@ def main() -> None:
     # Start external commands (non-blocking) — runs while we do in-process work
     git_procs = _start_git(inp.cwd)
     macmon_proc = _start_macmon()
+    dsp_proc = _start_dsp_check()
     try:
         # In-process: usage cache + dcat library (no subprocess)
         usage_data = _fetch_usage(inp.session_id, inp.cwd)
@@ -1191,6 +1293,7 @@ def main() -> None:
         # Collect git results and macmon data
         git = _collect_git(git_procs)
         macmon_data = _collect_macmon(macmon_proc)
+        dsp_active = _collect_dsp(dsp_proc)
     finally:
         for p in git_procs.values():
             try:
@@ -1202,6 +1305,11 @@ def main() -> None:
                 macmon_proc.kill()
             except OSError:
                 pass
+        if dsp_proc:
+            try:
+                dsp_proc.kill()
+            except OSError:
+                pass
 
     # Cache stats
     cum_fresh, cum_create, cum_read = _accumulate_cache_stats(
@@ -1211,6 +1319,7 @@ def main() -> None:
     # Render all sections
     top = [
         _render_timestamp(),
+        _render_dsp(dsp_active),
         _render_sandbox(inp.cwd, git.toplevel),
         _render_session_id(inp.session_id),
         _render_hostname(),
@@ -1233,6 +1342,8 @@ def main() -> None:
     _layout_and_print(
         top, session, usage_session_rl, usage_rl, usage_cost,
         usage_data, macmon_str, sessions, now_epoch, _t_start,
+        force_red=_on("HAIKU_RED") and "haiku" in inp.model.lower(),
+        model=inp.model,
     )
 
 

@@ -47,7 +47,7 @@ _PROJECT_ROOTS = (
 )
 
 # --- File-level cache ---
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def _script_hash() -> str:
@@ -75,6 +75,7 @@ def _serialize_records(records: list) -> list[dict]:
             "ts": r.timestamp.timestamp(),
             "sid": r.session_id,
             "project": r.project,
+            "cwd": r.cwd,
             "dk": r.dedup_key,
             "cost": r.cost_usd,
             "t": [r.tokens.input, r.tokens.output, r.tokens.cache_create, r.tokens.cache_read],
@@ -92,6 +93,7 @@ def _deserialize_records(raw: list[dict]) -> list:
             timestamp=datetime.fromtimestamp(r["ts"], tz=timezone.utc),
             session_id=r["sid"],
             project=r["project"],
+            cwd=r.get("cwd"),
             dedup_key=r.get("dk"),
             cost_usd=r.get("cost"),
             tokens=TokenCounts(
@@ -132,6 +134,7 @@ class UsageRecord:
     project: str
     cost_usd: float | None = None  # pre-calculated cost from Claude Code
     dedup_key: str | None = None  # message_id:request_id for deduplication
+    cwd: str | None = None  # original cwd from JSONL; lets future migrations re-derive project
 
 
 @dataclass
@@ -220,18 +223,39 @@ def discover_jsonl_files() -> list[Path]:
     return sorted(files)
 
 
+def _resolve_from_filesystem(dir_name: str) -> str | None:
+    """Reconstruct a real project name from a dash-encoded directory name.
+
+    Claude Code encodes both '/' and '-' as '-' in projects-dir names, so a
+    project at /Users/ove/git/project-name-v2 lands as
+    -Users-ove-git-project-name-v2 — ambiguous without context. Try every
+    possible split point and pick the one whose reconstructed path exists
+    on disk; prefer the longest tail (most dashes preserved in the name).
+    """
+    parts = dir_name.strip("-").split("-")
+    if not parts:
+        return None
+    for i in range(len(parts)):
+        prefix = Path("/" + "/".join(parts[:i])) if i > 0 else Path("/")
+        name = "-".join(parts[i:])
+        if name and (prefix / name).is_dir():
+            return name
+    return None
+
+
 def _derive_project(path: Path) -> str:
     """Derive project display name from a JSONL file's location.
 
-    The project key is the first directory component under a projects root:
-      projects/project-key/session.jsonl → project-key
-      projects/project-key/session-id/sub.jsonl → project-key
+    Used as fallback when records lack a cwd field. Tries to reconstruct
+    the real project name against the filesystem; falls back to the
+    last-segment heuristic if no real path matches.
     """
     for root in _PROJECT_ROOTS:
         try:
             rel = path.relative_to(root)
             if rel.parts:
-                return project_display_name(rel.parts[0])
+                dir_name = rel.parts[0]
+                return _resolve_from_filesystem(dir_name) or project_display_name(dir_name)
         except ValueError:
             continue
     return project_display_name(path.parent.name)
@@ -240,7 +264,7 @@ def _derive_project(path: Path) -> str:
 def parse_jsonl_file(path: Path) -> list[UsageRecord]:
     """Parse a single JSONL file and extract usage records."""
     records = []
-    project = _derive_project(path)
+    cwd_from_records: str | None = None
 
     try:
         with open(path, "rb") as f:
@@ -252,6 +276,11 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                     rec = orjson.loads(line)
                 except orjson.JSONDecodeError:
                     continue
+
+                if cwd_from_records is None:
+                    c = rec.get("cwd")
+                    if isinstance(c, str) and c:
+                        cwd_from_records = c
 
                 fields = extract_assistant_fields(rec)
                 if fields is None:
@@ -278,12 +307,17 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
                     tokens=tokens,
                     timestamp=ts,
                     session_id=rec.get("sessionId", path.stem),
-                    project=project,
+                    project="",
                     cost_usd=cost_usd,
                     dedup_key=dedup_key,
                 ))
     except (OSError, UnicodeDecodeError):
         pass
+
+    project = Path(cwd_from_records).name if cwd_from_records else _derive_project(path)
+    for r in records:
+        r.project = project
+        r.cwd = cwd_from_records
 
     return records
 

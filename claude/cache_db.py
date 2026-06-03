@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
     ts            REAL NOT NULL,
     sid           TEXT NOT NULL,
     project       TEXT NOT NULL,
+    cwd           TEXT,
     dk            TEXT,
     cost          REAL,
     input_tokens  INTEGER NOT NULL,
@@ -169,6 +170,13 @@ def get_connection() -> sqlite3.Connection:
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
+    # Add cwd column to ccreport_records on existing DBs (NULL for orphan rows
+    # whose source JSONL is already gone — those names are frozen in `project`).
+    try:
+        _conn.execute("ALTER TABLE ccreport_records ADD COLUMN cwd TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     migration_ran = _run_migrations(_conn)
     if db_existed and migration_ran:
         _sanity_check(_conn)
@@ -861,7 +869,7 @@ def write_session_cost(session_id: str, fingerprint: str, cost: float) -> None:
 
 # Bump this when schema or serialization changes in cache_db.py affect
 # the format of stored ccreport records (macsetup-2tt1).
-CACHE_SCHEMA_SALT = "1"
+CACHE_SCHEMA_SALT = "2"
 
 
 def check_ccreport_valid(version: int, script_hash: str) -> bool:
@@ -930,14 +938,14 @@ def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, li
         return {}, {}
     # All records
     rec_rows = conn.execute(
-        "SELECT file_path, mid, model, ts, sid, project, dk, cost, "
+        "SELECT file_path, mid, model, ts, sid, project, cwd, dk, cost, "
         "input_tokens, output_tokens, cache_create, cache_read "
         "FROM ccreport_records"
     ).fetchall()
     records_by_file: dict[str, list[dict]] = {}
-    for fp, mid, model, ts, sid, project, dk, cost, inp, out, cc, cr in rec_rows:
+    for fp, mid, model, ts, sid, project, cwd, dk, cost, inp, out, cc, cr in rec_rows:
         rec = {"mid": mid, "model": model, "ts": ts, "sid": sid,
-               "project": project, "dk": dk, "cost": cost,
+               "project": project, "cwd": cwd, "dk": dk, "cost": cost,
                "t": [inp, out, cc, cr]}
         records_by_file.setdefault(fp, []).append(rec)
     return file_meta, records_by_file
@@ -947,11 +955,11 @@ def get_ccreport_records(path: str) -> list[dict]:
     """Fetch all cached records for a file path.
 
     Returns list of dicts with keys matching the compact format:
-    mid, model, ts, sid, project, dk, cost, t.
+    mid, model, ts, sid, project, cwd, dk, cost, t.
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT mid, model, ts, sid, project, dk, cost, "
+        "SELECT mid, model, ts, sid, project, cwd, dk, cost, "
         "input_tokens, output_tokens, cache_create, cache_read "
         "FROM ccreport_records WHERE file_path = ?",
         (path,),
@@ -959,8 +967,8 @@ def get_ccreport_records(path: str) -> list[dict]:
     return [
         {
             "mid": r[0], "model": r[1], "ts": r[2], "sid": r[3],
-            "project": r[4], "dk": r[5], "cost": r[6],
-            "t": [r[7], r[8], r[9], r[10]],
+            "project": r[4], "cwd": r[5], "dk": r[6], "cost": r[7],
+            "t": [r[8], r[9], r[10], r[11]],
         }
         for r in rows
     ]
@@ -980,13 +988,13 @@ def save_ccreport_file(
     if records:
         conn.executemany(
             "INSERT INTO ccreport_records "
-            "(file_path, mid, model, ts, sid, project, dk, cost, "
+            "(file_path, mid, model, ts, sid, project, cwd, dk, cost, "
             "input_tokens, output_tokens, cache_create, cache_read) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     path, r["mid"], r["model"], r["ts"], r["sid"],
-                    r["project"], r.get("dk"), r.get("cost"),
+                    r["project"], r.get("cwd"), r.get("dk"), r.get("cost"),
                     r["t"][0], r["t"][1], r["t"][2], r["t"][3],
                 )
                 for r in records
@@ -1008,7 +1016,7 @@ def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
         return []
     placeholders = ",".join("?" * len(orphaned))
     rows = conn.execute(
-        f"SELECT mid, model, ts, sid, project, dk, cost, "
+        f"SELECT mid, model, ts, sid, project, cwd, dk, cost, "
         f"input_tokens, output_tokens, cache_create, cache_read "
         f"FROM ccreport_records WHERE file_path IN ({placeholders})",
         orphaned,
@@ -1016,8 +1024,8 @@ def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
     return [
         {
             "mid": r[0], "model": r[1], "ts": r[2], "sid": r[3],
-            "project": r[4], "dk": r[5], "cost": r[6],
-            "t": [r[7], r[8], r[9], r[10]],
+            "project": r[4], "cwd": r[5], "dk": r[6], "cost": r[7],
+            "t": [r[8], r[9], r[10], r[11]],
         }
         for r in rows
     ]
