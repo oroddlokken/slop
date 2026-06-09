@@ -90,7 +90,7 @@ def _local_tz() -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-04-16"
+LAST_CHECKED = "2026-06-09"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -175,6 +175,17 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        # Fable 5 first seen 2026-06-08. $10/$50 per MTok, cache write
+        # 1.25x input og cache read 0.1x input (standard Anthropic-ratio).
+        "effective": "2026-06-08",
+        "models": {
+            "claude-fable-5": {
+                "input": 10e-06, "output": 50e-06,
+                "cache_create": 12.5e-06, "cache_read": 1e-06,
+            },
+        },
+    },
 ]
 
 MODEL_ALIASES: dict[str, str] = {
@@ -185,6 +196,12 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 TIER_THRESHOLD = 200_000
+
+# Local models (Ollama et al.) use "name:tag" identifiers and have no
+# per-token cost. Claude model IDs never contain a colon.
+_FREE_PRICING: dict[str, float] = {
+    "input": 0.0, "output": 0.0, "cache_create": 0.0, "cache_read": 0.0,
+}
 
 
 def _parse_effective(date_str: str) -> datetime:
@@ -204,6 +221,9 @@ def find_pricing(model: str, ts: datetime | None = None) -> dict[str, float] | N
     match for a period whose effective date is <= *ts*.
     """
     resolved = MODEL_ALIASES.get(model, model)
+
+    if ":" in resolved:
+        return _FREE_PRICING
 
     for period in reversed(PRICING_HISTORY):
         effective = _parse_effective(period["effective"])

@@ -411,9 +411,9 @@ def fmt_tokens(n: int) -> str:
 
 
 def fmt_cost(c: float) -> str:
-    """Format cost in USD."""
-    if c >= 1.0:
-        return f"${c:.2f}"
+    """Format cost in USD. Sub-10-cent amounts keep extra precision to avoid $0.0."""
+    if c == 0.0 or c >= 0.1:
+        return f"${c:.1f}"
     return f"${c:.4f}"
 
 
