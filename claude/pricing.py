@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NamedTuple, TypedDict
 from zoneinfo import ZoneInfo
 
@@ -198,10 +199,11 @@ MODEL_ALIASES: dict[str, str] = {
 TIER_THRESHOLD = 200_000
 
 # Local models (Ollama et al.) use "name:tag" identifiers and have no
-# per-token cost. Claude model IDs never contain a colon.
-_FREE_PRICING: dict[str, float] = {
+# per-token cost. Claude model IDs never contain a colon — if a paid model
+# ever adopts colon-form IDs, this heuristic must be revisited.
+_FREE_PRICING: Mapping[str, float] = MappingProxyType({
     "input": 0.0, "output": 0.0, "cache_create": 0.0, "cache_read": 0.0,
-}
+})
 
 
 def _parse_effective(date_str: str) -> datetime:
@@ -214,7 +216,7 @@ def _parse_effective(date_str: str) -> datetime:
     return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
-def find_pricing(model: str, ts: datetime | None = None) -> dict[str, float] | None:
+def find_pricing(model: str, ts: datetime | None = None) -> Mapping[str, float] | None:
     """Find pricing for a model at a given timestamp.
 
     Walks PRICING_HISTORY in reverse chronological order, returning the first
