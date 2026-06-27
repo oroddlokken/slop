@@ -15,6 +15,8 @@ import argparse
 import calendar
 import hashlib
 import json
+import re
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -31,9 +33,12 @@ from rich.text import Text
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
+    add_project_override,
     bulk_load_ccreport_cache,
     check_ccreport_valid,
+    delete_project_override,
     get_ccreport_orphaned_records,
+    get_project_overrides,
     init_ccreport_meta,
     invalidate_ccreport,
     save_ccreport_file,
@@ -45,6 +50,78 @@ _PROJECT_ROOTS = (
     Path.home() / ".claude" / "projects",
     Path.home() / ".config" / "claude" / "projects",
 )
+
+# Repos live directly beneath these container dirs. A session's project is the
+# segment just under the deepest matching container, so subdirectories and git
+# worktrees collapse into their repo (e.g. ~/dev/ren.no/web -> ren.no) and a
+# repo opened from two places stays one (~/dev/penger and ~/dev/privat/penger
+# both -> penger). Ordered deepest-first for longest-prefix matching.
+_DEV_ROOTS = (
+    str(Path.home() / "dev" / "privat"),
+    str(Path.home() / "dev" / "intern"),
+    str(Path.home() / "dev"),
+)
+
+
+def _repo_from_path(cwd: str) -> str | None:
+    """Return the repo directory name for a cwd under a known dev root, else None.
+
+    None leaves the caller free to fall back to the plain basename for paths
+    that don't live under ~/dev.
+    """
+    for root in _DEV_ROOTS:
+        prefix = root + "/"
+        if cwd.startswith(prefix):
+            repo = cwd[len(prefix):].split("/", 1)[0]
+            if repo:
+                return repo
+    return None
+
+
+# Git remote is the durable project identity: it survives a folder being moved
+# or deleted, where a path does not. Resolved lazily at parse time (only while
+# the working dir still exists) and cached per cwd within a run.
+_remote_cache: dict[str, str | None] = {}
+
+
+def _normalize_remote(url: str) -> str:
+    """Reduce a git remote URL to a stable host/path key.
+
+    Handles scp-style (git@host:org/repo.git), ssh:// (with optional port),
+    and https:// forms; strips credentials, port, and the .git suffix.
+    """
+    url = url.strip()
+    url = re.sub(r"\.git$", "", url)
+    m = re.match(r"^[\w.+-]+@([^:/]+):(.+)$", url)  # scp-style: git@host:path
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]+@)?([^:/]+)(?::\d+)?/(.+)$", url)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return url
+
+
+def _resolve_remote(cwd: str) -> str | None:
+    """Return the normalized origin remote for a cwd, or None.
+
+    None when the dir is gone, it isn't a git repo, or there is no origin —
+    callers then fall back to the path-based name.
+    """
+    if cwd in _remote_cache:
+        return _remote_cache[cwd]
+    result: str | None = None
+    if Path(cwd).is_dir():
+        try:
+            out = subprocess.run(
+                ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                result = _normalize_remote(out.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            result = None
+    _remote_cache[cwd] = result
+    return result
 
 # --- File-level cache ---
 CACHE_VERSION = 2
@@ -76,6 +153,7 @@ def _serialize_records(records: list) -> list[dict]:
             "sid": r.session_id,
             "project": r.project,
             "cwd": r.cwd,
+            "repo": r.repo,
             "dk": r.dedup_key,
             "cost": r.cost_usd,
             "t": [r.tokens.input, r.tokens.output, r.tokens.cache_create, r.tokens.cache_read],
@@ -94,6 +172,7 @@ def _deserialize_records(raw: list[dict]) -> list:
             session_id=r["sid"],
             project=r["project"],
             cwd=r.get("cwd"),
+            repo=r.get("repo"),
             dedup_key=r.get("dk"),
             cost_usd=r.get("cost"),
             tokens=TokenCounts(
@@ -135,6 +214,7 @@ class UsageRecord:
     cost_usd: float | None = None  # pre-calculated cost from Claude Code
     dedup_key: str | None = None  # message_id:request_id for deduplication
     cwd: str | None = None  # original cwd from JSONL; lets future migrations re-derive project
+    repo: str | None = None  # normalized git remote captured at parse time (durable identity)
 
 
 @dataclass
@@ -314,12 +394,48 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
     except (OSError, UnicodeDecodeError):
         pass
 
-    project = Path(cwd_from_records).name if cwd_from_records else _derive_project(path)
+    repo = _resolve_remote(cwd_from_records) if cwd_from_records else None
+    if repo:
+        # Group by the repo's own name, not the full remote, so a host/org move
+        # (e.g. GitLab -> GitHub) keeps history together. A true repo rename is
+        # a manual `ccreport merge` away.
+        project = repo.rsplit("/", 1)[-1]
+    elif cwd_from_records:
+        project = _repo_from_path(cwd_from_records) or Path(cwd_from_records).name
+    else:
+        project = _derive_project(path)
     for r in records:
         r.project = project
         r.cwd = cwd_from_records
+        r.repo = repo
 
     return records
+
+
+def _build_override_fn():
+    """Compile the override table into a (repo, cwd, name) -> name function.
+
+    Rules apply in insertion order; first match wins. Returns None when there
+    are no rules so the hot loop pays nothing.
+    """
+    rules = get_project_overrides()
+    if not rules:
+        return None
+
+    def resolve(repo: str | None, cwd: str | None, name: str) -> str:
+        for r in rules:
+            kind, value = r["match_kind"], r["match_value"]
+            if kind == "name" and name == value:
+                return r["target"]
+            if kind == "remote" and repo == value:
+                return r["target"]
+            if kind == "cwd_prefix" and cwd and (
+                cwd == value or cwd.startswith(value.rstrip("/") + "/")
+            ):
+                return r["target"]
+        return name
+
+    return resolve
 
 
 def load_all_records(
@@ -335,6 +451,7 @@ def load_all_records(
     """
     files = discover_jsonl_files()
     _ensure_cache_valid()
+    override = _build_override_fn()
     seen_keys: set[str] = set()
     all_records: list[UsageRecord] = []
     live_paths: set[str] = set()
@@ -361,6 +478,8 @@ def load_all_records(
             save_ccreport_file(key, st.st_mtime_ns, st.st_size, _serialize_records(records))
 
         for rec in records:
+            if override:
+                rec.project = override(rec.repo, rec.cwd, rec.project)
             if since and rec.timestamp < since:
                 continue
             if until and rec.timestamp > until:
@@ -375,6 +494,8 @@ def load_all_records(
 
     # Load records from files that were purged from disk but cached in SQLite
     for raw in _deserialize_records(get_ccreport_orphaned_records(live_paths)):
+        if override:
+            raw.project = override(raw.repo, raw.cwd, raw.project)
         if since and raw.timestamp < since:
             continue
         if until and raw.timestamp > until:
@@ -1061,6 +1182,28 @@ def parse_date(s: str) -> datetime:
     return dt.replace(tzinfo=tz)
 
 
+def cmd_overrides(args) -> None:
+    """Manage the local project-grouping override rules."""
+    if args.command == "merge":
+        add_project_override(args.kind, args.source, args.target)
+        label = args.source if args.kind == "name" else f"{args.kind}:{args.source}"
+        print(f"Grouping {label} -> {args.target}")
+        return
+    if args.command == "unmerge":
+        n = delete_project_override(args.source, args.kind)
+        print(f"Removed {n} rule(s) matching {args.source!r}")
+        return
+    # overrides: list
+    rules = get_project_overrides()
+    if not rules:
+        print("No override rules. Add one with: ccreport merge <from> <into>")
+        return
+    width = max(len(r["match_value"]) for r in rules)
+    for r in rules:
+        kind = "" if r["match_kind"] == "name" else f"[{r['match_kind']}] "
+        print(f"  {kind}{r['match_value']:<{width}}  ->  {r['target']}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Analyze Claude Code token usage and costs from local JSONL logs.",
@@ -1088,6 +1231,18 @@ def main() -> None:
         if name == "session":
             p.add_argument("--limit", "-l", type=int, default=20, help="Max sessions to show (0=all)")
 
+    # Project-grouping overrides (manual merges/renames, stored locally)
+    sub.add_parser("overrides", help="List manual project-grouping rules")
+    pm = sub.add_parser("merge", help="Group one project name into another")
+    pm.add_argument("source", help="Name to remap (or remote/cwd-prefix with --kind)")
+    pm.add_argument("target", help="Project name to group it under")
+    pm.add_argument("--kind", choices=["name", "remote", "cwd_prefix"], default="name",
+                    help="What 'source' matches against (default: name)")
+    pu = sub.add_parser("unmerge", help="Remove a grouping rule")
+    pu.add_argument("source", help="The rule's match value to remove")
+    pu.add_argument("--kind", choices=["name", "remote", "cwd_prefix"],
+                    help="Restrict removal to this match kind")
+
     # Default: show all three reports
     parser.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
@@ -1096,6 +1251,11 @@ def main() -> None:
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
 
     args = parser.parse_args()
+
+    if args.command in ("overrides", "merge", "unmerge"):
+        cmd_overrides(args)
+        return
+
     mva = not args.no_mva
 
     since = parse_date(args.since) if args.since else None

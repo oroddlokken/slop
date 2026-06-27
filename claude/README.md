@@ -59,6 +59,38 @@ claude/agents/
 
 Skills reference agents by reading `~/.claude/agents/<name>.md` and passing the contents as an agent prompt.
 
+## Project grouping (ccreport)
+
+`ccreport` groups records into projects by a pure function over signals captured
+at parse time, so regrouping never needs a re-parse:
+
+1. **Git remote** — resolved from the session's `cwd` while the dir still exists
+   (`git config remote.origin.url`, normalized to `host/path`). Grouped by the
+   repo's *name* (last path segment), so moving a repo or changing its host/org
+   (GitLab → GitHub) keeps history together. This is the durable identity: it
+   survives the working dir being moved or deleted.
+2. **Dev-root path** — for repos with no remote, the segment just under `~/dev`,
+   `~/dev/privat`, or `~/dev/intern`. Collapses subdirectories and worktrees.
+3. **Dir-name / frozen label** — fallback for orphaned records whose source
+   JSONL is already purged and whose dir can't be reconstructed.
+
+### Manual merges and renames
+
+The automatic rules can't know that a *renamed* repo (`ren.no` → `ren-platform`)
+is the same project — that's human knowledge. Override rules live in the local
+`project_overrides` table (never committed; snapshotted with the rest of the DB):
+
+```bash
+ccreport overrides                          # list active rules
+ccreport merge <from-name> <into-name>      # group one name into another
+ccreport merge <remote> <into> --kind remote
+ccreport merge <cwd-prefix> <into> --kind cwd_prefix
+ccreport unmerge <value>                    # remove a rule
+```
+
+A repo rename is one `ccreport merge <new-name> <old-name>` away. Rules apply at
+report time, so the change shows up on the next run with no re-parse.
+
 ## Cache DB safety
 
 The shared cache (`~/.cache/macsetup/claude/cache.db`) holds token/cost history
