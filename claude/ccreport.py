@@ -15,9 +15,11 @@ import argparse
 import calendar
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -51,24 +53,45 @@ _PROJECT_ROOTS = (
     Path.home() / ".config" / "claude" / "projects",
 )
 
-# Repos live directly beneath these container dirs. A session's project is the
-# segment just under the deepest matching container, so subdirectories and git
-# worktrees collapse into their repo (e.g. ~/dev/ren.no/web -> ren.no) and a
-# repo opened from two places stays one (~/dev/penger and ~/dev/privat/penger
-# both -> penger). Ordered deepest-first for longest-prefix matching.
-_DEV_ROOTS = (
-    str(Path.home() / "dev" / "privat"),
-    str(Path.home() / "dev" / "intern"),
-    str(Path.home() / "dev"),
-    str(Path.home() / "git"),
-)
+# Repos live directly beneath per-machine container dirs (~/git on one
+# machine, ~/dev on another), so the roots come from a config file rather
+# than code. A session's project is the segment just under the deepest
+# matching root, so subdirectories and git worktrees collapse into their
+# repo (e.g. ~/git/ren.no/web -> ren.no) and a repo opened from two places
+# stays one.
+_CONFIG_PATH = Path(
+    os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+) / "macsetup" / "claude" / "ccreport.toml"
+
+
+def _load_dev_roots() -> tuple[str, ...]:
+    """Read dev_roots from the config file, sorted deepest-first.
+
+    Deepest-first makes matching longest-prefix regardless of file order.
+    No config file (or no dev_roots key) means the dev-root rule never
+    fires and cwds fall back to their basename; a malformed file warns
+    instead of taking the reports down with it.
+    """
+    try:
+        with open(_CONFIG_PATH, "rb") as f:
+            roots = tomllib.load(f).get("dev_roots", [])
+    except FileNotFoundError:
+        return ()
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        print(f"warning: ignoring {_CONFIG_PATH}: {e}", file=sys.stderr)
+        return ()
+    expanded = (str(Path(r).expanduser()) for r in roots if isinstance(r, str))
+    return tuple(sorted(expanded, key=len, reverse=True))
+
+
+_DEV_ROOTS = _load_dev_roots()
 
 
 def _repo_from_path(cwd: str) -> str | None:
-    """Return the repo directory name for a cwd under a known dev root, else None.
+    """Return the repo directory name for a cwd under a configured dev root.
 
     None leaves the caller free to fall back to the plain basename for paths
-    that don't live under ~/dev.
+    outside every dev root.
     """
     for root in _DEV_ROOTS:
         prefix = root + "/"
@@ -129,11 +152,22 @@ CACHE_VERSION = 2
 
 
 def _script_hash() -> str:
-    """SHA256 of this script file, used to invalidate cache on code changes."""
+    """SHA256 of this script plus the dev-roots config, used to invalidate cache.
+
+    The config participates because dev_roots shapes the project names frozen
+    into cached records at parse time — editing it must trigger a re-parse
+    just like a code change does.
+    """
+    h = hashlib.sha256()
     try:
-        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        h.update(Path(__file__).read_bytes())
     except OSError:
         return ""
+    try:
+        h.update(_CONFIG_PATH.read_bytes())
+    except OSError:
+        pass  # no config is a valid state; hash covers just the script
+    return h.hexdigest()
 
 
 def _ensure_cache_valid() -> None:
