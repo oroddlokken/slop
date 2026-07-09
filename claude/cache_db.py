@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
     sid           TEXT NOT NULL,
     project       TEXT NOT NULL,
     cwd           TEXT,
+    repo          TEXT,
     dk            TEXT,
     cost          REAL,
     input_tokens  INTEGER NOT NULL,
@@ -126,6 +127,17 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
 
 CREATE INDEX IF NOT EXISTS idx_ccr_file ON ccreport_records(file_path);
 CREATE INDEX IF NOT EXISTS idx_ccr_ts ON ccreport_records(ts);
+
+-- Manual project-grouping rules, applied as a pure function over the signals
+-- stored on each record (name/remote/cwd) at report time. Local data, never
+-- committed: merges and renames live here, not in code.
+CREATE TABLE IF NOT EXISTS project_overrides (
+    id          INTEGER PRIMARY KEY,
+    match_kind  TEXT NOT NULL,   -- 'name' | 'remote' | 'cwd_prefix'
+    match_value TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    UNIQUE (match_kind, match_value)
+);
 
 CREATE TABLE IF NOT EXISTS extra_usage_snapshots (
     ts    REAL PRIMARY KEY,
@@ -174,6 +186,13 @@ def get_connection() -> sqlite3.Connection:
     # whose source JSONL is already gone — those names are frozen in `project`).
     try:
         _conn.execute("ALTER TABLE ccreport_records ADD COLUMN cwd TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    # Add repo column (normalized git remote, captured at parse time while the
+    # working dir still exists). NULL for orphans parsed before this existed.
+    try:
+        _conn.execute("ALTER TABLE ccreport_records ADD COLUMN repo TEXT")
     except sqlite3.OperationalError as e:
         if "duplicate column" not in str(e).lower():
             raise
@@ -230,6 +249,20 @@ def _run_migrations(conn: sqlite3.Connection) -> bool:
         except sqlite3.OperationalError:
             pass  # Column already renamed or table structure differs
         _set_meta(conn, "migrated_rename_fingerprint", "1")
+        conn.commit()
+        ran = True
+
+    # Migration 4: Sonnet 5 had no pricing entry until 2026-07-09, so every
+    # cached cost covering a file touched since the model appeared
+    # (2026-06-30) counted its tokens as free. Clear those so they recompute.
+    # ccreport_records needs no fixup — its cost column is always NULL and
+    # recomputed from tokens on read.
+    if not _get_meta(conn, "migrated_sonnet_5_pricing"):
+        cutoff_ns = 1782777600000000000  # 2026-06-30T00:00 UTC in nanoseconds
+        conn.execute("DELETE FROM file_costs WHERE mtime_ns >= ?", (cutoff_ns,))
+        conn.execute("DELETE FROM session_costs")
+        conn.execute("DELETE FROM meta WHERE key IN ('cost_summary', 'cost_summary_time')")
+        _set_meta(conn, "migrated_sonnet_5_pricing", "1")
         conn.commit()
         ran = True
     return ran
@@ -869,7 +902,7 @@ def write_session_cost(session_id: str, fingerprint: str, cost: float) -> None:
 
 # Bump this when schema or serialization changes in cache_db.py affect
 # the format of stored ccreport records (macsetup-2tt1).
-CACHE_SCHEMA_SALT = "2"
+CACHE_SCHEMA_SALT = "3"
 
 
 def check_ccreport_valid(version: int, script_hash: str) -> bool:
@@ -938,14 +971,14 @@ def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, li
         return {}, {}
     # All records
     rec_rows = conn.execute(
-        "SELECT file_path, mid, model, ts, sid, project, cwd, dk, cost, "
+        "SELECT file_path, mid, model, ts, sid, project, cwd, repo, dk, cost, "
         "input_tokens, output_tokens, cache_create, cache_read "
         "FROM ccreport_records"
     ).fetchall()
     records_by_file: dict[str, list[dict]] = {}
-    for fp, mid, model, ts, sid, project, cwd, dk, cost, inp, out, cc, cr in rec_rows:
+    for fp, mid, model, ts, sid, project, cwd, repo, dk, cost, inp, out, cc, cr in rec_rows:
         rec = {"mid": mid, "model": model, "ts": ts, "sid": sid,
-               "project": project, "cwd": cwd, "dk": dk, "cost": cost,
+               "project": project, "cwd": cwd, "repo": repo, "dk": dk, "cost": cost,
                "t": [inp, out, cc, cr]}
         records_by_file.setdefault(fp, []).append(rec)
     return file_meta, records_by_file
@@ -959,7 +992,7 @@ def get_ccreport_records(path: str) -> list[dict]:
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT mid, model, ts, sid, project, cwd, dk, cost, "
+        "SELECT mid, model, ts, sid, project, cwd, repo, dk, cost, "
         "input_tokens, output_tokens, cache_create, cache_read "
         "FROM ccreport_records WHERE file_path = ?",
         (path,),
@@ -967,8 +1000,8 @@ def get_ccreport_records(path: str) -> list[dict]:
     return [
         {
             "mid": r[0], "model": r[1], "ts": r[2], "sid": r[3],
-            "project": r[4], "cwd": r[5], "dk": r[6], "cost": r[7],
-            "t": [r[8], r[9], r[10], r[11]],
+            "project": r[4], "cwd": r[5], "repo": r[6], "dk": r[7], "cost": r[8],
+            "t": [r[9], r[10], r[11], r[12]],
         }
         for r in rows
     ]
@@ -988,13 +1021,13 @@ def save_ccreport_file(
     if records:
         conn.executemany(
             "INSERT INTO ccreport_records "
-            "(file_path, mid, model, ts, sid, project, cwd, dk, cost, "
+            "(file_path, mid, model, ts, sid, project, cwd, repo, dk, cost, "
             "input_tokens, output_tokens, cache_create, cache_read) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     path, r["mid"], r["model"], r["ts"], r["sid"],
-                    r["project"], r.get("cwd"), r.get("dk"), r.get("cost"),
+                    r["project"], r.get("cwd"), r.get("repo"), r.get("dk"), r.get("cost"),
                     r["t"][0], r["t"][1], r["t"][2], r["t"][3],
                 )
                 for r in records
@@ -1016,7 +1049,7 @@ def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
         return []
     placeholders = ",".join("?" * len(orphaned))
     rows = conn.execute(
-        f"SELECT mid, model, ts, sid, project, cwd, dk, cost, "
+        f"SELECT mid, model, ts, sid, project, cwd, repo, dk, cost, "
         f"input_tokens, output_tokens, cache_create, cache_read "
         f"FROM ccreport_records WHERE file_path IN ({placeholders})",
         orphaned,
@@ -1024,11 +1057,55 @@ def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
     return [
         {
             "mid": r[0], "model": r[1], "ts": r[2], "sid": r[3],
-            "project": r[4], "cwd": r[5], "dk": r[6], "cost": r[7],
-            "t": [r[8], r[9], r[10], r[11]],
+            "project": r[4], "cwd": r[5], "repo": r[6], "dk": r[7], "cost": r[8],
+            "t": [r[9], r[10], r[11], r[12]],
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Project overrides (manual grouping rules)
+# ---------------------------------------------------------------------------
+
+def get_project_overrides() -> list[dict]:
+    """Return all override rules, lowest id first (insertion order = priority)."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, match_kind, match_value, target FROM project_overrides ORDER BY id"
+    ).fetchall()
+    return [
+        {"id": r[0], "match_kind": r[1], "match_value": r[2], "target": r[3]}
+        for r in rows
+    ]
+
+
+def add_project_override(match_kind: str, match_value: str, target: str) -> None:
+    """Insert or replace a rule. (match_kind, match_value) is unique."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO project_overrides (match_kind, match_value, target) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT (match_kind, match_value) DO UPDATE SET target = excluded.target",
+        (match_kind, match_value, target),
+    )
+    conn.commit()
+
+
+def delete_project_override(match_value: str, match_kind: str | None = None) -> int:
+    """Delete rules matching a value (optionally scoped to a kind). Returns count."""
+    conn = get_connection()
+    if match_kind:
+        cur = conn.execute(
+            "DELETE FROM project_overrides WHERE match_value = ? AND match_kind = ?",
+            (match_value, match_kind),
+        )
+    else:
+        cur = conn.execute(
+            "DELETE FROM project_overrides WHERE match_value = ?", (match_value,)
+        )
+    conn.commit()
+    return cur.rowcount
 
 
 # ---------------------------------------------------------------------------

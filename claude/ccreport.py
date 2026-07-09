@@ -15,7 +15,11 @@ import argparse
 import calendar
 import hashlib
 import json
+import os
+import re
+import subprocess
 import sys
+import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -31,9 +35,12 @@ from rich.text import Text
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
+    add_project_override,
     bulk_load_ccreport_cache,
     check_ccreport_valid,
+    delete_project_override,
     get_ccreport_orphaned_records,
+    get_project_overrides,
     init_ccreport_meta,
     invalidate_ccreport,
     save_ccreport_file,
@@ -46,16 +53,124 @@ _PROJECT_ROOTS = (
     Path.home() / ".config" / "claude" / "projects",
 )
 
+# Repos live directly beneath repo-root container dirs. A session's project
+# is the segment just under the deepest matching root, so subdirectories and
+# git worktrees collapse into their repo (e.g. ~/git/ren.no/web -> ren.no)
+# and a repo opened from two places stays one. ~/git is always a repo root;
+# per-machine layouts (~/dev and friends) are added via the config file,
+# which can only ever add roots, never remove the baseline.
+_CONFIG_PATH = Path(
+    os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+) / "macsetup" / "claude" / "ccreport.toml"
+
+_BASELINE_REPO_ROOT = Path.home() / "git"
+
+
+def _load_repo_roots() -> tuple[str, ...]:
+    """Return the ~/git baseline plus repo_roots from the config file.
+
+    Sorted deepest-first, which makes matching longest-prefix regardless of
+    config order. No config file (or no repo_roots key) leaves just the
+    baseline; a malformed file warns instead of taking the reports down
+    with it.
+    """
+    roots = {str(_BASELINE_REPO_ROOT)}
+    try:
+        with open(_CONFIG_PATH, "rb") as f:
+            extra = tomllib.load(f).get("repo_roots", [])
+    except FileNotFoundError:
+        extra = []
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        print(f"warning: ignoring {_CONFIG_PATH}: {e}", file=sys.stderr)
+        extra = []
+    roots.update(str(Path(r).expanduser()) for r in extra if isinstance(r, str))
+    return tuple(sorted(roots, key=len, reverse=True))
+
+
+_REPO_ROOTS = _load_repo_roots()
+
+
+def _repo_from_path(cwd: str) -> str | None:
+    """Return the repo directory name for a cwd under a repo root.
+
+    None leaves the caller free to fall back to the plain basename for paths
+    outside every repo root.
+    """
+    for root in _REPO_ROOTS:
+        prefix = root + "/"
+        if cwd.startswith(prefix):
+            repo = cwd[len(prefix):].split("/", 1)[0]
+            if repo:
+                return repo
+    return None
+
+
+# Git remote is the durable project identity: it survives a folder being moved
+# or deleted, where a path does not. Resolved lazily at parse time (only while
+# the working dir still exists) and cached per cwd within a run.
+_remote_cache: dict[str, str | None] = {}
+
+
+def _normalize_remote(url: str) -> str:
+    """Reduce a git remote URL to a stable host/path key.
+
+    Handles scp-style (git@host:org/repo.git), ssh:// (with optional port),
+    and https:// forms; strips credentials, port, and the .git suffix.
+    """
+    url = url.strip()
+    url = re.sub(r"\.git$", "", url)
+    m = re.match(r"^[\w.+-]+@([^:/]+):(.+)$", url)  # scp-style: git@host:path
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    m = re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]+@)?([^:/]+)(?::\d+)?/(.+)$", url)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    return url
+
+
+def _resolve_remote(cwd: str) -> str | None:
+    """Return the normalized origin remote for a cwd, or None.
+
+    None when the dir is gone, it isn't a git repo, or there is no origin —
+    callers then fall back to the path-based name.
+    """
+    if cwd in _remote_cache:
+        return _remote_cache[cwd]
+    result: str | None = None
+    if Path(cwd).is_dir():
+        try:
+            out = subprocess.run(
+                ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                result = _normalize_remote(out.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            result = None
+    _remote_cache[cwd] = result
+    return result
+
 # --- File-level cache ---
 CACHE_VERSION = 2
 
 
 def _script_hash() -> str:
-    """SHA256 of this script file, used to invalidate cache on code changes."""
+    """SHA256 of this script plus the repo-roots config, used to invalidate cache.
+
+    The config participates because repo_roots shapes the project names frozen
+    into cached records at parse time — editing it must trigger a re-parse
+    just like a code change does.
+    """
+    h = hashlib.sha256()
     try:
-        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        h.update(Path(__file__).read_bytes())
     except OSError:
         return ""
+    try:
+        h.update(_CONFIG_PATH.read_bytes())
+    except OSError:
+        pass  # no config is a valid state; hash covers just the script
+    return h.hexdigest()
 
 
 def _ensure_cache_valid() -> None:
@@ -76,6 +191,7 @@ def _serialize_records(records: list) -> list[dict]:
             "sid": r.session_id,
             "project": r.project,
             "cwd": r.cwd,
+            "repo": r.repo,
             "dk": r.dedup_key,
             "cost": r.cost_usd,
             "t": [r.tokens.input, r.tokens.output, r.tokens.cache_create, r.tokens.cache_read],
@@ -94,6 +210,7 @@ def _deserialize_records(raw: list[dict]) -> list:
             session_id=r["sid"],
             project=r["project"],
             cwd=r.get("cwd"),
+            repo=r.get("repo"),
             dedup_key=r.get("dk"),
             cost_usd=r.get("cost"),
             tokens=TokenCounts(
@@ -135,6 +252,7 @@ class UsageRecord:
     cost_usd: float | None = None  # pre-calculated cost from Claude Code
     dedup_key: str | None = None  # message_id:request_id for deduplication
     cwd: str | None = None  # original cwd from JSONL; lets future migrations re-derive project
+    repo: str | None = None  # normalized git remote captured at parse time (durable identity)
 
 
 @dataclass
@@ -314,12 +432,48 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
     except (OSError, UnicodeDecodeError):
         pass
 
-    project = Path(cwd_from_records).name if cwd_from_records else _derive_project(path)
+    repo = _resolve_remote(cwd_from_records) if cwd_from_records else None
+    if repo:
+        # Group by the repo's own name, not the full remote, so a host/org move
+        # (e.g. GitLab -> GitHub) keeps history together. A true repo rename is
+        # a manual `ccreport merge` away.
+        project = repo.rsplit("/", 1)[-1]
+    elif cwd_from_records:
+        project = _repo_from_path(cwd_from_records) or Path(cwd_from_records).name
+    else:
+        project = _derive_project(path)
     for r in records:
         r.project = project
         r.cwd = cwd_from_records
+        r.repo = repo
 
     return records
+
+
+def _build_override_fn():
+    """Compile the override table into a (repo, cwd, name) -> name function.
+
+    Rules apply in insertion order; first match wins. Returns None when there
+    are no rules so the hot loop pays nothing.
+    """
+    rules = get_project_overrides()
+    if not rules:
+        return None
+
+    def resolve(repo: str | None, cwd: str | None, name: str) -> str:
+        for r in rules:
+            kind, value = r["match_kind"], r["match_value"]
+            if kind == "name" and name == value:
+                return r["target"]
+            if kind == "remote" and repo == value:
+                return r["target"]
+            if kind == "cwd_prefix" and cwd and (
+                cwd == value or cwd.startswith(value.rstrip("/") + "/")
+            ):
+                return r["target"]
+        return name
+
+    return resolve
 
 
 def load_all_records(
@@ -335,6 +489,7 @@ def load_all_records(
     """
     files = discover_jsonl_files()
     _ensure_cache_valid()
+    override = _build_override_fn()
     seen_keys: set[str] = set()
     all_records: list[UsageRecord] = []
     live_paths: set[str] = set()
@@ -361,6 +516,8 @@ def load_all_records(
             save_ccreport_file(key, st.st_mtime_ns, st.st_size, _serialize_records(records))
 
         for rec in records:
+            if override:
+                rec.project = override(rec.repo, rec.cwd, rec.project)
             if since and rec.timestamp < since:
                 continue
             if until and rec.timestamp > until:
@@ -375,6 +532,8 @@ def load_all_records(
 
     # Load records from files that were purged from disk but cached in SQLite
     for raw in _deserialize_records(get_ccreport_orphaned_records(live_paths)):
+        if override:
+            raw.project = override(raw.repo, raw.cwd, raw.project)
         if since and raw.timestamp < since:
             continue
         if until and raw.timestamp > until:
@@ -402,17 +561,20 @@ def _is_narrow() -> bool:
 
 
 def fmt_tokens(n: int) -> str:
-    """Format token count with K/M suffix."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
+    """Format token count with K/M suffix. Past 100 the decimal is noise."""
+    for suffix, size in (("M", 1_000_000), ("K", 1_000)):
+        if n >= size:
+            scaled = n / size
+            # Branch on the rounded value, else 99.96 renders as "100.0K".
+            return f"{scaled:.0f}{suffix}" if round(scaled, 1) >= 100 else f"{scaled:.1f}{suffix}"
     return str(n)
 
 
 def fmt_cost(c: float) -> str:
-    """Format cost in USD. Cents kept above $1; sub-10-cent amounts keep
-    extra precision so small costs don't render as $0.0."""
+    """Format cost in USD. Cents stop mattering above $10; sub-10-cent amounts
+    keep extra precision so small costs don't render as $0.0."""
+    if round(c, 2) >= 10.0:  # rounded, else $9.996 renders as "$10.00"
+        return f"${c:.0f}"
     if c >= 1.0:
         return f"${c:.2f}"
     if c >= 0.1:
@@ -462,6 +624,53 @@ def short_model(model: str) -> str:
     return m
 
 
+MODELS_MIN_WIDTH = 12
+"""Below this a Models column shows nothing but an ellipsis, so drop it."""
+
+
+def _flex_cell(text: str) -> Text:
+    """Build a cell for the Models column, the only column Rich may shrink.
+
+    Rich takes width from wrappable columns first. When every column is no_wrap
+    it instead shaves all of them evenly, which is what turned the numbers into
+    '14.…'. The cell keeps no_wrap so a shrunk column truncates on one line
+    rather than wrapping onto two.
+    """
+    return Text(text, no_wrap=True, overflow="ellipsis")
+
+
+def _models_cell(models: set[str]) -> Text:
+    """Render a bucket's model set as a single-line, truncatable cell."""
+    return _flex_cell(", ".join(sorted(short_model(m) for m in models)))
+
+
+def _column_width(column) -> int:
+    """Natural width of a column: its widest cell, header included."""
+    widths = [Text.from_markup(str(column.header)).cell_len]
+    widths += [
+        cell.cell_len if isinstance(cell, Text) else Text.from_markup(str(cell)).cell_len
+        for cell in column._cells  # noqa: SLF001 - Rich exposes no public accessor
+    ]
+    return max(widths)
+
+
+def _print_report(table: Table) -> None:
+    """Print a report table, dropping Models when the terminal is too narrow.
+
+    Rich empties the wrappable Models column before shaving anything else, but it
+    takes it all the way to zero and then shaves the numbers regardless, leaving a
+    dead column behind. Removing it first keeps the rest of the table readable.
+    """
+    if table.columns and str(table.columns[-1].header) == "Models":
+        padding = table.padding[1] + table.padding[3]
+        fixed = sum(_column_width(c) + padding for c in table.columns[:-1])
+        if console.width - fixed - table._extra_width < MODELS_MIN_WIDTH:  # noqa: SLF001
+            table.columns.pop()
+    console.print()
+    console.print(table)
+    console.print()
+
+
 def _make_report_table(
     title: str,
     label_col: str,
@@ -477,7 +686,8 @@ def _make_report_table(
     table.add_column(label_col, style=label_style, no_wrap=True)
     _add_token_columns(table, compact=compact, narrow=narrow, has_nok=has_nok, mva=mva)
     if not narrow:
-        table.add_column("Models", style="dim", no_wrap=True)
+        # The only wrappable column, so Rich takes width from here first.
+        table.add_column("Models", style="dim")
     return table
 
 
@@ -560,7 +770,7 @@ def _add_summary_rows(
     table.add_section()
     total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, compact=compact, narrow=narrow, has_nok=has_nok)]
     if not narrow:
-        total_row.append(f"{len(total_agg.models)} models")
+        total_row.append(_flex_cell(f"{len(total_agg.models)} models"))
     table.add_row(*total_row, style="bold")
     if n_buckets > 1:
         avg_cost = total_agg.cost / n_buckets
@@ -583,7 +793,7 @@ def _add_summary_rows(
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
-            cells += ["", "", avg_label]
+            cells += ["", "", _flex_cell(avg_label)]
             table.add_row(*cells, style="dim")
 
 
@@ -621,7 +831,7 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False, rates: dic
         b = buckets[day]
         row = [day, *_token_row(b, total_cost, narrow=narrow, has_nok=has_nok)]
         if not narrow:
-            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+            row.append(_models_cell(b.models))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
@@ -641,9 +851,7 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False, rates: dic
 
     _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per day", has_nok=has_nok)
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_monthly(records: list[UsageRecord], rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
@@ -671,7 +879,7 @@ def report_monthly(records: list[UsageRecord], rates: dict[str, float] | None = 
         b = buckets[month]
         row = [month, *_token_row(b, total_cost, narrow=narrow, has_nok=has_nok)]
         if not narrow:
-            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+            row.append(_models_cell(b.models))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
@@ -754,13 +962,11 @@ def report_monthly(records: list[UsageRecord], rates: dict[str, float] | None = 
                         cells.append(Text(fmt_nok(projected_14d_nok, nok_14d_bucket.nok_estimated), style="dim cyan"))
                     cells += [
                         "", "",
-                        f"Last {window} days avg",
+                        _flex_cell(f"Last {window} days avg"),
                     ]
                     table.add_row(*cells, style="dim")
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_project(records: list[UsageRecord], limit: int | None = 20, rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
@@ -794,7 +1000,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20, rates: di
         b = buckets[proj]
         row = [proj, *_token_row(b, total_cost, compact=True, narrow=narrow, has_nok=has_nok)]
         if not narrow:
-            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+            row.append(_models_cell(b.models))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
@@ -831,12 +1037,10 @@ def report_project(records: list[UsageRecord], limit: int | None = 20, rates: di
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
-            cells += ["", "", f"per project (all {all_n})"]
+            cells += ["", "", _flex_cell(f"per project (all {all_n})")]
             table.add_row(*cells, style="dim")
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_session(records: list[UsageRecord], limit: int | None = 20, rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
@@ -890,7 +1094,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             table.add_column(nok_label, justify="right", style="cyan", no_wrap=True)
         table.add_column("%", justify="right", style="dim", no_wrap=True)
         table.add_column("Calls", justify="right", style="dim", no_wrap=True)
-        table.add_column("Models", style="dim", no_wrap=True)
+        table.add_column("Models", style="dim")
 
     total_cost = sum(buckets[s].cost for s in sorted_sessions)
     total_agg = AggBucket()
@@ -910,7 +1114,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             table.add_row(*cells)
         else:
             short_sid = sid[-8:] if len(sid) > 8 else sid
-            models_str = ", ".join(sorted(short_model(m) for m in b.models))
+            models_str = _models_cell(b.models)
             cells = [
                 short_sid,
                 meta["project"],
@@ -983,7 +1187,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
-            cells += ["", "", f"per session (top {n})"]
+            cells += ["", "", _flex_cell(f"per session (top {n})")]
             table.add_row(*cells, style="dim")
     # Average across ALL sessions
     all_n = len(buckets)
@@ -1011,12 +1215,10 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
-            cells += ["", "", f"per session (all {all_n})"]
+            cells += ["", "", _flex_cell(f"per session (all {all_n})")]
             table.add_row(*cells, style="dim")
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_json(records: list[UsageRecord], rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
@@ -1061,6 +1263,28 @@ def parse_date(s: str) -> datetime:
     return dt.replace(tzinfo=tz)
 
 
+def cmd_overrides(args) -> None:
+    """Manage the local project-grouping override rules."""
+    if args.command == "merge":
+        add_project_override(args.kind, args.source, args.target)
+        label = args.source if args.kind == "name" else f"{args.kind}:{args.source}"
+        print(f"Grouping {label} -> {args.target}")
+        return
+    if args.command == "unmerge":
+        n = delete_project_override(args.source, args.kind)
+        print(f"Removed {n} rule(s) matching {args.source!r}")
+        return
+    # overrides: list
+    rules = get_project_overrides()
+    if not rules:
+        print("No override rules. Add one with: ccreport merge <from> <into>")
+        return
+    width = max(len(r["match_value"]) for r in rules)
+    for r in rules:
+        kind = "" if r["match_kind"] == "name" else f"[{r['match_kind']}] "
+        print(f"  {kind}{r['match_value']:<{width}}  ->  {r['target']}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Analyze Claude Code token usage and costs from local JSONL logs.",
@@ -1088,6 +1312,18 @@ def main() -> None:
         if name == "session":
             p.add_argument("--limit", "-l", type=int, default=20, help="Max sessions to show (0=all)")
 
+    # Project-grouping overrides (manual merges/renames, stored locally)
+    sub.add_parser("overrides", help="List manual project-grouping rules")
+    pm = sub.add_parser("merge", help="Group one project name into another")
+    pm.add_argument("source", help="Name to remap (or remote/cwd-prefix with --kind)")
+    pm.add_argument("target", help="Project name to group it under")
+    pm.add_argument("--kind", choices=["name", "remote", "cwd_prefix"], default="name",
+                    help="What 'source' matches against (default: name)")
+    pu = sub.add_parser("unmerge", help="Remove a grouping rule")
+    pu.add_argument("source", help="The rule's match value to remove")
+    pu.add_argument("--kind", choices=["name", "remote", "cwd_prefix"],
+                    help="Restrict removal to this match kind")
+
     # Default: show all three reports
     parser.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
@@ -1096,6 +1332,11 @@ def main() -> None:
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
 
     args = parser.parse_args()
+
+    if args.command in ("overrides", "merge", "unmerge"):
+        cmd_overrides(args)
+        return
+
     mva = not args.no_mva
 
     since = parse_date(args.since) if args.since else None
