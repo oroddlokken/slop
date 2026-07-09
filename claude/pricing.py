@@ -187,6 +187,28 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        # Sonnet 5 first seen 2026-06-30, on introductory pricing ($2/$10 per
+        # MTok) through 2026-08-31. Cache rates derived from the standard
+        # Anthropic ratios: write 1.25x input, read 0.1x input.
+        "effective": "2026-06-30",
+        "models": {
+            "claude-sonnet-5": {
+                "input": 2e-06, "output": 10e-06,
+                "cache_create": 2.5e-06, "cache_read": 0.2e-06,
+            },
+        },
+    },
+    {
+        # Sonnet 5 introductory period ends 2026-08-31; list price takes over.
+        "effective": "2026-09-01",
+        "models": {
+            "claude-sonnet-5": {
+                "input": 3e-06, "output": 15e-06,
+                "cache_create": 3.75e-06, "cache_read": 0.3e-06,
+            },
+        },
+    },
 ]
 
 MODEL_ALIASES: dict[str, str] = {
