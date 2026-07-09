@@ -523,17 +523,20 @@ def _is_narrow() -> bool:
 
 
 def fmt_tokens(n: int) -> str:
-    """Format token count with K/M suffix."""
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
+    """Format token count with K/M suffix. Past 100 the decimal is noise."""
+    for suffix, size in (("M", 1_000_000), ("K", 1_000)):
+        if n >= size:
+            scaled = n / size
+            # Branch on the rounded value, else 99.96 renders as "100.0K".
+            return f"{scaled:.0f}{suffix}" if round(scaled, 1) >= 100 else f"{scaled:.1f}{suffix}"
     return str(n)
 
 
 def fmt_cost(c: float) -> str:
-    """Format cost in USD. Cents kept above $1; sub-10-cent amounts keep
-    extra precision so small costs don't render as $0.0."""
+    """Format cost in USD. Cents stop mattering above $10; sub-10-cent amounts
+    keep extra precision so small costs don't render as $0.0."""
+    if round(c, 2) >= 10.0:  # rounded, else $9.996 renders as "$10.00"
+        return f"${c:.0f}"
     if c >= 1.0:
         return f"${c:.2f}"
     if c >= 0.1:
