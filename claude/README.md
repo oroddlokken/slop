@@ -69,8 +69,9 @@ at parse time, so regrouping never needs a re-parse:
    repo's *name* (last path segment), so moving a repo or changing its host/org
    (GitLab → GitHub) keeps history together. This is the durable identity: it
    survives the working dir being moved or deleted.
-2. **Dev-root path** — for repos with no remote, the segment just under `~/dev`,
-   `~/dev/privat`, or `~/dev/intern`. Collapses subdirectories and worktrees.
+2. **Dev-root path** — for repos with no remote, the segment just under a known
+   dev root (`~/git`, `~/dev`, `~/dev/privat`, `~/dev/intern`). Collapses
+   subdirectories and worktrees.
 3. **Dir-name / frozen label** — fallback for orphaned records whose source
    JSONL is already purged and whose dir can't be reconstructed.
 

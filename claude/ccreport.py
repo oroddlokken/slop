@@ -60,6 +60,7 @@ _DEV_ROOTS = (
     str(Path.home() / "dev" / "privat"),
     str(Path.home() / "dev" / "intern"),
     str(Path.home() / "dev"),
+    str(Path.home() / "git"),
 )
 
 
