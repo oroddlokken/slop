@@ -69,18 +69,18 @@ at parse time, so regrouping never needs a re-parse:
    repo's *name* (last path segment), so moving a repo or changing its host/org
    (GitLab → GitHub) keeps history together. This is the durable identity: it
    survives the working dir being moved or deleted.
-2. **Dev-root path** — for repos with no remote, the segment just under a
-   configured dev root. Roots are per-machine and live in
+2. **Repo-root path** — for repos with no remote, the segment just under a
+   repo root. `~/git` is always a repo root; per-machine extras (a config
+   file can only add roots, never remove the baseline) live in
    `${XDG_CONFIG_HOME:-~/.config}/macsetup/claude/ccreport.toml`:
 
    ```toml
-   dev_roots = ["~/git", "~/dev"]
+   repo_roots = ["~/dev", "~/dev/privat"]
    ```
 
-   Matching is longest-prefix, so nested roots are fine in any order. With no
-   config file this rule is inert. Collapses subdirectories and worktrees.
-   Editing the config invalidates the report cache, so records regroup on the
-   next run.
+   Matching is longest-prefix, so nested roots are fine in any order.
+   Collapses subdirectories and worktrees. Editing the config invalidates the
+   report cache, so records regroup on the next run.
 3. **Dir-name / frozen label** — fallback for orphaned records whose source
    JSONL is already purged and whose dir can't be reconstructed.
 

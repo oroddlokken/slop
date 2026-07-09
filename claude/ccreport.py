@@ -53,47 +53,50 @@ _PROJECT_ROOTS = (
     Path.home() / ".config" / "claude" / "projects",
 )
 
-# Repos live directly beneath per-machine container dirs (~/git on one
-# machine, ~/dev on another), so the roots come from a config file rather
-# than code. A session's project is the segment just under the deepest
-# matching root, so subdirectories and git worktrees collapse into their
-# repo (e.g. ~/git/ren.no/web -> ren.no) and a repo opened from two places
-# stays one.
+# Repos live directly beneath repo-root container dirs. A session's project
+# is the segment just under the deepest matching root, so subdirectories and
+# git worktrees collapse into their repo (e.g. ~/git/ren.no/web -> ren.no)
+# and a repo opened from two places stays one. ~/git is always a repo root;
+# per-machine layouts (~/dev and friends) are added via the config file,
+# which can only ever add roots, never remove the baseline.
 _CONFIG_PATH = Path(
     os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
 ) / "macsetup" / "claude" / "ccreport.toml"
 
+_BASELINE_REPO_ROOT = Path.home() / "git"
 
-def _load_dev_roots() -> tuple[str, ...]:
-    """Read dev_roots from the config file, sorted deepest-first.
 
-    Deepest-first makes matching longest-prefix regardless of file order.
-    No config file (or no dev_roots key) means the dev-root rule never
-    fires and cwds fall back to their basename; a malformed file warns
-    instead of taking the reports down with it.
+def _load_repo_roots() -> tuple[str, ...]:
+    """Return the ~/git baseline plus repo_roots from the config file.
+
+    Sorted deepest-first, which makes matching longest-prefix regardless of
+    config order. No config file (or no repo_roots key) leaves just the
+    baseline; a malformed file warns instead of taking the reports down
+    with it.
     """
+    roots = {str(_BASELINE_REPO_ROOT)}
     try:
         with open(_CONFIG_PATH, "rb") as f:
-            roots = tomllib.load(f).get("dev_roots", [])
+            extra = tomllib.load(f).get("repo_roots", [])
     except FileNotFoundError:
-        return ()
+        extra = []
     except (tomllib.TOMLDecodeError, OSError) as e:
         print(f"warning: ignoring {_CONFIG_PATH}: {e}", file=sys.stderr)
-        return ()
-    expanded = (str(Path(r).expanduser()) for r in roots if isinstance(r, str))
-    return tuple(sorted(expanded, key=len, reverse=True))
+        extra = []
+    roots.update(str(Path(r).expanduser()) for r in extra if isinstance(r, str))
+    return tuple(sorted(roots, key=len, reverse=True))
 
 
-_DEV_ROOTS = _load_dev_roots()
+_REPO_ROOTS = _load_repo_roots()
 
 
 def _repo_from_path(cwd: str) -> str | None:
-    """Return the repo directory name for a cwd under a configured dev root.
+    """Return the repo directory name for a cwd under a repo root.
 
     None leaves the caller free to fall back to the plain basename for paths
-    outside every dev root.
+    outside every repo root.
     """
-    for root in _DEV_ROOTS:
+    for root in _REPO_ROOTS:
         prefix = root + "/"
         if cwd.startswith(prefix):
             repo = cwd[len(prefix):].split("/", 1)[0]
@@ -152,9 +155,9 @@ CACHE_VERSION = 2
 
 
 def _script_hash() -> str:
-    """SHA256 of this script plus the dev-roots config, used to invalidate cache.
+    """SHA256 of this script plus the repo-roots config, used to invalidate cache.
 
-    The config participates because dev_roots shapes the project names frozen
+    The config participates because repo_roots shapes the project names frozen
     into cached records at parse time — editing it must trigger a re-parse
     just like a code change does.
     """
