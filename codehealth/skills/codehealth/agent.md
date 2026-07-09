@@ -25,15 +25,9 @@ The orchestrator has already scanned the codebase. Here are the files:
 
 ## Output Format
 
-End your review with a structured findings table. Use the format specified in your review criteria's Output Format section. At minimum, every table must include these columns: **Severity**, **File:Line**, **Issue**, **Suggestion**.
+End your review with a `## Findings Summary` markdown heading followed by a findings table. The numbered table's base columns are **Severity** and **File:Line**; your reviewer criteria file (below) defines the additional domain-specific columns.
 
 **Cap output at 12 findings, ranked by severity.** Drop the lowest-severity items first when over the cap. A distillation step downstream merges your output with other lenses — a tight prioritized list lets the criticals surface; a flood buries them.
-
-## Findings Summary
-
-| # | Severity | File:Line | Issue | Suggestion |
-|---|----------|-----------|-------|------------|
-| 1 | Critical | path:line | description | what to change |
 
 Severity levels: Critical, High, Medium, Low
 

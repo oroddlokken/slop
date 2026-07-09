@@ -1,6 +1,5 @@
 
 # Simplify Code
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for over-engineered solutions and suggest simpler alternatives. The goal: every piece of code should be as simple as possible for what it does — no simpler, no more complex.
 
@@ -94,21 +93,7 @@ For each simplification opportunity:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Simplification Opportunities
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{start_line}-{end_line}` (and related files)
-**Pattern**: {what over-engineering pattern was found}
-**Currently**: {brief description of current approach}
-**Simpler**: {concrete alternative — show what the code would look like}
-**Reasoning benefit**: {why the simpler version is easier to think about}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Pattern | Simpler Alternative | Lines Saved |
 |---|----------|-----------|---------|--------------------|----|

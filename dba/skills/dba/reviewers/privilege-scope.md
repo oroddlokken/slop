@@ -110,21 +110,7 @@ db.execute("SELECT id, name, email, internal_notes FROM users")
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Privilege Scope
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Current privilege**: {what the DB user can do}
-**Needed privilege**: {what the app actually needs}
-**Risk**: {what could go wrong — accidental DDL, data leak, full DB compromise}
-**Fix**: {create restricted user, add RLS, separate migration user, etc.}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Issue | Current Privilege | Fix |
 |---|----------|-----------|-------|------------------|-----|

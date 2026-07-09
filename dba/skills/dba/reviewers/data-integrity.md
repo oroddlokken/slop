@@ -132,21 +132,7 @@ class Order(Model):
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Data Integrity
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}` (schema definition or code that exposes the gap)
-**Table.column**: {table and column with the gap}
-**Missing constraint**: {FK, UNIQUE, NOT NULL, CHECK, ON DELETE, DEFAULT}
-**Risk**: {orphaned records, duplicates, null crashes, garbage data, undefined cascade}
-**Fix**: {exact ALTER TABLE or model change}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Table.Column | Missing Constraint | Fix |
 |---|----------|-----------|-------------|-------------------|-----|

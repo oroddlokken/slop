@@ -120,21 +120,7 @@ Should be: add new column, backfill, deploy code using new column, drop old colu
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Migration Safety
-
-### {Severity}: {short description}
-
-**Migration**: `{file}:{line}`
-**Operation**: {what the migration does}
-**Risk**: {data loss, downtime, lock contention, no rollback}
-**Deploy impact**: {will this cause downtime? how long? for what table size?}
-**Fix**: {add rollback, split into steps, use CONCURRENTLY, batch the backfill, etc.}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Operation | Risk | Fix |
 |---|----------|-----------|-----------|------|-----|

@@ -91,22 +91,7 @@ Multiple indexes that overlap:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Index Coverage
-
-### {Severity}: {short description}
-
-**Query location**: `{file}:{line}`
-**Query pattern**: {the WHERE/ORDER BY/JOIN that needs an index}
-**Table.column**: {table and column that's missing an index}
-**Existing indexes**: {what indexes the table currently has}
-**Impact**: {full table scan, filesort, slow join — with estimated severity based on likely table size}
-**Fix**: {exact CREATE INDEX statement or ORM equivalent}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Table.Column | Query Pattern | Fix |
 |---|----------|-----------|-------------|---------------|-----|

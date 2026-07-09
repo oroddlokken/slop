@@ -4,7 +4,7 @@ You are a distillation agent. You receive structured `## Findings Summary` table
 
 ## What you receive
 
-- One block per reviewer headed `### Reviewer: {name}`, containing the reviewer's findings table (Severity, File:Line, Issue, Suggestion).
+- One block per reviewer headed `### Reviewer: {name}`, containing the reviewer's findings table (base columns Severity and File:Line, plus reviewer-specific columns).
 - Which reviewers ran, which were skipped (and why).
 - A dcat issues list (if the orchestrator detected one).
 - A focus area (if the user specified one).

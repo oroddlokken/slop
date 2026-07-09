@@ -1,6 +1,5 @@
 
 # Find Complexity Hotspots
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for mechanically complex code — functions that are too long, too deeply nested, or have too many branches. These are the places where bugs hide and maintenance is most expensive.
 
@@ -81,22 +80,7 @@ For each hotspot:
 
 ## Output Format
 
-After scanning, output a **Top 10 Hotspots** list (or fewer if the codebase is small):
-
-```
-## Complexity Hotspots
-
-### #{rank}: `{function_name}` in `{file}`
-
-**Lines**: {start}-{end} ({count} lines)
-**Nesting depth**: {max_depth} levels
-**Branches**: {count}
-**Parameters**: {count}
-**Why it matters**: {specific risk}
-**Suggestion**: {concrete approach to simplify}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Function | Lines | Nesting | Branches | Suggestion |
 |---|----------|-----------|----------|-------|---------|----------|-----------|

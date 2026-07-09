@@ -1,5 +1,4 @@
 # Find Missing Type Structures
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for raw dicts, lists, and tuples being passed between functions that should be proper typed data structures. Raw data structures provide no documentation, no validation, and no IDE support — they're the #1 source of "what keys does this dict have?" confusion.
 
@@ -137,29 +136,7 @@ For each instance:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Missing Type Structures
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}` (and {N} other files that use this structure)
-**Pattern**: {Dict-as-object | Unstructured tuple | kwargs bag | ...}
-**Currently**: {show the dict keys/tuple structure being passed around}
-**Replace with**:
-```python
-@dataclass
-class SuggestedName:
-    field_1: type
-    field_2: type
-    field_3: type = default
-```
-**Benefits**: {autocomplete, type checking, self-documenting, validation}
-**Scope**: Used in {N} files — {list the key files}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Pattern | Keys/Fields | Suggested Structure |
 |---|----------|-----------|---------|-------------|-------------------|

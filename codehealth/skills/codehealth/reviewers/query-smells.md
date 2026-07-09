@@ -1,5 +1,4 @@
 # Find Query Smells
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for database query patterns that cause performance problems, security vulnerabilities, or maintenance headaches.
 
@@ -95,21 +94,7 @@ For each query smell:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Query Smells
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Type**: {N+1 | SQL injection | Query in loop | ...}
-**Current**: {what the code does now}
-**Impact**: {performance/security/correctness impact}
-**Fix**: {concrete solution with code example}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Type | Impact | Fix |
 |---|----------|-----------|------|--------|-----|

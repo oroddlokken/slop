@@ -137,22 +137,7 @@ Should use: `get_or_create()` with a unique constraint, or INSERT ... ON CONFLIC
 
 ## Output Format
 
-After scanning, output:
-
-```
-## ORM Anti-patterns
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Pattern**: {SELECT *, bulk in loop, wrong loading, count vs exists, etc.}
-**ORM**: {Django ORM / SQLAlchemy / Prisma / etc.}
-**Current**: {what the code does}
-**Impact**: {performance, memory, race condition, readability}
-**Fix**: {specific ORM method to use instead}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Pattern | ORM | Fix |
 |---|----------|-----------|---------|-----|-----|

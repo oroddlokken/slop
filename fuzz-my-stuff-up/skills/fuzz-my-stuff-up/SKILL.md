@@ -5,12 +5,17 @@ args:
   - name: area
     description: The directory, feature, or component to fuzz (optional)
     required: false
-user-invokable: true
+user-invocable: true
 ---
 
 # Fuzz My Stuff Up
 
 Launch ~20 parallel adversarial agents, each trying to break the codebase from a different angle — like fuzzing but with reasoning. Each agent thinks like an attacker, a confused user, a hostile environment, or an edge-case machine. Then distill all findings into prioritized action points.
+
+## Who Does What
+
+- **Orchestrator** (you, the main Claude Code session): Runs Steps 1-6 — asks user questions, prescans the codebase, launches fuzzer agents, distills findings.
+- **Fuzzer agents** (spawned subagents): Receive a read-only snapshot, attack from one angle, return findings. They do not scan independently, modify code, or interact with live systems.
 
 ## Rules
 
@@ -25,7 +30,7 @@ Launch ~20 parallel adversarial agents, each trying to break the codebase from a
 
 Ask the user which mode they want:
 
-- **Full** — Run all 20 fuzzers in parallel, then distill (empty-inputs, boundary-values, type-confusion, unicode-chaos, concurrency, path-traversal, injection, state-machine, resource-exhaustion, time-travel, permission-escalation, malformed-input, network-failure, config-chaos, dependency-failure, locale-chaos, filesystem-edge, api-abuse, upgrade-path, adversarial-user). Maximum chaos.
+- **Full** — Run all 20 fuzzers, then distill (empty-inputs, boundary-values, type-confusion, unicode-chaos, concurrency, path-traversal, injection, state-machine, resource-exhaustion, time-travel, permission-escalation, malformed-input, network-failure, config-chaos, dependency-failure, locale-chaos, filesystem-edge, api-abuse, upgrade-path, adversarial-user). Maximum chaos.
 - **Quick** — Run 7 high-impact fuzzers (empty-inputs, type-confusion, injection, state-machine, malformed-input, api-abuse, adversarial-user), then distill. Faster.
 - **Pick** — Let the user choose which fuzzers to run.
 
@@ -55,6 +60,17 @@ Available fuzzers:
 | adversarial-user | Intentionally hostile inputs, CSRF scenarios, replay attacks, parameter tampering |
 
 Default to **Full** if the user doesn't specify.
+
+**Why fuzzers share one methodology:** Unlike the sibling review skills (dba, accountant, codehealth), which give each lens its own criteria file, the fuzzers intentionally share a single generic attack methodology defined in `fuzzer-agent.md` rather than per-fuzzer criteria files — fuzzing is open-ended, and a fixed checklist would narrow it. Each fuzzer differs only by its attack angle. Ground every finding in the actual snapshot code with a concrete, reproducible scenario — never a hypothetical.
+
+### Severity Definitions (all fuzzers)
+
+- **Critical**: Security vulnerability, data loss, or crash triggerable with user-supplied input
+- **High**: Incorrect behavior, silent data corruption, or denial of service
+- **Medium**: Edge case that produces wrong results or confusing errors
+- **Low**: Unusual behavior that's unlikely but worth hardening against
+
+Individual fuzzers report findings against these levels (see the severity guide in `fuzzer-agent.md`). When the distill step resolves cross-fuzzer conflicts, use these universal definitions as the baseline. During distillation, easy exploitability bumps a finding up one tier, and any fuzzer-reported "Critical" that requires implausible conditions or is already fully mitigated is remapped to "High" before tier assignment. See distill.md for the full mapping algorithm.
 
 ### Scope Boundaries
 

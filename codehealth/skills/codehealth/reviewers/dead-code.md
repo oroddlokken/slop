@@ -1,5 +1,4 @@
 # Find Dead Code
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for code that's no longer used, reachable, or needed. Dead code adds confusion, increases maintenance burden, and makes the codebase harder to navigate.
 
@@ -86,32 +85,7 @@ Note: Dead code is never "Critical" severity — it's not causing bugs (by defin
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Dead Code Found
-
-### {Type}: {short description}
-
-**Location**: `{file}:{line}` (or `{file}` for orphaned files)
-**Confidence**: {High | Medium | Low}
-**Last modified**: {date from git blame, if available}
-**Action**: {Delete | Investigate | Remove comment}
-**Why it's dead**: {how you determined it's unused}
-```
-
-End with a summary:
-
-```
-## Summary
-- **{N} unused functions** — safe to delete
-- **{N} commented-out blocks** — {total lines} lines of dead comments
-- **{N} orphaned files** — not imported by anything
-- **{N} dead imports** — imported but never used
-- **{N} uncertain** — might be used dynamically, investigate
-```
-
-And a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Type | Confidence | Action |
 |---|----------|-----------|------|------------|--------|

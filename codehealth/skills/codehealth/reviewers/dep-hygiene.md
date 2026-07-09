@@ -1,5 +1,4 @@
 # Find Dependency Issues
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for dependency problems — unused packages, unnecessary imports, outdated deps, and heavyweight libraries used for trivial tasks.
 
@@ -76,28 +75,7 @@ For each dependency issue:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Dependency Issues
-
-### Package-Level Issues
-
-#### {Severity}: {short description}
-**Package**: `{package_name}`
-**Declared in**: `{manifest_file}`
-**Used in**: {list of files that import it, or "nowhere"}
-**Suggestion**: {Remove | Replace with X | Update}
-**Impact**: {what you gain}
-
-### File-Level Import Issues
-
-#### {file_path}
-- Line {N}: `import {X}` — unused in this file
-- Line {N}: `from {X} import {Y}` — {Y} never referenced
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | Location | Type | Package | Suggestion |
 |---|----------|----------|------|---------|-----------|

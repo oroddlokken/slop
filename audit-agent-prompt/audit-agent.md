@@ -79,7 +79,7 @@ Before assembling the output, check each draft finding against these filters —
 After working through all lenses:
 
 1. **Deduplicate.** The same text often violates multiple lenses. Merge into one finding and list every lens that flagged it.
-   *Worked example*: "NEVER mention competitors" fails Lens 1 (Framing — activates the forbidden topic) and Lens 12 (Guardrails — prohibition without positive guidance). Merge into one finding, `Flagged by: Lens 1 (Framing), Lens 12 (Guardrails)`, and propose the positive rewrite once.
+   *Worked example*: "NEVER mention competitors" fails Framing (activates the forbidden topic) and Guardrails (prohibition without positive guidance). Merge into one finding, `Flagged by: Framing, Guardrails`, and propose the positive rewrite once.
 2. **Classify** each finding:
    - **Remove** — platitudes, redundancies, rules restating base-model defaults
    - **Rewrite** — weak language, negative framing, bare rules without reasoning, weasel phrases

@@ -105,21 +105,7 @@ engine = create_engine("postgresql://user:password@localhost/mydb")
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Connection Management
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Issue**: {no pool / leak / wrong pool size / module-level / no timeout}
-**Current**: {what the code does now}
-**Risk**: {pool exhaustion, connection storm, thread safety, hang}
-**Fix**: {use pool, add context manager, increase pool_size, add timeout, etc.}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Issue | Risk | Fix |
 |---|----------|-----------|-------|------|-----|

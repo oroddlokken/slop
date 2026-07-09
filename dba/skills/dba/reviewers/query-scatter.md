@@ -77,21 +77,7 @@ All database access is inline — no dedicated module, class, or layer for data 
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Query Scatter
-
-### {Severity}: {short description}
-
-**Locations**: `{file1}:{line}`, `{file2}:{line}`, ...
-**Pattern**: {duplication / wrong layer / mixed style}
-**Table(s)**: {which tables are affected}
-**Impact**: {maintenance burden, inconsistency risk, testability}
-**Fix**: {extract to repository/service, consolidate queries, standardize on ORM or raw}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | Files | Pattern | Table | Fix |
 |---|----------|-------|---------|-------|-----|

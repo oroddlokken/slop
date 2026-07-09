@@ -1,8 +1,8 @@
-## Error Paths
+# Error Paths
 
 Find failure modes that are untested — what happens when things go wrong?
 
-### What to Look For
+## What to Look For
 
 1. **Network failure handling**: HTTP calls without tests for timeout, connection refused, DNS failure, partial response
 2. **Invalid input responses**: Functions accepting user input with no test for malformed, missing, or oversized input
@@ -15,21 +15,21 @@ Find failure modes that are untested — what happens when things go wrong?
 9. **Timeout behavior**: Long-running operations with no test for timeout boundary
 10. **Concurrent modification**: Two operations on the same resource — is the conflict tested?
 
-### How to Evaluate
+## How to Evaluate
 
 For each untested error path:
 - What does the user see when this fails in production? (crash, hang, wrong data, cryptic error?)
 - How often could this realistically happen?
 - Is the error path handled in code but never verified by tests, or completely unhandled?
 
-### Severity Guide
+## Severity Guide
 
 - **Critical**: Auth or payment error paths untested
 - **High**: External service failures untested for core features
 - **Medium**: File/database errors untested for secondary features
 - **Low**: Edge-case failures unlikely in normal operation
 
-### Output Format
+## Output Format
 
 | # | Severity | File:Line | Issue | What to Test | Suggestion |
 |---|----------|-----------|-------|-------------|------------|

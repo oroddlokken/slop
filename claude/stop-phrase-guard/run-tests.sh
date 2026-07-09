@@ -7,29 +7,25 @@ pass=0
 fail=0
 
 check() {
-  local label="$1" file="$2" expect_block="$3"
+  local label="$1" file="$2" expect_warn="$3"
   local out rc
   out=$($GUARD < "$file" 2>&1) && rc=$? || rc=$?
 
-  local got_block="false"
+  local got_warn="false"
   local detail=""
-  if [ -n "$out" ] && jq -e '.decision' <<< "$out" >/dev/null 2>&1; then
-    local decision
-    decision=$(jq -r '.decision' <<< "$out")
-    if [ "$decision" = "block" ]; then
-      got_block="true"
-      detail=$(jq -r '.reason // ""' <<< "$out")
-    fi
+  if [ -n "$out" ] && jq -e '.systemMessage' <<< "$out" >/dev/null 2>&1; then
+    got_warn="true"
+    detail=$(jq -r '.systemMessage // ""' <<< "$out")
   fi
 
   local status reason_ok="true"
-  # When blocking, the reason must surface the matched regex so false
+  # When warning, the message must surface the matched regex so false
   # positives can be identified and tuned.
-  if [ "$got_block" = "true" ] && ! grep -q '\[matched: ' <<< "$detail"; then
+  if [ "$got_warn" = "true" ] && ! grep -q '\[matched: ' <<< "$detail"; then
     reason_ok="false"
   fi
 
-  if [ "$expect_block" = "$got_block" ] && [ "$reason_ok" = "true" ]; then
+  if [ "$expect_warn" = "$got_warn" ] && [ "$reason_ok" = "true" ]; then
     pass=$((pass + 1))
     status="PASS"
   else
@@ -37,13 +33,13 @@ check() {
     status="FAIL"
   fi
 
-  printf "%-4s %-40s expect=%-5s got=%-5s %s\n" "$status" "$label" "$expect_block" "$got_block" "$detail"
+  printf "%-4s %-40s expect=%-5s got=%-5s %s\n" "$status" "$label" "$expect_warn" "$got_warn" "$detail"
 }
 
 # -- Original regression tests --
 check "clean_message"               $DIR/test_clean.json              false
 check "ownership_dodge"             $DIR/test_violation.json          true
-check "loop_guard"                  $DIR/test_loop_guard.json         false
+check "stop_hook_active_still_warns" $DIR/test_loop_guard.json        true
 check "session_quit_combo"          $DIR/test_session_quit.json       true
 check "empty_message"               $DIR/test_empty.json              false
 

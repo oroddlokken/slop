@@ -13,7 +13,7 @@ Read broadly — the goal is to capture enough code across all languages so agen
 5. Read key source files across all in-scope languages, focusing on: input parsing/validation, data transformation, error handling, config loading, external service integrations, auth/authz logic
 6. Use these patterns to identify files worth including in the snapshot: `eval(`, `innerHTML`, `dangerouslySetInnerHTML`, `unwrap()`, bare `except:`, `subprocess` with `shell=True`, `os.system(`. The fuzzer agents evaluate attack surface.
 7. Check for existing validation: schemas, validators, type guards, assert statements, middleware
-8. Run `git log --oneline -15`
+8. Run `git log --oneline -20`
 
 {focus}
 

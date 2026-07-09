@@ -5,12 +5,17 @@ args:
   - name: area
     description: The directory or area to review (optional)
     required: false
-user-invokable: true
+user-invocable: true
 ---
 
 # Test My Tests
 
 Launch parallel test-quality agents, each analyzing the test suite through a different lens, then distill all findings into unified, prioritized action points. Goes beyond "do tests exist?" to ask "do these tests actually catch real bugs?"
+
+## Who Does What
+
+- **Orchestrator** (you, the main Claude Code session): Runs Steps 1-4 — asks user questions, prescans source and test code, launches reviewer agents, distills findings.
+- **Reviewer agents** (spawned subagents): Receive a read-only snapshot, analyze the test suite through one lens, return findings. They do not scan independently, modify code, or interact with live systems.
 
 ## Rules
 
@@ -35,6 +40,8 @@ Ask the user which mode they want:
 - **High**: Missing test for a complex user flow or important error path
 - **Medium**: Existing test with significant quality gaps (weak assertions, unrealistic data)
 - **Low**: Minor test improvement that would increase confidence
+
+Individual reviewers map their findings to these levels in their Severity Guide section. When the distill step resolves cross-reviewer conflicts, use these universal definitions as the baseline. During distillation, any reviewer-reported "Critical" that is only a minor test-quality gap (not an untested path risking data loss, security bypass, or financial impact) is remapped to "High" before tier assignment. See distill.md for the full mapping algorithm.
 
 Available reviewers:
 
@@ -148,7 +155,7 @@ If the user doesn't specify, use **Sequential**.
 **For each reviewer, resolve per-agent content:**
 1. In the resolved template, replace `{reviewer}` with the reviewer name (e.g., `coverage-gaps`)
 2. Read `reviewers/{reviewer}.md`. If the file does not exist, skip that reviewer and warn the user. Replace `{reviewer_criteria}` with the file contents.
-3. For overlapping reviewers (coverage-gaps/happy-path-only, error-paths/boundary-values, assertion-quality/happy-path-only, mock-debt/fragile-tests, data-realism/boundary-values), append the relevant scope boundary rule from the Scope Boundaries section **after** `{reviewer_criteria}` (below `---`).
+3. For overlapping reviewers (see Scope Boundaries), append the relevant scope boundary rule from the Scope Boundaries section **after** `{reviewer_criteria}` (below `---`).
 4. Pass the result as the agent prompt
 
 **Focus block** (inserted when focus is set — replace `{area}` with the user's focus area):

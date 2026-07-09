@@ -1,5 +1,4 @@
 # Find Naming Inconsistencies
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for naming problems that make code harder to navigate, understand, and maintain. Good names are the cheapest documentation.
 
@@ -76,23 +75,7 @@ For each naming issue:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Naming Issues
-
-### Systemic: {pattern description}
-
-**Type**: {Mixed convention | Inconsistent terminology | ...}
-**Examples**:
-- `{file_1}:{line}` uses `{name_a}`
-- `{file_2}:{line}` uses `{name_b}`
-- `{file_3}:{line}` uses `{name_c}`
-**Standardize on**: `{recommended_name}` because {reason}
-**Scope**: {N files would need updating}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Type | Current | Suggested |
 |---|----------|-----------|------|---------|-----------|

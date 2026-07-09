@@ -278,7 +278,7 @@ Quick test: read the prompt as if you had never seen the product. Any sentence w
 
 ## Reasoning Models
 
-On reasoning-capable models (Claude Opus 4.7 extended thinking, o3, DeepSeek R1, Gemini thinking): skip meta-instructions like "think step by step" (native to the trace), minimize few-shot on reasoning-heavy tasks (anchors the trace and suppresses exploration), avoid prescribed reasoning structure (degrades native strategy), and constrain only the final-answer format — leave the reasoning trace free. These caveats don't apply to classification, extraction, or grounded QA.
+On reasoning-capable models (Claude with extended thinking, o3, DeepSeek R1, Gemini thinking): skip meta-instructions like "think step by step" (native to the trace), minimize few-shot on reasoning-heavy tasks (anchors the trace and suppresses exploration), avoid prescribed reasoning structure (degrades native strategy), and constrain only the final-answer format — leave the reasoning trace free. These caveats don't apply to classification, extraction, or grounded QA.
 
 ## Self-Verification Without a Test Suite
 

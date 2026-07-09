@@ -1,16 +1,21 @@
 ---
 name: codehealth
-description: "Meta code quality review. Spins up parallel agents — each reviewing through a different lens (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, dead-code, naming, dep-hygiene, test-gaps, type-structs) — then distills all findings into prioritized action points."
+description: "Meta code quality review. Spins up parallel agents — each reviewing through a different lens (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs) — then distills all findings into prioritized action points."
 args:
   - name: area
     description: The directory or area to review (optional)
     required: false
-user-invokable: true
+user-invocable: true
 ---
 
 # Code Health
 
 Launch parallel code-quality agents, each analyzing the codebase through a different lens, then distill all findings into unified, prioritized action points.
+
+## Who Does What
+
+- **Orchestrator** (you, the main Claude Code session): Runs Steps 1-4 — asks user questions, prescans the codebase, launches reviewer agents, distills findings.
+- **Reviewer agents** (spawned subagents): Receive a read-only snapshot, analyze through one lens, return findings. They do not scan independently, modify code, or interact with live systems.
 
 ## Rules
 
@@ -24,7 +29,7 @@ Launch parallel code-quality agents, each analyzing the codebase through a diffe
 
 Ask the user which mode they want:
 
-- **Full** — Run all 12 reviewers in parallel, then distill (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, dead-code, naming, dep-hygiene, test-gaps, type-structs).
+- **Full** — Run all 13 reviewers, then distill (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs).
 - **Quick** — Run 5 high-risk reviewers (duplicates, complexity, error-gaps, hardcoded, type-structs), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
@@ -35,7 +40,7 @@ Ask the user which mode they want:
 - **Medium**: Technical debt, code clarity issues, moderate maintenance cost
 - **Low**: Minor improvements, style consistency, nice-to-haves
 
-Individual skills map their findings to these levels in their Severity Guide section. Reviewers may refine these levels for their domain — when the distill step resolves cross-reviewer conflicts, use these universal definitions as the baseline. A reviewer-specific "Critical" that doesn't involve security or data loss maps to "High" in the final output.
+Individual reviewers map their findings to these levels in their Severity Guide section. Reviewers may refine these levels for their domain — when the distill step resolves cross-reviewer conflicts, use these universal definitions as the baseline. During distillation, any reviewer-reported "Critical" that involves only maintainability or style (not security, data loss, or financial impact) is remapped to "High" before tier assignment. See distill.md for the full mapping algorithm.
 
 Available reviewers:
 
@@ -48,6 +53,7 @@ Available reviewers:
 | error-gaps | Missing, swallowed, or inconsistent error handling |
 | complexity | Long functions, deep nesting, high branching |
 | query-smells | N+1 queries, raw SQL in loops, missing parameterization |
+| caching | Stale/leaky caches, unbounded growth, missing invalidation or memoization |
 | dead-code | Unused functions, unreachable branches, dead routes |
 | naming | Inconsistent naming conventions, ambiguous identifiers |
 | dep-hygiene | Unused imports, unnecessary dependencies, outdated deps |
@@ -60,6 +66,7 @@ If the user does not specify a mode, run Full mode automatically.
 
 Some reviewers examine similar code from different angles. When findings overlap:
 - **query-smells** owns all database findings (N+1, SQL injection, scattered queries). extract-logic defers to query-smells for database issues.
+- **caching** owns the cache layer (key correctness, invalidation, eviction, leaks, missing memoization). **query-smells** owns the query underneath. When a query result is cached, query-smells flags the query; caching flags the cache around it. If a finding is purely about the SQL, caching defers to query-smells.
 - **dep-hygiene** owns package-level dependency issues (unused entries in manifests). dead-code owns file-level unused imports.
 - **complexity** targets mechanical metrics (length, nesting, branches). extract-logic targets logical boundaries (multi-step operations in wrong layer). Both may flag the same long function — complexity measures the shape, extract-logic measures responsibility.
 - **duplicates** flags copied code. extract-logic flags inline operations. If code is both duplicated AND inline, duplicates takes precedence.
@@ -131,7 +138,7 @@ The 1-hour TTL matches Anthropic's prompt-cache window — `/dba` followed by `/
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 
-Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 12 agents each independently scanning the same files.
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 13 agents each independently scanning the same files.
 
 1. Replace `{languages}` and `{focus}` in `scan-steps.md`
 2. Follow the scan procedure — read manifests, source files, CI/CD, git log, etc.
@@ -166,7 +173,7 @@ If the user doesn't specify, use **Sequential**.
 **For each reviewer, resolve per-agent content:**
 1. In the resolved template, replace `{reviewer}` with the reviewer name (e.g., `duplicates`)
 2. Read `reviewers/{reviewer}.md`. If the file does not exist, skip that reviewer and warn the user. Replace `{reviewer_criteria}` with the file contents.
-3. For overlapping reviewers (duplicates/extract-logic, complexity/extract-logic, query-smells/extract-logic, dep-hygiene/dead-code), append the relevant scope boundary rule from the Scope Boundaries section **after** `{reviewer_criteria}` (below `---`).
+3. For overlapping reviewers (see Scope Boundaries), append the relevant scope boundary rule from the Scope Boundaries section **after** `{reviewer_criteria}` (below `---`).
 4. Pass the result as the agent prompt
 
 **Focus block** (inserted when focus is set):
@@ -178,7 +185,7 @@ Concentrate your analysis primarily on **{area}**. During the scan, go deeper on
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reviewer criteria files** are in this skill's `reviewers/` directory: `duplicates.md`, `extract-logic.md`, `simplify-code.md`, `hardcoded.md`, `error-gaps.md`, `complexity.md`, `query-smells.md`, `dead-code.md`, `naming.md`, `dep-hygiene.md`, `test-gaps.md`, `type-structs.md`.
+**Reviewer criteria files** are in this skill's `reviewers/` directory: `duplicates.md`, `extract-logic.md`, `simplify-code.md`, `hardcoded.md`, `error-gaps.md`, `complexity.md`, `query-smells.md`, `caching.md`, `dead-code.md`, `naming.md`, `dep-hygiene.md`, `test-gaps.md`, `type-structs.md`.
 
 ### Step 4: Distill
 

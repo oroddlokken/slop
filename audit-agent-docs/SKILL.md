@@ -1,6 +1,6 @@
 ---
 name: audit-agent-docs
-description: "Audit agent-facing documentation (CLAUDE.md, AGENTS.md, copilot-instructions.md) for redundancies, contradictions, gaps, and misplaced content. Supports Claude Code, OpenAI Codex, and GitHub Copilot. Use when the user wants to review or improve their agent instructions."
+description: "Audit agent-facing documentation (CLAUDE.md, AGENTS.md, copilot-instructions.md) for redundancies, contradictions, gaps, and misplaced content. Supports Claude Code, OpenAI Codex, and GitHub Copilot. For a general agent's system prompt, persona, or tool descriptions (not repo docs), use audit-agent-prompt. Use when the user wants to review or improve their agent instructions."
 ---
 
 # Audit Docs
@@ -16,6 +16,8 @@ This skill performs no file modifications or state changes. Every finding is a p
 **In scope**: agent-facing documentation files inside the project root — CLAUDE.md, AGENTS.md, copilot-instructions.md, `.claude/rules/`, `.claude/agents/`, `.claude/skills/`, `.cursorrules`, and files imported by those via `@` references.
 
 **Out of scope** — if the target appears to be something other than agent-facing docs (a GitHub PR template, CI/CD config, source code documentation for humans), confirm with the user: "This doesn't look like agent-facing documentation. Do you still want me to audit it as one?" Then stop and wait.
+
+**`.claude/agents/` boundary**: this skill owns the frontmatter and wiring of `.claude/agents/*.md` files — the `description` field and tool scoping (`tools`/`disallowedTools`). The prompt prose inside those files belongs to `audit-agent-prompt`.
 
 ## Definitions
 
@@ -227,6 +229,7 @@ After all agents complete, analyze the combined output:
 
 #### {Remove|Move|Rewrite|Add}: {title}
 **Flagged by**: {lens names}
+**Severity**: {Critical|High|Medium|Low}
 **Current** (lines N-M):
 > {quoted text}
 **Proposed**:
@@ -235,7 +238,15 @@ After all agents complete, analyze the combined output:
 
 ---
 
-### Summary
+### Findings Summary
+
+| # | Severity | File:Lines | Issue | Category | Flagged by | Proposed Fix |
+|---|----------|-----------|-------|----------|-----------|-------------|
+| 1 | High | path:N-M | description | Remove/Move/Rewrite/Add | lenses | what to change |
+
+Severity scale: Critical, High, Medium, Low. Sort rows by file, then by starting line. Every finding gets a row.
+
+### Counts
 - {N} redundancies to remove
 - {N} contradictions to fix
 - {N} rewrites for clarity
@@ -254,6 +265,7 @@ After all agents complete, analyze the combined output:
 
 #### Rewrite: "handle errors gracefully" is unmeasurable
 **Flagged by**: Actionability, Hygiene
+**Severity**: Medium
 **Current** (lines 45-47):
 > Always handle errors gracefully. Use best judgment for recovery strategies.
 **Proposed**:
@@ -273,7 +285,7 @@ Before presenting the distilled report to the user, check:
 
 If any of the above fails, fix it before returning the report. Do not ship a half-formed audit.
 
-5. After outputting, ask the user: "Want me to apply these changes?"
+After the checks pass, present the report and ask the user: "Want me to apply these changes?"
 
 **If the user declines**, offer: "Would you like to adjust the scope or pick a subset of lenses and re-run, or drop the audit?" Do not re-apply changes, do not re-run silently, and do not nag. The report stays in the conversation for reference.
 

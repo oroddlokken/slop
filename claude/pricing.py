@@ -91,7 +91,7 @@ def _local_tz() -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-06-09"
+LAST_CHECKED = "2026-07-02"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -179,19 +179,23 @@ PRICING_HISTORY: list[dict[str, Any]] = [
     {
         # Fable 5 first seen 2026-06-08. $10/$50 per MTok, cache write
         # 1.25x input og cache read 0.1x input (standard Anthropic-ratio).
+        # Mythos 5 (Project Glasswing only) matches Fable 5 pricing exactly.
         "effective": "2026-06-08",
         "models": {
             "claude-fable-5": {
                 "input": 10e-06, "output": 50e-06,
                 "cache_create": 12.5e-06, "cache_read": 1e-06,
             },
+            "claude-mythos-5": {
+                "input": 10e-06, "output": 50e-06,
+                "cache_create": 12.5e-06, "cache_read": 1e-06,
+            },
         },
     },
     {
-        # Sonnet 5 first seen 2026-06-30, on introductory pricing ($2/$10 per
-        # MTok) through 2026-08-31. Cache rates derived from the standard
-        # Anthropic ratios: write 1.25x input, read 0.1x input.
-        "effective": "2026-06-30",
+        # Sonnet 5 introductory pricing, $2/$10 per MTok through 2026-08-31.
+        # Release date unknown; 2026-06-01 covers all current records.
+        "effective": "2026-06-01",
         "models": {
             "claude-sonnet-5": {
                 "input": 2e-06, "output": 10e-06,
@@ -200,7 +204,7 @@ PRICING_HISTORY: list[dict[str, Any]] = [
         },
     },
     {
-        # Sonnet 5 introductory period ends 2026-08-31; list price takes over.
+        # Sonnet 5 standard pricing, $3/$15 per MTok, after intro window ends.
         "effective": "2026-09-01",
         "models": {
             "claude-sonnet-5": {

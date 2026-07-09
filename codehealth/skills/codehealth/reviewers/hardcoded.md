@@ -1,6 +1,5 @@
 
 # Find Hardcoded Values
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for magic strings, numbers, URLs, credentials, and thresholds that should be extracted to configuration, environment variables, or constants.
 
@@ -84,21 +83,7 @@ For each hardcoded value:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Hardcoded Values Found
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Value**: `{value or [REDACTED] for secrets}`
-**Type**: {Credential | URL | Magic number | Magic string | Env-specific}
-**Extract to**: {env var `FOO_BAR` | config `settings.timeout` | constant `MAX_RETRIES`}
-**Risk**: {what happens when this needs to change}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Value | Type | Extract To |
 |---|----------|-----------|-------|------|-----------|

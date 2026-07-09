@@ -31,6 +31,8 @@ This skill is LLM-agnostic. For coding-agent docs (CLAUDE.md, AGENTS.md) use `au
 - CLAUDE.md / AGENTS.md / copilot-instructions.md / coding-agent framework docs → `audit-agent-docs`
 - SDK wiring, prompt caching, tool-use runtime mechanics → `claude-api`
 
+**`.claude/agents/` boundary**: this skill owns the prompt prose inside `.claude/agents/*.md` files. Their frontmatter and wiring — the `description` field and tool scoping (`tools`/`disallowedTools`) — belong to `audit-agent-docs`.
+
 ## Lenses
 
 Each lens is a specific critical angle. The user picks a scope (standard, full, or a named subset) and all selected lenses are bundled into a single sub-agent prompt, applied in one pass.
@@ -65,6 +67,8 @@ Each lens is a specific critical angle. The user picks a scope (standard, full, 
 4. **Platitudes & Defaults** — Find rules that restate base-model behavior: "be polite", "answer the user's question", "don't be offensive", "use proper grammar", "be accurate". Apply this test to every rule: *if inserting "not" somewhere would leave the rule still generally true of a base model, it's a platitude.* Delete platitudes — they carry zero information density. Every rule competes with every other rule for attention budget; there is no free rule.
 
 5. **Redundancy & Brevity** — Find duplicated rules across sections, count total rules, and flag critical rules buried in the 40-60% zone of prompts >= 20 lines (LLMs pay less attention to the middle of long documents). A rule is **critical** if: (a) it forbids a high-risk action (destructive tool calls, PII disclosure, irreversible state change), OR (b) it is referenced or relied on by other rules in the prompt. Recommend consolidation of duplicates and relocation of critical rules to the top or bottom.
+
+   Also check **input delimiting**: are user input, retrieved documents, few-shot examples, and output schemas wrapped in semantic tags (e.g. `<user_input>`, `<document>`, `<example>`, `<output_schema>`), or do they run together with instructions in prose where the model can't tell instruction from data? Flag undelimited inputs, examples, and schemas and propose a wrapping tag.
 
 6. **Contradictions** — Flag intra-prompt conflicts between sections (e.g., persona says "be brief", output shape says "explain thoroughly"). Pay special attention to **examples contradicting rules** — when examples drift from written rules, the examples win silently. For each: quote both passages, explain the conflict, recommend which wins.
 
@@ -113,6 +117,8 @@ Each lens is a specific critical angle. The user picks a scope (standard, full, 
 
     A rule with all three is dense with closed loopholes; a rule with only positive framing is the floor. This lens measures the ceiling. For each finding: quote the rule, note which of the three moves are missing, and propose what to add (using the harvest procedures above).
 
+    **Also flag over-hardening.** Hardening costs attention budget and signals importance, so it must be rare to catch the eye — a prompt where every rule carries loophole enumerations, rationalization tables, and Red Flags is bloat, and the signal is lost. Flag hardening applied to rules that aren't load-bearing (no observed cost when they slip), and recommend stripping it back to plain positive framing or cutting the rule.
+
 ### Full Lenses (add to core)
 
 14. **Source Hierarchy** — When the agent has multiple sources (knowledge base, training, retrieved docs, current user message), is there an explicit priority rule? Without it, the agent silently picks one and you can't predict which. Example of a good rule:
@@ -146,7 +152,7 @@ Each lens is a specific critical angle. The user picks a scope (standard, full, 
 
 19. **Cold Start** — Pretend to be a fresh LLM with zero context outside the prompt. What assumptions does the prompt make? (Product knowledge, jargon, workflow steps, user profile fields, tool semantics.) Flag anything the prompt references but doesn't define. Agents without this context hallucinate definitions or fail silently; undefined references are a common source of behavior that looks random to users.
 
-20. **Reasoning-Model Fit** — If the target prompt deploys on a reasoning-capable model (Claude Opus 4.7 extended thinking, o3, DeepSeek R1, Gemini thinking), flag patterns that degrade on these models:
+20. **Reasoning-Model Fit** — If the target prompt deploys on a reasoning-capable model (Claude with extended thinking, o3, DeepSeek R1, Gemini thinking), flag patterns that degrade on these models:
     - Redundant meta-instructions ("think step by step", "reason carefully") — native to the thinking trace; compete with it.
     - Heavy few-shot blocks on reasoning-heavy tasks — anchor the trace and suppress exploration.
     - Prescribed reasoning structure ("first analyze X, then Y") — often beats the model's native strategy in the wrong direction.
@@ -188,9 +194,9 @@ Use the user's target as the scope root. Only discover files that exist on disk 
 
 **2c. Fallback — ask the user**: If auto-discovery finds no plausible prompt files, list every `.md`, `.txt`, `.yaml`, `.yml`, `.json` file in the target path (up to ~20) and ask the user to label which file is which component (system prompt / tool descriptions / examples / guardrails / other / skip). Skip files labeled "other" or "skip".
 
-**2c. Extract embedded prompts**: If a discovered config file has a string value under `system:` / `system_prompt:` / `instructions:` / `prompt:` / `persona:`, extract the string and treat it as a system prompt, recording its origin (`config.yaml → system_prompt`).
+**2d. Extract embedded prompts**: If a discovered config file has a string value under `system:` / `system_prompt:` / `instructions:` / `prompt:` / `persona:`, extract the string and treat it as a system prompt, recording its origin (`config.yaml → system_prompt`).
 
-**2d. Report the snapshot** — before launching the agent, list what was discovered, with filename + classification + line count. Example:
+**2e. Report the snapshot** — before launching the agent, list what was discovered, with filename + classification + line count. Example:
 
 > Discovered:
 > - `prompt.md` — system prompt (134 lines)
@@ -209,7 +215,7 @@ Spawn a single sub-agent (`subagent_type: "Explore"`) that applies all selected 
 1. Read `audit-agent.md` from this skill's directory.
 2. Replace `{prompt_snapshot}` with all discovered files (paths + line-numbered contents).
 3. Replace `{path}` with the target root.
-4. Replace `{discovered_components}` with the Step 2d report.
+4. Replace `{discovered_components}` with the Step 2e report.
 5. Build the `{lenses}` block by concatenating the instructions for each selected lens from the Lenses section above. Format each lens as:
 
     ```

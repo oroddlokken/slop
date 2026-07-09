@@ -1,11 +1,8 @@
 #!/bin/bash
 # Stop hook: catches ownership-dodging and session-quitting phrases that
-# violate CLAUDE.md golden rules. When triggered, blocks the assistant from
-# stopping and forces it to go back and do the work properly.
-#
-# The assistant's message has already been shown to the user by the time this
-# runs, but the assistant is forced to continue — so the correction appears
-# immediately after the violation, which is visible and self-documenting.
+# violate CLAUDE.md golden rules. When triggered, surfaces a soft warning
+# to the user via systemMessage — non-blocking, so the assistant is allowed
+# to stop, but the matched rule is visible for review and tuning.
 
 set -euo pipefail
 
@@ -16,14 +13,6 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 INPUT=$(cat)
-
-# Prevent infinite loops: if the hook already fired once this turn, let
-# the assistant stop. The correction message from the first firing is
-# enough — we don't want to trap the assistant in an endless cycle.
-HOOK_ACTIVE=$(jq -r '.stop_hook_active // false' <<< "$INPUT")
-if [[ "$HOOK_ACTIVE" == "true" ]]; then
-  exit 0
-fi
 
 MESSAGE=$(jq -r '.last_assistant_message // empty' <<< "$INPUT")
 if [[ -z "$MESSAGE" ]]; then
@@ -176,15 +165,13 @@ for entry in "${VIOLATIONS[@]}"; do
       && LC_ALL=C grep -iqE "${pattern}.*(${PERMISSION_ESCAPE_RE})" <<< "$MESSAGE"; then
       continue
     fi
-    # Output JSON decision to stdout — Claude Code reads this and forces
-    # the assistant to continue with the reason as its next instruction.
-    # Surface the matched regex so the user can identify which rule fired
-    # (useful for tuning false positives).
+    # Emit a non-blocking systemMessage so the assistant is allowed to
+    # stop, but the user sees which rule fired (useful for tuning false
+    # positives). Surface the matched regex in the same format as before.
     jq -n \
-      --arg reason "STOP HOOK VIOLATION: $correction [matched: $pattern]" \
+      --arg msg "stop-phrase-guard: $correction [matched: $pattern]" \
       '{
-        decision: "block",
-        reason: $reason
+        systemMessage: $msg
       }'
     exit 0
   fi

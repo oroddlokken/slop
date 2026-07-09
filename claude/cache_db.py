@@ -252,19 +252,6 @@ def _run_migrations(conn: sqlite3.Connection) -> bool:
         conn.commit()
         ran = True
 
-    # Migration 4: Sonnet 5 had no pricing entry until 2026-07-09, so every
-    # cached cost covering a file touched since the model appeared
-    # (2026-06-30) counted its tokens as free. Clear those so they recompute.
-    # ccreport_records needs no fixup — its cost column is always NULL and
-    # recomputed from tokens on read.
-    if not _get_meta(conn, "migrated_sonnet_5_pricing"):
-        cutoff_ns = 1782777600000000000  # 2026-06-30T00:00 UTC in nanoseconds
-        conn.execute("DELETE FROM file_costs WHERE mtime_ns >= ?", (cutoff_ns,))
-        conn.execute("DELETE FROM session_costs")
-        conn.execute("DELETE FROM meta WHERE key IN ('cost_summary', 'cost_summary_time')")
-        _set_meta(conn, "migrated_sonnet_5_pricing", "1")
-        conn.commit()
-        ran = True
     return ran
 
 

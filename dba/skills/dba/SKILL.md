@@ -5,7 +5,7 @@ args:
   - name: area
     description: The directory or area to review (optional)
     required: false
-user-invokable: true
+user-invocable: true
 ---
 
 # SQL Health
@@ -195,7 +195,7 @@ If the user doesn't specify, use **Sequential**.
 **For each reviewer, resolve per-agent content:**
 1. In the resolved template, replace `{reviewer}` with the reviewer name (e.g., `injection`)
 2. Read `reviewers/{reviewer}.md`. If the file does not exist, skip that reviewer and warn the user. Replace `{reviewer_criteria}` with the file contents.
-3. For overlapping reviewers (injection/query-scatter, n-plus-one/orm-antipatterns, index-coverage/raw-perf, schema-drift/migration-safety, transaction-gaps/data-integrity, connection-mgmt/orm-antipatterns), append the relevant scope boundary rule from the Scope Boundaries section **after** `{reviewer_criteria}` (below `---`).
+3. For overlapping reviewers (see Scope Boundaries), append the relevant scope boundary rule from the Scope Boundaries section **after** `{reviewer_criteria}` (below `---`).
 4. Pass the result as the agent prompt
 
 **Focus block** (inserted when focus is set):

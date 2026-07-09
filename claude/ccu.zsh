@@ -93,7 +93,7 @@ ccu_bar() {
   printf '\033[0;32m'
   (( filled > 0 )) && printf '%.0s█' {1..$filled}
   printf '\033[0;90m'
-  (( empty > 0 )) && printf '%.0s█' {1..$empty}
+  (( empty > 0 )) && printf '%.0s░' {1..$empty}
   printf '\033[0m'
 }
 

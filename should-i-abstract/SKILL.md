@@ -5,7 +5,7 @@ args:
   - name: area
     description: The directory or area to review (optional)
     required: false
-user-invokable: true
+user-invocable: true
 ---
 
 # Should I Abstract?

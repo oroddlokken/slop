@@ -78,21 +78,7 @@ The model declares one type, but the migration creates a different one:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Schema Drift
-
-### {Severity}: {short description}
-
-**Model**: `{file}:{line}` — {field definition}
-**Migration**: `{file}:{line}` — {column definition, or "missing"}
-**Drift**: {what doesn't match — type, constraint, existence, default}
-**Impact**: {crash, data loss, silent corruption, dead data}
-**Fix**: {generate migration, update model, add constraint, etc.}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | Model File:Line | Migration File:Line | Drift | Fix |
 |---|----------|----------------|--------------------|----|-----|

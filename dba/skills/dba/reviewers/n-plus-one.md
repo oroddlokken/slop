@@ -97,23 +97,7 @@ results = list(map(lambda u: fetch_orders(u.id), users))
 
 ## Output Format
 
-After scanning, output:
-
-```
-## N+1 Query Patterns
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Pattern**: {explicit loop query / lazy load / serializer / template}
-**Outer query**: {the collection query}
-**Inner query**: {the per-item query}
-**Scale**: {estimated N — how many items does the outer query return?}
-**Impact**: {N+1 queries per request, unbounded growth, etc.}
-**Fix**: {specific fix for the ORM — select_related, joinedload, JOIN, etc.}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Pattern | Scale | Fix |
 |---|----------|-----------|---------|-------|-----|

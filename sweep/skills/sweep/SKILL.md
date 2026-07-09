@@ -5,7 +5,7 @@ args:
   - name: area
     description: The feature, component, or path to review (optional)
     required: false
-user-invokable: true
+user-invocable: true
 ---
 
 # Sweep
@@ -107,7 +107,7 @@ Use a single agent template (`sweep-agent.md`). The template places shared conte
 
 **For each reviewer, resolve per-agent content:**
 1. In the resolved template, replace `{reviewer}` with the reviewer name (e.g., `audit`)
-2. Replace `{skill_path}` with the path to the existing skill's SKILL.md (e.g., `skills/audit/SKILL.md`)
+2. Replace `{skill_path}` with the path to the lens's reference file in the impeccable skill (e.g., `skills/impeccable/reference/audit.md`)
 3. Pass the result as the agent prompt
 
 **Focus block** (inserted when focus is set):
@@ -123,15 +123,15 @@ Other issues are still worth mentioning but give {area} roughly 3x the attention
 
 | Reviewer | Reads criteria from |
 |----------|-------------------|
-| audit | `skills/audit/SKILL.md` |
-| critique | `skills/critique/SKILL.md` |
-| harden | `skills/harden/SKILL.md` |
-| optimize | `skills/optimize/SKILL.md` |
-| polish | `skills/polish/SKILL.md` |
-| clarify | `skills/clarify/SKILL.md` |
-| layout | `skills/layout/SKILL.md` |
-| typeset | `skills/typeset/SKILL.md` |
-| colorize | `skills/colorize/SKILL.md` |
+| audit | `skills/impeccable/reference/audit.md` |
+| critique | `skills/impeccable/reference/critique.md` |
+| harden | `skills/impeccable/reference/harden.md` |
+| optimize | `skills/impeccable/reference/optimize.md` |
+| polish | `skills/impeccable/reference/polish.md` |
+| clarify | `skills/impeccable/reference/clarify.md` |
+| layout | `skills/impeccable/reference/layout.md` |
+| typeset | `skills/impeccable/reference/typeset.md` |
+| colorize | `skills/impeccable/reference/colorize.md` |
 
 All paths are relative to the skills directory.
 

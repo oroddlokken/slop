@@ -27,12 +27,12 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_GIT                     — branch + indicators
   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
   CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation)
-  CLAUDE_STATUSLINE_SESSION                 — model, context window %, I/O ratio
+  CLAUDE_STATUSLINE_SESSION                 — model, context window %
     CLAUDE_STATUSLINE_COST                  — session cost
-    CLAUDE_STATUSLINE_IO_RATIO              — output/input token ratio
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate %
   CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on 80% usable window (auto-compact threshold)
   CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon)
+  CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset)
   CLAUDE_STATUSLINE_PEAK                    — peak/off-peak indicator with countdown (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
@@ -87,6 +87,8 @@ from pricing import compute_costs, compute_project_rolling_costs, compute_sessio
 # Thresholds and layout constants
 TEMP_WARN_C = 75           # °C — yellow warning for CPU/GPU temp
 TEMP_CRIT_C = 90           # °C — red alert for CPU/GPU temp
+BATT_WARN_PCT = 40         # % — yellow warning when discharging
+BATT_CRIT_PCT = 20         # % — red alert when discharging
 STALE_THRESHOLD_S = 3600   # seconds before usage data is considered too old
 LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
 SESSION_WINDOW_MS = 900_000  # 15 min — active sessions lookback
@@ -331,6 +333,63 @@ def _render_macmon(data: dict) -> str:
     if not parts:
         return ""
     return " ".join(parts)
+
+
+# --- Battery (pmset) ---
+
+
+def _start_battery() -> subprocess.Popen[bytes] | None:
+    """Start pmset battery query as a non-blocking subprocess."""
+    if not _on("BATTERY"):
+        return None
+    try:
+        return subprocess.Popen(
+            ["pmset", "-g", "batt"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None
+
+
+_BATT_RE = re.compile(r"(\d+)%;\s*([\w ]+?);(?:\s*(\d+:\d+)\s+remaining)?")
+
+
+def _collect_battery(proc: subprocess.Popen[bytes] | None) -> dict:
+    """Parse pmset -g batt output into {pct, state, time}."""
+    if proc is None:
+        return {}
+    try:
+        out, _ = proc.communicate(timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        proc.kill()
+        return {}
+    if not out:
+        return {}
+    m = _BATT_RE.search(out.decode("utf-8", errors="replace"))
+    if not m:
+        return {}
+    return {"pct": int(m.group(1)), "state": m.group(2), "time": m.group(3) or ""}
+
+
+def _render_battery(batt: dict) -> str:
+    """Render battery stats: BAT:65%↓3:43 (discharging) / BAT:80%⚡0:31 (charging)."""
+    if not batt:
+        return ""
+    pct = batt["pct"]
+    state = batt["state"]
+    discharging = state == "discharging"
+    # Alert colors only when discharging and low; otherwise subdued
+    if discharging and pct <= BATT_CRIT_PCT:
+        val_col = "\033[0;31m"
+    elif discharging and pct <= BATT_WARN_PCT:
+        val_col = "\033[0;33m"
+    else:
+        val_col = SUBDUED
+    sym = "↓" if discharging else "⚡" if state == "charging" else ""
+    t = batt["time"]
+    t_str = t if t and t != "0:00" and state in ("discharging", "charging") else ""
+    return f"{SUBDUED}BAT:{val_col}{pct}%{sym}{t_str}{RST}"
 
 
 # --- Permission mode ---
@@ -1043,8 +1102,6 @@ def _render_session(
     model: str,
     used: str,
     ctx_size: int,
-    total_in: int,
-    total_out: int,
     cum_fresh: int,
     cum_create: int,
     cum_read: int,
@@ -1067,12 +1124,6 @@ def _render_session(
                 parts.append(f"\033[0;90m${fmt}\033[0m")
         except ValueError:
             pass
-
-    # I/O ratio (structural)
-    if _on("IO_RATIO") and total_in > 0 and total_out > 0:
-        ratio = (total_out * 10 + total_in // 2) // total_in
-        w, f = divmod(ratio, 10)
-        parts.append(f"{SUBDUED}I/O:{w}.{f}x{RST}")
 
     # Cumulative cache hit rate (structural)
     if _on("CACHE_HIT"):
@@ -1137,7 +1188,6 @@ class _InputData(NamedTuple):
     cache_read: int
     input_fresh: int
     total_in: int
-    total_out: int
     session_id: str
 
 
@@ -1161,7 +1211,6 @@ def _parse_input(data: dict) -> _InputData:
         cache_read=int(cur.get("cache_read_input_tokens", 0) or 0),
         input_fresh=int(cur.get("input_tokens", 0) or 0),
         total_in=int(data.get("context_window", {}).get("total_input_tokens", 0) or 0),
-        total_out=int(data.get("context_window", {}).get("total_output_tokens", 0) or 0),
         session_id=data.get("session_id", ""),
     )
 
@@ -1174,6 +1223,7 @@ def _layout_and_print(
     usage_cost: str,
     usage_data: dict,
     macmon_str: str,
+    battery_str: str,
     sessions: str,
     now_epoch: float,
     _t_start: float,
@@ -1225,6 +1275,8 @@ def _layout_and_print(
     last_parts: list[str] = []
     if macmon_str:
         last_parts.append(macmon_str)
+    if battery_str:
+        last_parts.append(battery_str)
     last_parts.append(f"{SUBDUED}{_t_elapsed:.3f}s{RST}")
     if sessions:
         last_parts.append(sessions)
@@ -1277,6 +1329,7 @@ def main() -> None:
     # Start external commands (non-blocking) — runs while we do in-process work
     git_procs = _start_git(inp.cwd)
     macmon_proc = _start_macmon()
+    battery_proc = _start_battery()
     dsp_proc = _start_dsp_check()
     try:
         # In-process: usage cache + dcat library (no subprocess)
@@ -1293,6 +1346,7 @@ def main() -> None:
         # Collect git results and macmon data
         git = _collect_git(git_procs)
         macmon_data = _collect_macmon(macmon_proc)
+        battery_data = _collect_battery(battery_proc)
         dsp_active = _collect_dsp(dsp_proc)
     finally:
         for p in git_procs.values():
@@ -1303,6 +1357,11 @@ def main() -> None:
         if macmon_proc:
             try:
                 macmon_proc.kill()
+            except OSError:
+                pass
+        if battery_proc:
+            try:
+                battery_proc.kill()
             except OSError:
                 pass
         if dsp_proc:
@@ -1332,16 +1391,17 @@ def main() -> None:
     chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
     chat_cost = str(chat_cost_val) if chat_cost_val > 0 else ""
     session = _render_session(
-        inp.model, inp.used, inp.ctx_size, inp.total_in, inp.total_out,
+        inp.model, inp.used, inp.ctx_size,
         cum_fresh, cum_create, cum_read, chat_cost,
     )
     sessions = _render_sessions(inp.cwd, now_epoch)
     macmon_str = _render_macmon(macmon_data)
+    battery_str = _render_battery(battery_data)
     usage_session_rl, usage_rl, usage_cost = _render_usage(usage_data, now_epoch)
 
     _layout_and_print(
         top, session, usage_session_rl, usage_rl, usage_cost,
-        usage_data, macmon_str, sessions, now_epoch, _t_start,
+        usage_data, macmon_str, battery_str, sessions, now_epoch, _t_start,
         force_red=_on("HAIKU_RED") and "haiku" in inp.model.lower(),
         model=inp.model,
     )

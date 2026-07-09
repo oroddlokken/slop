@@ -101,22 +101,7 @@ Should use: parameterized IN with the correct number of placeholders
 
 ## Output Format
 
-After scanning, output:
-
-```
-## SQL Injection Audit
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Vector**: {interpolation type — f-string, concatenation, format, etc.}
-**Input source**: {where the dynamic value comes from — request param, DB field, config, etc.}
-**Current**: {the vulnerable code}
-**Impact**: {what an attacker could do}
-**Fix**: {parameterized version of the query}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Vector | Input Source | Fix |
 |---|----------|-----------|--------|-------------|-----|

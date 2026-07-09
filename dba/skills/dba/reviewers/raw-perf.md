@@ -128,21 +128,7 @@ Alternatives: approximate count via `pg_stat_live_tuples` (within ~10%), materia
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Query Performance
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Query pattern**: {the problematic SQL pattern}
-**Why it's slow**: {what the DB optimizer can't do}
-**Impact**: {full table scan, filesort, OOM, timeout, O(N*M)}
-**Fix**: {rewritten query, index suggestion, alternative approach}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Pattern | Why Slow | Fix |
 |---|----------|-----------|---------|----------|-----|

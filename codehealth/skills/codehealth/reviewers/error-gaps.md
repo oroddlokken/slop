@@ -1,6 +1,5 @@
 
 # Find Error Handling Gaps
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for missing, swallowed, or inconsistent error handling that could cause silent failures, data corruption, or confusing user experiences.
 
@@ -100,23 +99,7 @@ For each error handling gap:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Error Handling Gaps
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line}`
-**Type**: {Swallowed | Bare catch | Missing handling | Inconsistent | Missing cleanup}
-**Currently**: {what the code does now}
-**Risk**: {what can go wrong}
-**Suggestion**: {concrete fix}
-```
-
-If there are systemic patterns (e.g., "no route handlers have error handling"), call them out in a **Systemic Issues** section before the individual findings.
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Type | Risk | Suggestion |
 |---|----------|-----------|------|------|-----------|

@@ -1,8 +1,8 @@
-## Data Realism
+# Data Realism
 
 Find tests using oversimplified data that doesn't represent production reality.
 
-### What to Look For
+## What to Look For
 
 1. **Single-item lists**: Tests always use `[item]` when production handles thousands (pagination, batching, performance)
 2. **ASCII-only strings**: `"test"` or `"John Doe"` when real users have unicode, emoji, accented characters, CJK text
@@ -15,21 +15,21 @@ Find tests using oversimplified data that doesn't represent production reality.
 9. **Unrealistic file sizes**: 10-byte files when users upload 500MB
 10. **English-only**: Assuming English locale, LTR text, US date format, dollar currency
 
-### How to Evaluate
+## How to Evaluate
 
 For each data realism gap:
 - What production incident could this miss? (encoding bugs, overflow, performance degradation)
 - What's the simplest representative test data that would catch this?
 - Is this systemic (all test data is simplistic) or isolated?
 
-### Severity Guide
+## Severity Guide
 
 - **Critical**: Financial or data integrity tests using unrealistic numeric ranges
 - **High**: User-facing features tested only with ASCII/English data
 - **Medium**: Tests using single items when batch behavior differs
 - **Low**: Tests that work but could use more diverse scenarios
 
-### Output Format
+## Output Format
 
 | # | Severity | File:Line | Issue | What to Test | Suggestion |
 |---|----------|-----------|-------|-------------|------------|

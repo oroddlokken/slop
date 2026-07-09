@@ -1,6 +1,5 @@
 
 # Find Duplicated Code
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for copy-pasted and near-identical code blocks that should be consolidated into shared functions, methods, or modules.
 
@@ -63,24 +62,7 @@ For each duplicate found:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Duplicates Found
-
-### {Severity}: {short description}
-
-**Locations:**
-- `{file_1}:{start_line}-{end_line}`
-- `{file_2}:{start_line}-{end_line}`
-
-**Similarity**: Exact | Near (differs in: {what}) | Structural
-**Lines duplicated**: {count}
-**Suggestion**: {how to consolidate — be specific about where to extract and what the shared interface looks like}
-**Risk**: {what happens if these stay duplicated}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Duplicate Of | Lines | Type | Suggestion |
 |---|----------|-----------|-------------|-------|------|------------|

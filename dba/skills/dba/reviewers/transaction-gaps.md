@@ -104,22 +104,7 @@ Look for: inconsistent lock ordering across code paths, missing retry logic for 
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Transaction Gaps
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{line_range}`
-**Write sequence**: {what operations happen in sequence}
-**Transaction boundary**: {none / incomplete / rollback missing}
-**Failure scenario**: {what happens if step N fails — describe the inconsistent state}
-**Impact**: {data loss, orphaned records, incorrect balances, etc.}
-**Fix**: {wrap in transaction, add rollback, use atomic update, etc.}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Write Sequence | Gap | Fix |
 |---|----------|-----------|---------------|-----|-----|

@@ -1,8 +1,8 @@
-## Fragile Tests
+# Fragile Tests
 
 Find tests tightly coupled to implementation details that will break on harmless refactors.
 
-### What to Look For
+## What to Look For
 
 1. **Testing private methods**: Tests that reach into internals (`_private_method()`, internal state)
 2. **Exact output matching**: Asserting on exact string output, HTML structure, or log messages that could change cosmetically
@@ -14,21 +14,21 @@ Find tests tightly coupled to implementation details that will break on harmless
 8. **Import-path testing**: Verifying internal module structure rather than public API behavior
 9. **Database schema coupling**: Depending on specific column names, table structure, or migration state
 
-### How to Evaluate
+## How to Evaluate
 
 For each fragile test:
 - Would a safe refactor (rename, restructure, optimize) break this test?
 - Does this test verify behavior (what it does) or implementation (how it does it)?
 - How often has this pattern caused false test failures?
 
-### Severity Guide
+## Severity Guide
 
 - **Critical**: Tests that prevent safe refactoring of critical paths
 - **High**: Tests coupled to implementation that break on routine maintenance
 - **Medium**: Tests with hardcoded values that work now but are brittle
 - **Low**: Minor coupling unlikely to cause problems soon
 
-### Output Format
+## Output Format
 
 | # | Severity | File:Line | Issue | What to Test | Suggestion |
 |---|----------|-----------|-------|-------------|------------|

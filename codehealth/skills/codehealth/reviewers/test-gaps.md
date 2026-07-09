@@ -1,5 +1,4 @@
 # Find Test Gaps
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for critical code that lacks test coverage. Not every line needs a test — focus on code where bugs would cause the most damage.
 
@@ -98,33 +97,7 @@ For each test gap:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Test Coverage Gaps
-
-### Coverage Map
-
-| Source File | Test File | Coverage Assessment |
-|------------|-----------|-------------------|
-| `{source}` | `{test}` | {Tested | Partial | No tests} |
-| `{source}` | — | No test file exists |
-
-### Critical Gaps
-
-#### {Severity}: {short description}
-
-**Source**: `{file}:{line_range}`
-**Function**: `{function_name}`
-**Current tests**: {None | Happy path only | Missing error cases}
-**Risk**: {what could go wrong}
-**Suggested test cases**:
-1. {specific test case — what input, what expected behavior}
-2. {error case — what happens when X fails}
-3. {edge case — boundary condition}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | Source File:Line | Function | Current Tests | Risk |
 |---|----------|-----------------|----------|--------------|------|

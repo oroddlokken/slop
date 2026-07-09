@@ -15,9 +15,9 @@ Fast approach validation. Gather context, spawn a Sonnet agent to poke holes, re
 ## Rules
 
 - **Sonnet model only** — spawn the agent with `model: "sonnet"`. Fast and capable.
-- **Pass all context inline** — the agent has no file access. Include intent, approach, and code directly in the prompt.
+- **Pass all context inline** — the agent should not need file access, so include intent, approach, and code directly in the prompt.
 - **Return the agent response verbatim** — add nothing. The response is the deliverable.
-- **Single agent, single round** — this is a quick gut-check, not a deep review. For thorough analysis, use `/codehealth` or `/devils-advocate`.
+- **Single agent, single round** — this is a quick gut-check, not a deep review. For thorough analysis, use `/codehealth` or `/should-i-abstract`.
 
 ## Workflow
 

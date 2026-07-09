@@ -1,6 +1,5 @@
 
 # Find Code That Should Be Extracted
-This reviewer scans code and reports findings — it does not modify code.
 
 Scan the codebase for inline operations that should be functions, methods, or services. The goal: business logic should be named, testable, and reusable — not scattered inline across handlers, views, and scripts.
 
@@ -100,21 +99,7 @@ For each extraction opportunity:
 
 ## Output Format
 
-After scanning, output:
-
-```
-## Extraction Opportunities
-
-### {Severity}: {short description}
-
-**Location**: `{file}:{start_line}-{end_line}`
-**Inline operation**: {what's happening inline}
-**Layer violation**: {current layer} → should be in {correct layer}
-**Extract to**: `{target_file}:{function_name}({params}) -> {return_type}`
-**Why**: {testability, reusability, separation of concerns}
-```
-
-End with a Findings Summary table:
+After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Inline Operation | Extract To | Why |
 |---|----------|-----------|-----------------|------------|-----|
