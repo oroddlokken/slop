@@ -583,6 +583,53 @@ def short_model(model: str) -> str:
     return m
 
 
+MODELS_MIN_WIDTH = 12
+"""Below this a Models column shows nothing but an ellipsis, so drop it."""
+
+
+def _flex_cell(text: str) -> Text:
+    """Build a cell for the Models column, the only column Rich may shrink.
+
+    Rich takes width from wrappable columns first. When every column is no_wrap
+    it instead shaves all of them evenly, which is what turned the numbers into
+    '14.…'. The cell keeps no_wrap so a shrunk column truncates on one line
+    rather than wrapping onto two.
+    """
+    return Text(text, no_wrap=True, overflow="ellipsis")
+
+
+def _models_cell(models: set[str]) -> Text:
+    """Render a bucket's model set as a single-line, truncatable cell."""
+    return _flex_cell(", ".join(sorted(short_model(m) for m in models)))
+
+
+def _column_width(column) -> int:
+    """Natural width of a column: its widest cell, header included."""
+    widths = [Text.from_markup(str(column.header)).cell_len]
+    widths += [
+        cell.cell_len if isinstance(cell, Text) else Text.from_markup(str(cell)).cell_len
+        for cell in column._cells  # noqa: SLF001 - Rich exposes no public accessor
+    ]
+    return max(widths)
+
+
+def _print_report(table: Table) -> None:
+    """Print a report table, dropping Models when the terminal is too narrow.
+
+    Rich empties the wrappable Models column before shaving anything else, but it
+    takes it all the way to zero and then shaves the numbers regardless, leaving a
+    dead column behind. Removing it first keeps the rest of the table readable.
+    """
+    if table.columns and str(table.columns[-1].header) == "Models":
+        padding = table.padding[1] + table.padding[3]
+        fixed = sum(_column_width(c) + padding for c in table.columns[:-1])
+        if console.width - fixed - table._extra_width < MODELS_MIN_WIDTH:  # noqa: SLF001
+            table.columns.pop()
+    console.print()
+    console.print(table)
+    console.print()
+
+
 def _make_report_table(
     title: str,
     label_col: str,
@@ -598,7 +645,8 @@ def _make_report_table(
     table.add_column(label_col, style=label_style, no_wrap=True)
     _add_token_columns(table, compact=compact, narrow=narrow, has_nok=has_nok, mva=mva)
     if not narrow:
-        table.add_column("Models", style="dim", no_wrap=True)
+        # The only wrappable column, so Rich takes width from here first.
+        table.add_column("Models", style="dim")
     return table
 
 
@@ -681,7 +729,7 @@ def _add_summary_rows(
     table.add_section()
     total_row = [Text("TOTAL", style="bold"), *_token_row(total_agg, compact=compact, narrow=narrow, has_nok=has_nok)]
     if not narrow:
-        total_row.append(f"{len(total_agg.models)} models")
+        total_row.append(_flex_cell(f"{len(total_agg.models)} models"))
     table.add_row(*total_row, style="bold")
     if n_buckets > 1:
         avg_cost = total_agg.cost / n_buckets
@@ -704,7 +752,7 @@ def _add_summary_rows(
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
-            cells += ["", "", avg_label]
+            cells += ["", "", _flex_cell(avg_label)]
             table.add_row(*cells, style="dim")
 
 
@@ -742,7 +790,7 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False, rates: dic
         b = buckets[day]
         row = [day, *_token_row(b, total_cost, narrow=narrow, has_nok=has_nok)]
         if not narrow:
-            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+            row.append(_models_cell(b.models))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
@@ -762,9 +810,7 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False, rates: dic
 
     _add_summary_rows(table, total_agg, len(buckets), narrow=narrow, avg_label="per day", has_nok=has_nok)
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_monthly(records: list[UsageRecord], rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
@@ -792,7 +838,7 @@ def report_monthly(records: list[UsageRecord], rates: dict[str, float] | None = 
         b = buckets[month]
         row = [month, *_token_row(b, total_cost, narrow=narrow, has_nok=has_nok)]
         if not narrow:
-            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+            row.append(_models_cell(b.models))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
@@ -875,13 +921,11 @@ def report_monthly(records: list[UsageRecord], rates: dict[str, float] | None = 
                         cells.append(Text(fmt_nok(projected_14d_nok, nok_14d_bucket.nok_estimated), style="dim cyan"))
                     cells += [
                         "", "",
-                        f"Last {window} days avg",
+                        _flex_cell(f"Last {window} days avg"),
                     ]
                     table.add_row(*cells, style="dim")
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_project(records: list[UsageRecord], limit: int | None = 20, rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
@@ -915,7 +959,7 @@ def report_project(records: list[UsageRecord], limit: int | None = 20, rates: di
         b = buckets[proj]
         row = [proj, *_token_row(b, total_cost, compact=True, narrow=narrow, has_nok=has_nok)]
         if not narrow:
-            row.append(", ".join(sorted(short_model(m) for m in b.models)))
+            row.append(_models_cell(b.models))
         table.add_row(*row)
         total_agg.tokens += b.tokens
         total_agg.cost += b.cost
@@ -952,12 +996,10 @@ def report_project(records: list[UsageRecord], limit: int | None = 20, rates: di
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
-            cells += ["", "", f"per project (all {all_n})"]
+            cells += ["", "", _flex_cell(f"per project (all {all_n})")]
             table.add_row(*cells, style="dim")
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_session(records: list[UsageRecord], limit: int | None = 20, rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
@@ -1011,7 +1053,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             table.add_column(nok_label, justify="right", style="cyan", no_wrap=True)
         table.add_column("%", justify="right", style="dim", no_wrap=True)
         table.add_column("Calls", justify="right", style="dim", no_wrap=True)
-        table.add_column("Models", style="dim", no_wrap=True)
+        table.add_column("Models", style="dim")
 
     total_cost = sum(buckets[s].cost for s in sorted_sessions)
     total_agg = AggBucket()
@@ -1031,7 +1073,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             table.add_row(*cells)
         else:
             short_sid = sid[-8:] if len(sid) > 8 else sid
-            models_str = ", ".join(sorted(short_model(m) for m in b.models))
+            models_str = _models_cell(b.models)
             cells = [
                 short_sid,
                 meta["project"],
@@ -1104,7 +1146,7 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(avg_nok, total_agg.nok_estimated), style="dim cyan"))
-            cells += ["", "", f"per session (top {n})"]
+            cells += ["", "", _flex_cell(f"per session (top {n})")]
             table.add_row(*cells, style="dim")
     # Average across ALL sessions
     all_n = len(buckets)
@@ -1132,12 +1174,10 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, rates: di
             ]
             if has_nok:
                 cells.append(Text(fmt_nok(all_avg_nok, all_any_est), style="dim cyan"))
-            cells += ["", "", f"per session (all {all_n})"]
+            cells += ["", "", _flex_cell(f"per session (all {all_n})")]
             table.add_row(*cells, style="dim")
 
-    console.print()
-    console.print(table)
-    console.print()
+    _print_report(table)
 
 
 def report_json(records: list[UsageRecord], rates: dict[str, float] | None = None, has_nok: bool = False, max_rate_date: str | None = None, mva: bool = True) -> None:
