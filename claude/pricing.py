@@ -91,7 +91,7 @@ def _local_tz() -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-07-02"
+LAST_CHECKED = "2026-07-24"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -200,6 +200,19 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             "claude-sonnet-5": {
                 "input": 2e-06, "output": 10e-06,
                 "cache_create": 2.5e-06, "cache_read": 0.2e-06,
+            },
+        },
+    },
+    {
+        # Opus 5 released 2026-07-24, same pricing as 4.8 ($5/$25 per MTok),
+        # 1M context with no long-context premium. Fast mode is 2x base
+        # ($10/$50) but rides the same model ID — records carry a separate
+        # "speed" field we don't read, so fast-mode usage costs as standard.
+        "effective": "2026-07-24",
+        "models": {
+            "claude-opus-5": {
+                "input": 5e-06, "output": 25e-06,
+                "cache_create": 6.25e-06, "cache_read": 0.5e-06,
             },
         },
     },
