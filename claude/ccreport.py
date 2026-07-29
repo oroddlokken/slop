@@ -46,7 +46,7 @@ from cache_db import (
     save_ccreport_file,
 )
 from exchange import get_rate, load_rates, to_oslo_date
-from pricing import calc_cost, extract_assistant_fields
+from pricing import MISSING_PRICING_MODELS, calc_cost, extract_assistant_fields
 
 _PROJECT_ROOTS = (
     Path.home() / ".claude" / "projects",
@@ -1285,6 +1285,23 @@ def cmd_overrides(args) -> None:
         print(f"  {kind}{r['match_value']:<{width}}  ->  {r['target']}")
 
 
+def _warn_missing_pricing() -> None:
+    """Print a hard-to-miss summary of models that lack pricing data.
+
+    calc_cost warns once per model early in the run; this repeats the
+    message after the reports so it doesn't scroll out of sight.
+    """
+    if not MISSING_PRICING_MODELS:
+        return
+    models = ", ".join(sorted(MISSING_PRICING_MODELS))
+    print(
+        f"\n⚠ NO PRICING for: {models}\n"
+        f"  Their tokens are counted as $0 in every total above.\n"
+        f"  Fix: add the model to PRICING_HISTORY in pricing.py.",
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Analyze Claude Code token usage and costs from local JSONL logs.",
@@ -1357,6 +1374,7 @@ def main() -> None:
 
     if hasattr(args, "json") and args.json:
         report_json(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date, mva=mva)
+        _warn_missing_pricing()
         return
 
     command = args.command
@@ -1377,6 +1395,8 @@ def main() -> None:
         report_monthly(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date, mva=mva)
         report_project(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date, mva=mva)
         report_session(records, rates=rates, has_nok=has_nok, max_rate_date=max_rate_date, mva=mva)
+
+    _warn_missing_pricing()
 
 
 if __name__ == "__main__":
