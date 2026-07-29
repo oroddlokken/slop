@@ -244,6 +244,11 @@ _FREE_PRICING: Mapping[str, float] = MappingProxyType({
     "input": 0.0, "output": 0.0, "cache_create": 0.0, "cache_read": 0.0,
 })
 
+# calc_cost runs once per record, so a model without pricing would otherwise
+# flood stderr with thousands of identical warnings. Warn once per model here;
+# ccreport prints a visible summary from this set after the reports.
+MISSING_PRICING_MODELS: set[str] = set()
+
 
 def _parse_effective(date_str: str) -> datetime:
     """Parse an effective date string to a timezone-aware datetime.
@@ -301,8 +306,13 @@ def calc_cost(
     """
     prices = find_pricing(model, ts)
     if not prices:
-        if model and not model.startswith("<"):
-            print(f"Warning: no pricing found for model '{model}'", file=sys.stderr)
+        if model and not model.startswith("<") and model not in MISSING_PRICING_MODELS:
+            MISSING_PRICING_MODELS.add(model)
+            print(
+                f"Warning: no pricing found for model '{model}' — "
+                f"tokens counted as $0",
+                file=sys.stderr,
+            )
         return 0.0
     return (
         tiered_cost(input_tokens, prices.get("input", 0.0), prices.get("input_200k"))
