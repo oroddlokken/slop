@@ -55,7 +55,8 @@ Work through this lens systematically. For each potential finding:
 ## Expected Output Volume
 
 - Minimum: 1-2 findings per lens (some lenses apply narrowly).
-- Maximum: 10-15 findings per lens. If you have more, prioritize by severity and combine minor items into a single "misc polish" entry.
+- Maximum: 12 findings, ranked by severity, dropping the lowest first. If you drop any, say so in one line beneath the table: "Dropped N Low-severity items to stay under the cap." A flood of trivial rows buries the two findings that matter.
+- **Batch systemic patterns.** Forty rules sharing one opening formula, or thirty files with the same structural defect, is one finding with a count — not forty rows. Name the count and cite two or three representative locations.
 
 ## Output Format
 
@@ -87,9 +88,19 @@ Then end with a summary table:
 | 1 | High | path:N-M | description | Remove/Move/Rewrite/Add | what to change |
 ```
 
-Severity levels: Critical, High, Medium, Low.
+**Severity scale**:
+- **Critical**: the docs will lead the agent into a destructive or irreversible action (a missing guardrail on a delete/force-push/migration path), or a live credential is committed in a doc file.
+- **High**: a contradiction between files, a documented command or path that no longer matches the codebase, or a command an agent copies out of the docs that fails when pasted. The agent is actively misled.
+- **Medium**: redundancy, weak or unenforceable wording, misplaced content, token-budget overruns. Real maintenance cost, no immediate trap.
+- **Low**: polish — consolidation, decorative noise, minor wording.
 
 **The summary table is mandatory** — every finding gets a row.
+
+## Rules for Your Own Report
+
+- **Do not speculate about authorship.** Write about the prose. "This rule states no checkable condition" is actionable. "This was written by ChatGPT" is a claim you cannot support, and it gives the author an easy reason to dismiss the whole report.
+- **Write the findings in plain prose.** A report about hollow phrasing that is itself full of hollow phrasing is worthless. No em-dash strings, no "not just X but Y", no present-participle tails, no closing summary paragraph. The findings table is the summary.
+- **Every finding names the replacement.** "Too vague" is not a finding; the rewritten line is. If the fix is deletion, say "delete" and say what is lost by deleting it.
 
 ## Self-Verification
 
@@ -100,3 +111,4 @@ Before submitting:
 - All severity labels are justified against the scale.
 - Findings are sorted by file then starting line.
 - No finding appears twice under different titles.
+- The report is within the cap, and systemic patterns are batched into single counted findings.

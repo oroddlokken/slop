@@ -99,7 +99,7 @@ Prompts written without this loop read as checklists of tactics. Prompts written
 Hardening costs attention budget and signals importance. Apply it selectively:
 
 - If you haven't baseline-tested the rule under pressure, don't harden it yet — you'll be guessing at excuses and red flags instead of harvesting real ones.
-- If the rule isn't load-bearing (no observed cost when it slips), don't harden it — or cut the rule.
+- If the rule has no observed cost when it slips, don't harden it — or cut the rule.
 - If every rule in the prompt is hardened, hardening stops catching the eye and becomes bloat. Reserve it for the 2-3 rules where slippage actually hurts.
 
 Red flags — if you're thinking any of these while choosing whether to harden, stop:
@@ -108,9 +108,12 @@ Red flags — if you're thinking any of these while choosing whether to harden, 
 - "More hardening is always better."
 
 ### Weak Language Dilutes Everything
+
+The test for any adjective in a rule: does it name a fact or a mood? "The lock is held across the retry" is a fact — the agent can check it and act on it. "The lock is critical" is a mood. Moods read as emphasis and carry nothing the agent can apply.
+
 - **Weak modals** — "should", "try to", "ideally", "prefer to". Rewrite as directives. If it's genuinely optional, say so and name the condition ("MAY ... when ...").
 - **Weasel phrases** — "use appropriate tone", "as needed", "generally", "if relevant". Escape hatches. Replace with concrete conditions.
-- **Unmeasurable quality** — "be helpful", "be friendly", "write naturally". The agent can't evaluate these. Make them checkable ("address the user by first name when known") or cut them.
+- **Unmeasurable quality** — "be helpful", "be friendly", "write naturally". Moods. Make them checkable ("address the user by first name when known") or cut them.
 - **Aggressive emphasis** — "YOU MUST", "CRITICAL", "NEVER EVER". Calm, direct instructions perform better on modern models. Reserve caps/bold for the 2-3 rules that actually matter; overuse dilutes all of them.
 
 ### Instruction Count vs. Compliance
@@ -139,6 +142,9 @@ Red flags — if you're thinking any of these while drafting, stop and cut a rul
 - "This is an important safety boundary." (Then put it in one place, hardened; don't sprinkle.)
 
 **Placement.** In prompts past ~20 lines, put the rules you care most about at the **top or bottom**. The middle 40-60% is the lowest-attention zone in most current LLMs. In long-context deployments (see glossary — roughly >100k tokens, >50 turns, or more than half the window filled), earliest tokens can also lose salience, so head-placement alone isn't a safety net; mirror critical rules at the tail in those cases.
+
+### Name Things the Same Way Every Time
+Rotating synonyms for one thing — "the payload", then "the request body", then "the incoming data" — breaks the mapping between your prose and the tool, parameter, or field the agent must actually emit. Repetition reads as fussy in an essay and as precise in a prompt. Say `body` four times. The same goes for shape: don't pad rules to equal length or force every bullet into one grammatical mold, because the item that resisted the mold was usually the one carrying a caveat.
 
 ### Avoid Redundancy
 State each rule in one canonical section. Duplicated rules compete for the model's attention, and when one copy drifts during edits the inconsistency teaches the agent that rules are soft. If the same constraint applies to multiple sections, pick the most specific section and put it there; reference it from the others instead of copying.
@@ -291,9 +297,10 @@ Coding agents can "run the tests". General agents have weaker equivalents, but n
 **Self-checks for prompt writers, before shipping:**
 
 - Every rule has explicit reasoning — at minimum a one-sentence "because X" clause, or inherits it from a nearby paragraph.
-- All load-bearing rules (forbidding high-impact actions, or referenced by other rules) sit in the top or bottom 25% of the prompt, not the middle 40-60%.
+- Every rule that forbids a high-impact action, or that other rules depend on, sits in the top or bottom 25% of the prompt, not the middle 40-60%.
 - No two sections tell the agent to do different things in the same situation (read top-to-bottom once; flag conflicts).
-- None of the principles this skill teaches — positive framing, weak-language hygiene, persona-as-operational, scope-as-scripted — is violated by your own prompt prose.
+- None of the principles this skill teaches — positive framing, weak-language hygiene, fact-not-mood adjectives, persona-as-operational, scope-as-scripted — is violated by your own prompt prose.
 - Every Iron Law is hardened (loopholes enumerated, rationalization table if it recurs, Red Flags) — and every rule that *isn't* an Iron Law is stripped of hardening so the signal stays legible.
+- No rule was reworded without checking it is still true. Polish ranks below correctness: a smoothly phrased wrong constraint is worse than a plainly phrased right one, because the polish makes it more convincing.
 
 These are soft checks, but naming them outperforms omitting them.

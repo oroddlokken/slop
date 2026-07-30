@@ -44,6 +44,7 @@ This is documentation **for AI agents**, not humans. Agents can read source code
 - **Behavioral rules** that can't be derived from code (don't-do-X rules, non-obvious consequences)
 - **Information in the wrong file** (behavioral rules in architecture docs, architecture in behavioral docs)
 - **Genuinely missing context** that agents repeatedly get wrong and can't figure out from code alone
+- **Machine-prose filler** that reads as instruction while stating nothing checkable, plus residue and curly quotes that break the commands agents copy out of the docs
 
 Skip anything an agent could discover by reading source: function signatures, file structure, fixture details, config options, CSS conventions.
 
@@ -71,6 +72,8 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
    - **Unmeasurable quality**: "write clean code", "keep it simple", "use best practices", "be careful with" — agents can't evaluate these. Replace with specific, checkable criteria or delete.
    - **Aggressive emphasis**: "CRITICAL!", "YOU MUST", "NEVER EVER", "ABSOLUTELY DO NOT" — calm, direct instructions perform better on modern Claude models. Reserve emphasis (caps, bold) for the 2-3 most important rules; overuse dilutes all of them.
    - For each: quote the instruction, explain why it's weak, propose a concrete rewrite as a positive directive with reasoning.
+
+   **What NOT to flag**: a hedge carrying a real condition ("generally, unless the repo pins a version") is a scoped rule, not a weasel. Definite claims and superlatives the author meant ("the only entry point", "always run migrations first") are commitments, not emphasis. One "should" in a doc that is otherwise directive is noise; a doc built on "should" is the finding. Removing a finding is cheaper than making the user filter your report.
 
 5. **Information Architecture** — Check if content is in the right file. Behavioral instructions belong in CLAUDE.md, system design in architecture docs, DB conventions in DB docs. Flag misplaced content and propose where it should move.
 
@@ -121,13 +124,55 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
 
    Apply this lens **selectively**. A CLAUDE.md full of loophole enumerations is bloat — these patterns work because they're rare enough to catch the eye. Recommend hardening only where incidents have shown the rule actually erodes under pressure. For each finding: quote the rule, note which moves are missing, propose what to add (and flag that the table/Red Flags rows should be harvested from real incidents, not invented).
 
+10. **Prose Tics** — The Actionability lens owns weak modals, weasel phrases, and unmeasurable adjectives. This lens owns the sentence *shapes* and mechanical defects that survive that filter: prose that reads as grammatical and confident while stating nothing the agent can check, plus text that was never meant to ship. Guiding test: judge the word by what it earns. "This migration drops the column before the backfill runs" is a fact. "This migration is critical" is a mood.
+
+    Start with the mechanical greps. These need no judgment and have a near-zero false-positive rate:
+    - **Curly quotes and apostrophes** anywhere in the docs, and above all inside a documented command. Agent docs are full of copy-pasteable commands, and a smart quote silently breaks the command a future agent runs. Report every hit inside a code span or fenced block as High.
+    - **Unfilled placeholders** shipped into a live doc: `[Add description here]`, `<your-api-key>` inside a real config example, `TODO: fill in`, `2025-XX-XX` dates.
+    - **Tool artifacts**: `contentReference`, `oaicite`, `oai_citation`, `turn0search0`, `[cite: 1]`, `(start_span)`, `grok_card`, `attached_file:`, `utm_source=chatgpt.com`, `utm_source=openai`, `referrer=grok.com`.
+    - **Chat residue**: "Would you like me to", "Let me know if", "I hope this helps", "Here's the updated", "This follows best practices".
+
+    Then read for shape:
+    - **Copulative avoidance** — "serves as", "stands as", "functions as", "represents", "offers", "refers to" opening a definition. Rewrite to `is` / `are` / `has`.
+    - **Negative parallelism** — "not just X but Y", "it's not X, it's Y". The shape implies the reader held a wrong belief. In a rule, state Y and stop.
+    - **Rule of three** — triads where one item carries the meaning ("fast, safe, and predictable"). Cut to the item that constrains behavior.
+    - **Uniform rhythm** — the strongest tell in the set, and the one a vocabulary grep never finds. Sentences of near-identical length through a paragraph; bullet lists where every item is forced into the same grammatical shape whether the content fits it or not; sections padded or trimmed to match each other rather than their content. State the fix positively: uneven sentence length, sections sized to their content, concrete specifics.
+
+      **Carve-out — read this before flagging any list.** Bullet density is a tell in README and general markdown prose, where roughly 60% bullets reads as machine-written no matter how good the words are. It is *not* a tell in `CLAUDE.md`, `AGENTS.md`, `copilot-instructions.md`, or `.claude/rules/`. Those files are rule lists; dense bullets are their correct form, and rewriting them as paragraphs makes them worse for the agent that has to read them. Apply the density check only to prose docs, and never propose converting an agent-doc rule list into prose.
+    - **Present-participle tails** — "..., ensuring consistency across services", "..., enabling faster lookups". The most common shape of filler; almost never carries a checkable claim.
+    - **Elegant variation** — prose that renames one thing mid-document ("the payload", then "the request body", then "the incoming data") breaks the mapping between the doc and the actual command, flag, or file name the agent must use. Flag every synonym drift away from the real symbol. Stated from the other side: repeating the technical term is the human move, and in agent docs it is also the correct one — name the command the same way every time.
+    - **Promotional register** — "blazing fast", "powerful and flexible", "rich set of features", "commitment to quality". A doc says what the thing does and how to run it.
+    - **Changelog voice in rules** — "Updated to handle the new format", "Refactored for clarity", "Changed from X to Y" with no reason given. Git records what changed; the doc should say why the rule exists.
+    - **Editorial filler** — "Note that", "It's worth noting", "Importantly", "In summary" closing a section under one screen long.
+
+    **Batch systemic patterns.** If forty rules share one opening formula from a single generation pass, that is one finding with a file count, not forty rows.
+
+    **What NOT to flag.** False positives here are expensive, because the finding reads as a claim about who wrote the text. They carry a second cost: over-correction takes the author's time and makes the doc worse. A rewrite that strips a real constraint to satisfy a style rule is a net loss, and the fifth cosmetic finding in a row teaches the reader to skip the first four.
+    - Plain prose. "is", "are", "has", short sentences, and wordy-but-human constructions ("in order to", "the fact that") point *away* from machine authorship.
+    - Good grammar, formal register, and correct technical terms in their precise sense (graceful shutdown, idempotent, blast radius in a runbook).
+    - Em dashes on their own, especially unspaced, especially where the repo's older prose already uses them. Check `git log` on the line before calling any style choice a deviation.
+    - Superlatives and definite claims ("the only caller", "always"). Machines hedge; authors commit.
+    - House style. If the repo's own pre-existing docs are built on bold-lead bullets, that is the convention here.
+
+    **Density decides.** Never open a finding on a single stylistic hit unless it is a mechanical grep hit from the list above. A cluster in one paragraph is the signal.
+
+    **Do not speculate about authorship.** Write about the prose. "This rule states no checkable condition" is actionable; "this was written by ChatGPT" is a claim you cannot support and it makes the finding easy to dismiss.
+
+    **This lens ranks below Contradictions (lens 2), Gaps (lens 3), and the stale-instruction check in Hygiene (lens 7).** Whether a doc tells the truth matters more than whether it reads as machine-written, and the two are independent — a doc can be beautifully written and describe a command that no longer exists. When the same text trips both, the correctness finding leads and the style note becomes a clause inside it, not its own row.
+
+    **Never launder a false claim.** A rewrite must improve readability and must never make an unverified statement more convincing. If you cannot tell whether the claim under the bad prose still holds, say so in the finding and leave the claim alone. Rewriting filler around a stale instruction makes the doc more persuasive and no less wrong.
+
+    **What this lens is not.** It improves readability. It is not detection-proofing, and a clean pass is no evidence about who wrote the doc. Style cleanup is politeness, not defense.
+
+    **Boundaries:** Actionability (lens 4) owns weak modals, weasel phrases, unmeasurable adjectives, and aggressive emphasis, including bare intensifiers with no consequence stated. Hygiene (lens 7) owns secrets, platitudes restating base-model knowledge, hook-enforceable rules, and instructions that no longer match the codebase. This lens owns sentence shape, vocabulary drift, residue, and mechanical defects. Do not report the same text under two lenses.
+
 ### Full Lenses (add to core)
 
-10. **Cold Start** — Pretend to be a fresh agent with zero context. What assumptions does the documentation make that would confuse a first-time reader? Skip things derivable from code.
+11. **Cold Start** — Pretend to be a fresh agent with zero context. What assumptions does the documentation make that would confuse a first-time reader? Skip things derivable from code.
 
-11. **Domain: {area}** — Deep-dive gap analysis for a specific domain (e.g., "database", "frontend", "pipeline", "testing"). Reads both docs AND relevant source code to find where the docs mislead or where non-obvious patterns aren't captured.
+12. **Domain: {area}** — Deep-dive gap analysis for a specific domain (e.g., "database", "frontend", "pipeline", "testing"). Reads both docs AND relevant source code to find where the docs mislead or where non-obvious patterns aren't captured.
 
-12. **Agent Quality** — Audit `.claude/agents/` definitions:
+13. **Agent Quality** — Audit `.claude/agents/` definitions:
     - Missing or vague `description` field (Claude uses this to decide when to delegate — must be specific)
     - Overly broad tool access (should restrict to minimum needed via `tools`/`disallowedTools`)
     - Agents trying to do too many things (should be focused on one task)
@@ -140,7 +185,7 @@ Each lens is a sub-agent with a specific critical angle. The user can run all or
 Ask the user for target path and scope before launching agents — running on assumed defaults misfires because doc layouts vary too widely to guess:
 - **Path**: Which files/directories to audit? (suggest: the project root — discovery will find CLAUDE.md files, agent_docs/, etc. automatically)
 - **Scope**: Ask the user to pick one:
-  - `standard` — runs the 9 core checks: duplicated info, conflicting instructions, missing context, vague rules, misplaced content, file size/structure issues, secrets/stale content, guardrails/prohibitions, and hardening of critical rules
+  - `standard` — runs the 10 core checks: duplicated info, conflicting instructions, missing context, vague rules, misplaced content, file size/structure issues, secrets/stale content, guardrails/prohibitions, hardening of critical rules, and machine-prose filler
   - `full` — everything above plus: cold-start readability, a domain deep-dive (ask which area), and agent definition quality checks
   - Or the user can name specific areas if they know what they want (e.g., "just check for contradictions and stale content")
 
@@ -256,6 +301,7 @@ Severity scale: Critical, High, Medium, Low. Sort rows by file, then by starting
 - {N} structural issues (token budget, progressive disclosure, rules boundary)
 - {N} hygiene issues (secrets, self-evident rules, hook-enforceable rules, stale content)
 - {N} critical rules lacking hardening (enumerated loopholes, rationalization tables, Red Flags)
+- {N} prose tics (filler shapes, synonym drift, residue, broken copy-paste commands)
 ```
 
 **Example finding (to show the shape of a filled entry):**

@@ -19,6 +19,7 @@ This is an audit of the *text that steers an LLM agent's behavior* — system pr
 - No clarification policy → the agent asks three questions on every ambiguous input
 - No scripted refuse sentence → the agent rambles apologetically on off-topic requests
 - No uncertainty phrasebook → the agent hallucinates or hedges with "it may be possible that..."
+- Machine-prose filler ("serves as", "..., ensuring consistency", synonym drift off the tool name) reads as instruction while stating nothing checkable
 - Examples that drift from the rules silently override the rules
 
 This skill is LLM-agnostic. For coding-agent docs (CLAUDE.md, AGENTS.md) use `audit-agent-docs`. For SDK wiring / caching / tool-use mechanics use `claude-api`.
@@ -63,6 +64,8 @@ Each lens is a specific critical angle. The user picks a scope (standard, full, 
    - **Weasel phrases**: "use appropriate tone", "as needed", "if relevant", "generally", "usually", "normally", "typically". Replace with concrete conditions — name the context or metric.
    - **Unmeasurable quality**: "be helpful", "be friendly", "write naturally", "use best judgment". Replace with checkable criteria (e.g., "cite sources", "under 100 words") or delete.
    - **Aggressive emphasis**: "YOU MUST", "CRITICAL", "NEVER EVER", "ABSOLUTELY". Limit to 2-3 true Iron Laws per prompt; overuse dilutes compliance with every rule.
+
+   **What NOT to flag**: a hedge carrying a real condition ("generally, unless the user set `--strict`") is a scoped rule, not a weasel. Definite claims and superlatives the author meant ("the only caller", "always retry") are commitments, not emphasis. One "should" in a document that is otherwise directive is noise; a document built on "should" is the finding. Removing a finding is cheaper than making the user filter your report.
 
 4. **Platitudes & Defaults** — Find rules that restate base-model behavior: "be polite", "answer the user's question", "don't be offensive", "use proper grammar", "be accurate". Apply this test to every rule: *if inserting "not" somewhere would leave the rule still generally true of a base model, it's a platitude.* Delete platitudes — they carry zero information density. Every rule competes with every other rule for attention budget; there is no free rule.
 
@@ -117,42 +120,78 @@ Each lens is a specific critical angle. The user picks a scope (standard, full, 
 
     A rule with all three is dense with closed loopholes; a rule with only positive framing is the floor. This lens measures the ceiling. For each finding: quote the rule, note which of the three moves are missing, and propose what to add (using the harvest procedures above).
 
-    **Also flag over-hardening.** Hardening costs attention budget and signals importance, so it must be rare to catch the eye — a prompt where every rule carries loophole enumerations, rationalization tables, and Red Flags is bloat, and the signal is lost. Flag hardening applied to rules that aren't load-bearing (no observed cost when they slip), and recommend stripping it back to plain positive framing or cutting the rule.
+    **Also flag over-hardening.** Hardening costs attention budget and signals importance, so it must be rare to catch the eye — a prompt where every rule carries loophole enumerations, rationalization tables, and Red Flags is bloat, and the signal is lost. Flag hardening applied to rules with no observed cost when they slip, and recommend stripping it back to plain positive framing or cutting the rule.
+
+14. **Prose Tics** — Weak Language (lens 3) catches hedges and unmeasurable adjectives. This lens catches the sentence *shapes* that read as grammatical and confident while stating nothing the agent can check. Guiding test: judge the word by what it earns. "The lock is held across the retry" is a fact. "The lock is critical" is a mood.
+
+    Patterns to flag:
+    - **Copulative avoidance** — "serves as", "stands as", "functions as", "operates as", "represents", "offers", "features", "refers to" opening a definition. Rewrite to `is` / `are` / `has`: "This tool serves as the entry point" → "This tool is the entry point".
+    - **Negative parallelism** — "not just X but Y", "it's not X, it's Y", "no X, no Y, just Z". The shape implies the reader held a wrong belief the writer is correcting. In an instruction, state Y and stop.
+    - **Rule of three** — triads where one item carries the meaning ("fast, safe, and predictable"). Cut to the item that constrains behavior.
+    - **Uniform rhythm** — the strongest tell in the set, and the one a vocabulary grep never finds. Sentences of near-identical length through a paragraph; bullet lists where every item is bent into the same grammatical shape whether the content fits it or not (a list of four verb-then-object clauses, one of which was really a caveat); sections padded or trimmed to match each other rather than their content. State the fix positively: uneven sentence length, sections sized to their content, concrete specifics. **Carve-out:** do not flag bullet density itself. A prompt is a rule list, dense bullets are its correct form, and rewriting it as paragraphs makes it worse for the model reading it.
+    - **Present-participle tails** — "..., ensuring consistency across services", "..., enabling faster lookups", "..., contributing to reliability". The most common shape of filler; almost never carries a checkable claim. Delete the tail, or replace it with the condition it stands in for.
+    - **Elegant variation** — the highest-value pattern for prompts specifically. When the prose renames one thing mid-document ("the payload", then "the request body", then "the incoming data") it breaks the mapping between the instruction text and the actual tool name, parameter, or field the agent must emit. Flag every synonym drift away from the real symbol and propose the symbol name throughout. Stated from the other side: repeating the technical term is the human move, and here it is also the correct one — say `body` four times.
+    - **Editorial filler** — "Note that", "It's worth noting", "Importantly", "In other words" restating a clear sentence, "In summary" / "Overall" closing a section under one screen long.
+    - **Chat residue** — "Would you like me to", "Let me know if", "I hope this helps", "This follows best practices", plus unfilled placeholders shipped into a live prompt: `[Add description here]`, `<your-api-key>`, `TODO: fill in`, `2025-XX-XX`.
+    - **Promotional register** — "blazing fast", "powerful and flexible", "rich set of features", "plays a crucial role in the overall architecture". A tool has a job; it does not have a legacy.
+
+    Mechanical pre-checks — grep these first and report hits without further judgment; the false-positive rate is near zero:
+    - Curly quotes and apostrophes anywhere in the prompt, and above all inside a documented shell command or JSON example. They break grep, break copy-paste of the command, and in some languages break the code outright.
+    - Tool artifacts: `contentReference`, `oaicite`, `oai_citation`, `turn0search0`, `[cite: 1]`, `(start_span)`, `grok_card`, `attached_file:`, `utm_source=chatgpt.com`, `utm_source=openai`, `referrer=grok.com`.
+
+    **What NOT to flag.** False positives on this lens are expensive, because the finding reads as a claim about who wrote the text. They carry a second cost: over-correction takes the author's time and makes the prompt worse. A rewrite that strips a real constraint to satisfy a style rule is a net loss, and the fifth cosmetic finding in a row teaches the reader to skip the first four.
+    - Plain prose. "is", "are", "has", short sentences, and wordy-but-human constructions ("in order to", "the fact that") point *away* from machine authorship, not toward it.
+    - Good grammar, formal register, and correct technical terms in their precise sense (graceful shutdown, idempotent, first-class function).
+    - Em dashes on their own, especially unspaced, especially where the surrounding prose already uses them.
+    - Superlatives and definite claims ("the only caller", "always"). Machines hedge; authors commit.
+    - House style. If the whole document uses bold-lead bullets, that is the convention here, not a tic.
+
+    **Density decides.** Never open a finding on a single stylistic hit unless it is chat residue, a tool artifact, or a curly quote inside a command. A cluster in one paragraph is the signal.
+
+    **Do not speculate about authorship.** Write about the prose. "This rule states no checkable condition" is actionable; "this was written by ChatGPT" is a claim you cannot support and it makes the finding easy to dismiss.
+
+    **This lens ranks below Contradictions (lens 6) and Platitudes (lens 4).** Whether a prompt states something true and non-redundant matters more than whether it reads as machine-written, and the two are independent — a prompt can be beautifully written and specify a false constraint. When the same text trips both, the correctness finding leads and the style note becomes a clause inside it, not its own row.
+
+    **Never launder a false claim.** A rewrite must improve readability and must never make an unverified statement more convincing. If you cannot tell whether the claim under the bad prose is correct, say so in the finding and leave the claim alone. Rewriting filler around a wrong constraint makes the prompt more persuasive and more wrong.
+
+    **What this lens is not.** It improves readability. It is not detection-proofing, and a clean pass is no evidence about who wrote the prompt. Style cleanup is politeness, not defense.
+
+    **Boundary with Weak Language (lens 3):** that lens owns hedges, weak modals, unmeasurable adjectives, and aggressive emphasis — including bare intensifiers ("crucial", "vital", "essential") with no consequence stated. This lens owns sentence shape, vocabulary drift, residue, and formatting tells. Do not report the same phrase under both.
 
 ### Full Lenses (add to core)
 
-14. **Source Hierarchy** — When the agent has multiple sources (knowledge base, training, retrieved docs, current user message), is there an explicit priority rule? Without it, the agent silently picks one and you can't predict which. Example of a good rule:
+15. **Source Hierarchy** — When the agent has multiple sources (knowledge base, training, retrieved docs, current user message), is there an explicit priority rule? Without it, the agent silently picks one and you can't predict which. Example of a good rule:
 
     > "Prefer the knowledge base over training knowledge. Prefer the current user message over the knowledge base. If the knowledge base and the user message contradict, say so and ask which to trust."
 
     Propose a three-line priority rule if missing.
 
-15. **Escalation / Handoff** — For agents with human handoff: are triggers named with enumerated conditions?
+16. **Escalation / Handoff** — For agents with human handoff: are triggers named with enumerated conditions?
     - **Explicit triggers**: user phrases like "talk to a human", "I want support", "escalate this".
     - **Implicit triggers**: "after 2 failed clarifications", frustration markers ("this is useless", "I'm giving up"), request outside documented scope.
 
     Is the exact handoff sentence given verbatim? Is the state-to-pass to the next handler specified (user ID, conversation summary, open questions)? Flag missing pieces. Agents without escalation either loop forever or bail on the first friction.
 
-16. **Tool Descriptions** — Tool description fields are system-prompt text the model reads every turn. Apply lenses 1-4 to every tool description. Additionally check:
+17. **Tool Descriptions** — Tool description fields are system-prompt text the model reads every turn. Apply lenses 1-4 and lens 14 to every tool description. Additionally check:
     - Is the boundary between overlapping tools named? ("`search_docs` for product behavior; `search_tickets` for customer history.")
     - Is recovery guidance present? ("Returns up to 10 results; re-query with a narrower phrase if none match.")
     - Are arguments documented with examples where the format matters?
 
-17. **Examples** — For few-shot examples:
+18. **Examples** — For few-shot examples:
     - Do they span the cases (happy path + refusal + clarification + edge case), or only the happy path?
     - Do any examples contradict the written rules? Flag as high-severity — examples win over rules silently.
     - Are examples teaching *shape* (tone, structure, length) or teaching *knowledge* (facts)? Teaching knowledge via examples is a code smell — facts belong in the knowledge base, examples should model structure.
 
-18. **Self-Verification** — Are soft-check instructions named? Examples:
+19. **Self-Verification** — Are soft-check instructions named? Examples:
     - "Before sending, check that every factual claim has a cited source."
     - "Before refusing, check whether a scoped partial answer is possible."
     - "If your response is longer than 3 paragraphs, check whether the user asked for that much."
 
     These are cheap to add and measurably improve compliance.
 
-19. **Cold Start** — Pretend to be a fresh LLM with zero context outside the prompt. What assumptions does the prompt make? (Product knowledge, jargon, workflow steps, user profile fields, tool semantics.) Flag anything the prompt references but doesn't define. Agents without this context hallucinate definitions or fail silently; undefined references are a common source of behavior that looks random to users.
+20. **Cold Start** — Pretend to be a fresh LLM with zero context outside the prompt. What assumptions does the prompt make? (Product knowledge, jargon, workflow steps, user profile fields, tool semantics.) Flag anything the prompt references but doesn't define. Agents without this context hallucinate definitions or fail silently; undefined references are a common source of behavior that looks random to users.
 
-20. **Reasoning-Model Fit** — If the target prompt deploys on a reasoning-capable model (Claude with extended thinking, o3, DeepSeek R1, Gemini thinking), flag patterns that degrade on these models:
+21. **Reasoning-Model Fit** — If the target prompt deploys on a reasoning-capable model (Claude with extended thinking, o3, DeepSeek R1, Gemini thinking), flag patterns that degrade on these models:
     - Redundant meta-instructions ("think step by step", "reason carefully") — native to the thinking trace; compete with it.
     - Heavy few-shot blocks on reasoning-heavy tasks — anchor the trace and suppress exploration.
     - Prescribed reasoning structure ("first analyze X, then Y") — often beats the model's native strategy in the wrong direction.
@@ -166,7 +205,7 @@ Ask the user for target path and scope before launching agents — running on as
 
 - **Path**: Point at the directory containing the agent prompt (or a single file if the whole prompt is one file). The skill will auto-discover system prompt, tool descriptions, examples, and guardrail files.
 - **Scope**: Ask the user to pick one:
-  - `standard` (recommended) — runs the 13 core lenses: framing, reasoning, weak language, platitudes, redundancy, contradictions, persona, scope & redirect, clarification policy, output shape, uncertainty, guardrails, rule hardening
+  - `standard` (recommended) — runs the 14 core lenses: framing, reasoning, weak language, platitudes, redundancy, contradictions, persona, scope & redirect, clarification policy, output shape, uncertainty, guardrails, rule hardening, prose tics
   - `full` — everything above plus source hierarchy, escalation, tool descriptions, examples audit, self-verification, cold start, reasoning-model fit
   - Or the user can name specific areas (e.g., "just check framing and weak language")
 
@@ -235,6 +274,8 @@ If the agent's output deviates from the expected structure, reformat it for pres
 
 - **One sub-agent, all selected lenses.** Agent-prompt audits target a single small artifact. Multi-subagent dispatch (as in `audit-agent-docs`) adds coordination overhead not justified here. Deploy one agent, apply all selected lenses in one pass.
 - **The sub-agent deduplicates across lenses internally.** The same issue often trips multiple lenses (e.g., "NEVER mention competitors" violates both Framing and Guardrails). Merge duplicates into one finding; list all flagging lenses.
+
+- **The report is capped and systemic patterns are batched.** The cap and batching rules live in `audit-agent.md`; if the returned report exceeds the cap, hand it to the user as-is and note the overflow rather than re-auditing it yourself.
 - **Propose edits; do not apply them.** Wait for user approval before making changes. The user decides which findings are worth the code churn.
 - **Scope findings strictly to the discovered files.** Do not pull rules from conversation context, CLAUDE.md, or global configs — the user cannot act on findings tied to files they don't control.
 - **LLM-agnostic output.** Audit prompt text, not deployment infrastructure. Mention Claude-specific tools (`.claude/rules/`, skills, hooks) only when the target prompt is demonstrably a Claude Code prompt; otherwise propose portable advice.

@@ -57,6 +57,8 @@ If a rule's placement, wording, or scope is ambiguous, ask the user rather than 
 
 Never silently reinterpret an existing rule while editing around it. If you can't verify a fact in the project while drafting, use the phrase: `"[Uncertain — verify with the user]"` inline rather than omitting the detail or guessing it.
 
+Polish ranks below correctness. When you reword an existing rule, verify it still holds first — a smoothly phrased stale instruction is worse than the clumsy version, because the polish makes it more convincing. Never tidy the prose around a claim you haven't checked.
+
 ## Output & Interaction
 
 When the user asks you to update CLAUDE.md or `.claude/rules/`:
@@ -124,9 +126,11 @@ Tell the agent how to check its own work — the command to run, the file to dif
 
 ## Avoid Weak Language
 
+The test for any adjective in a rule: does it name a fact or a mood? "This migration drops the column before the backfill runs" is a fact the agent can check. "This migration is critical" is a mood. Moods read as emphasis and give the agent nothing to act on.
+
 - **Weak modals**: "should", "consider", "try to", "ideally", "prefer to" — rewrite as clear directives. If truly optional, say so explicitly ("MAY ... but only when ...").
 - **Weasel phrases**: "use appropriate...", "as needed", "if possible", "usually", "generally" — these give agents an escape hatch. Use concrete conditions instead.
-- **Unmeasurable quality**: "write clean code", "use best practices", "be careful with" — agents can't evaluate these. Replace with specific, checkable criteria or delete.
+- **Unmeasurable quality**: "write clean code", "use best practices", "be careful with" — moods. Replace with specific, checkable criteria or delete.
 - **Aggressive emphasis**: "CRITICAL!", "YOU MUST", "NEVER EVER" — calm, direct instructions perform better. Reserve emphasis for the 2-3 most important rules; overuse dilutes all of them.
 
 ## Self-Evident Instructions
@@ -172,6 +176,10 @@ Use integration tests with a real database for API routes.
 ## Lost in the Middle
 
 LLMs pay more attention to the beginning and end of long documents. In files >= 20 lines, put critical rules at the top or bottom — not buried in the middle. The effect is strongest on base-chat models; reasoning models attend to middle sections more evenly, but head-or-tail placement is still the safer default since the same doc is read by both.
+
+## Name Things the Same Way Every Time
+
+Rotating synonyms for one thing — "the deploy script", then "the release tool", then "the publish step" — breaks the mapping between the doc and the command the agent has to run. Repetition reads as fussy in an essay and as precise in agent docs. Name it once and reuse that name.
 
 ## Avoid Redundancy
 
