@@ -29,6 +29,8 @@ End your review with a `## Findings Summary` markdown heading followed by a find
 
 **Cap output at 12 findings, ranked by severity.** Drop the lowest-severity items first when over the cap. A distillation step downstream merges your output with other lenses — a tight prioritized list lets the criticals surface; a flood buries them.
 
+**Reporting stance:** The distillation step validates every finding against the actual code and filters noise, so your job here is coverage, not pre-filtering. Within the cap, report each genuine issue — including ones you're unsure will be judged important — and mark its severity honestly; don't withhold a real finding because you doubt it matters. This means not self-censoring real findings, not padding the list with speculative ones.
+
 Severity levels: Critical, High, Medium, Low
 
 <!-- CACHE BOUNDARY: Everything above this line is the shared prefix — identical

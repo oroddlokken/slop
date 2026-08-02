@@ -14,6 +14,12 @@ Scan for comments and docstrings that say in five paragraphs what belongs in one
 - Walking through control flow line by line in prose when the code is already linear and readable
 - Justifying a design at length where a one-line pointer ("resolved from the package, not CWD — see entra.py") suffices
 
+### One rationale re-argued at every call site
+
+A constraint gets explained where it is defined, and then explained again in every function, test and template that observes it — fifteen paragraphs of the same argument, each slightly reworded. The rationale is real; the repetition is the finding. Flag the copies, keep the canonical statement at the place the constraint lives, and leave the observers bare or with a bare pointer to the symbol.
+
+The tell is a phrase that recurs across files: the same constraint named the same way in a dozen docstrings. Grep the distinctive noun phrase and count the sites.
+
 ### Prose that should be structure
 - A wall of prose describing a resolution order / fallback chain that a 3-item numbered list would convey faster
 - Long inline comments that would be clearer as a short docstring, or vice versa
@@ -53,7 +59,7 @@ After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Issue | Suggestion |
 |---|----------|-----------|-------|------------|
-| 1 | Medium | config.py:1-19 | 19-line module docstring; contract ("loads [diagnosis] suppression, best-effort, re-read per request") is 2 lines, rest is narrative | Cut to a 3-line summary + a one-line pointer to the ticket |
+| 1 | Medium | config.py:1-19 | 19-line module docstring; contract ("loads [diagnosis] suppression, best-effort, re-read per request") is 2 lines, rest is narrative | Cut to the 2-line contract plus the one gotcha (re-read per request); drop the backstory |
 
 ## Rules
 
@@ -61,3 +67,4 @@ After scanning, output your `## Findings Summary` table:
 - **Never delete a fact — only cut words.** If the ramble contains a real gotcha, preserve the gotcha in the shortened version. When unsure whether a sentence carries a fact, keep it and flag only the clearly redundant parts.
 - **Respect the project's own norm.** If every docstring in the codebase is a paragraph, a two-paragraph one is the outlier — calibrate to the house style, flag the excess above it.
 - **A short comment is never rambling.** This lens is about volume; one-line redundancy belongs to `restates-code`.
+- **Length is not proof of care.** Comment volume tracks how hard the decision felt to write, not how surprising the code is to read. A decision that took a day and a decision that took a minute get the same one line if they are equally non-obvious on the page.

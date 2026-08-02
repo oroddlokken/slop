@@ -10,8 +10,17 @@ Scan for comments and docstrings engineered to go stale: they bake a *moment in 
 - "As of the current prod state…", "currently the only workload that…" — snapshots of a mutable world
 
 ### Ticket / issue references inline in prose
-- `chartroom-3x49`, `JIRA-1234`, `#4567` embedded in docstrings and comments as the *explanation* ("de-escalated (chartroom-3x49)")
-- These belong in git history / the tracker, not as permanent code prose; they rot when the tracker changes and mean nothing to a future reader without access
+
+The most common form of this rot, and the default fix is deletion. `chartroom-3x49`, `JIRA-1234`, `#4567`, `vekt-52r9` embedded in a comment, a docstring, a test docstring, a SQL migration header, a template comment, a CSS block.
+
+The id belongs in the commit message and the tracker. In the file it carries nothing a reader can use: without tracker access it resolves to nothing at all, and with access it resolves to a closed ticket describing code that has since moved.
+
+Two shapes, both flagged:
+
+- **Trailing citation** — the sentence is complete and the id is bolted on: `... so the day bucket is derived in Python (vekt-52r9).` Delete the parenthetical, keep the sentence.
+- **Id standing in for the fact** — the sentence only parses if you go read the ticket: `Refines vekt-34gr.` / `The whole point of vekt-24tp: don't silently pick one equation.` Here the rationale is missing, not abbreviated. Recover the fact from the code and write it.
+
+**Grade the spread, not the instance.** One stray id is Low. The same project prefix across dozens of files is a house habit; one High finding naming the prefix, the file count and the fix beats forty Lows that get skimmed past.
 
 ### Temporal framing
 - "recently added", "new in this version", "the old behaviour", "for now", "temporarily", "will be removed soon" with no date or version — permanently "recent"
@@ -27,7 +36,7 @@ Scan for comments and docstrings engineered to go stale: they bake a *moment in 
 ## How to Scan
 
 1. **Search for proper nouns in comments** — capitalized resource names, service names, registries, hostnames. Ask: will this name still exist / be relevant in a year?
-2. **Grep for ticket patterns** in comments/docstrings: `[a-z]+-[0-9a-z]{3,}`, `#\d+`, `JIRA-`, project prefixes.
+2. **Grep for ticket patterns** in comments/docstrings: `[a-z]+-[0-9a-z]{3,}`, `#\d+`, `JIRA-`. Derive the local prefix first — it is usually the repo or product name — then grep it case-insensitively across every file type, source and tests and migrations and templates alike. Count the hits and the files before writing the finding.
 3. **Grep for temporal words**: `recently`, `currently`, `new`, `old`, `now`, `soon`, `temporarily`, `for now`, `as of`, `prior`, `used to`.
 4. **Find dates and names** in comments.
 5. **For each hit, separate the durable point from the transient carrier.** "A can't-evaluate is an infra problem, not a policy violation" is durable; "(chartroom-5dbt)" and "the live skybank-savings Deployment" are transient carriers of it.
@@ -46,9 +55,9 @@ For each transient element:
 
 ### Severity Guide
 
-- **Medium**: A concrete live-instance anecdote presented as a durable example — will actively mislead once that instance changes; and pervasive ticket-id litter across many docstrings (systemic).
+- **High**: Ticket-id litter spanning more than a handful of files — the reader cannot resolve any of it without a system outside the repo, and the cost is the file-by-file sweep, not any one line. Also an id standing in for the rationale, where deleting it leaves a sentence that says nothing. Also a temporal claim ("this is safe *for now* because X holds") that will read as a permanent guarantee once X stops holding.
+- **Medium**: A concrete live-instance anecdote presented as a durable example — will actively mislead once that instance changes.
 - **Low**: A single stray ticket id, an author name, a "recently" with no other harm.
-- Rarely **High**: only when a temporal claim ("this is safe *for now* because X holds") will read as a permanent guarantee after X stops holding.
 
 ## Output Format
 
@@ -56,11 +65,13 @@ After scanning, output your `## Findings Summary` table:
 
 | # | Severity | File:Line | Issue | Suggestion |
 |---|----------|-----------|-------|------------|
-| 1 | Medium | policy.py:4-8 | Docstring names a live workload ("skybank-savings Deployment … dokken.azurecr.io") as the example | Generalize to "a workload whose image-verification rule errors on registry auth"; drop the instance name |
+| 1 | High | 41 files, 148 sites | `vekt-<id>` ticket refs inlined in comments, docstrings, migrations, templates and CSS | Sweep them out. Where the id trails a complete sentence, delete the parenthetical; where it *is* the explanation (`refines vekt-34gr`), replace it with the fact |
+| 2 | Medium | policy.py:4-8 | Docstring names a live workload ("skybank-savings Deployment … dokken.azurecr.io") as the example | Generalize to "a workload whose image-verification rule errors on registry auth"; drop the instance name |
 
 ## Rules
 
 - **Keep the lesson, cut the timestamp.** Every fix preserves the durable point and removes only the rot-prone carrier.
+- **An id is not a fact.** A reference is only worth its line when the thing it points at is permanent and reachable from the file — an RFC number, a CVE, an upstream bug URL that outlives the sprint. A ticket in the team's own tracker is none of those.
 - **Group systemic litter.** "Ticket ids inlined in 14 docstrings" is one finding listing locations, not 14 findings.
 - **A dated freshness marker is legitimate** when the comment's job is to record when something was verified (e.g. a `LAST_CHECKED` pricing note). Don't flag those — flag dates masquerading as permanent facts.
 - **Don't flag stable identifiers** — a public API name, an env var, a config key, a standardized annotation string are not transient. Transient = tied to a mutable instance or moment.

@@ -25,7 +25,7 @@ You are reviewing the codebase at `{path}` through a pragmatic DRY lens.
 
 # Your Assignment: Pragmatic DRY Analysis
 
-You review in **both directions** — finding code that should be shared AND abstractions that should be inlined. Every finding requires reasoning — the framework test reference is the deliverable, not just the code location.
+You review in **both directions** — finding code that should be shared AND abstractions that should be inlined. Every finding must cite which framework test led to it — that rule citation is the deliverable, not just the code location.
 
 ## The Decision Framework
 
@@ -164,7 +164,7 @@ For "Inline This" findings:
 ## Rules
 
 - **Weigh each finding on its framework test alone** — abstract-this and inline-this carry equal weight.
-- **Every finding includes a framework test reference.** A finding without one is incomplete — the reasoning is the deliverable.
+- **Every finding includes a framework test reference.** A finding without one is incomplete — the rule citation is the deliverable.
 - **Include "Leave Alone" items** when you find incidental duplication. They prevent future bad refactors by explaining why similar-looking code is correctly separate.
 - **Be concrete**: specify where the shared version lives, its name, and its interface. "Extract to `services/billing.py:calculate_total(items, tax_rate)`" — not "consider abstracting."
 - **Skip framework boilerplate** (route decorators, model definitions, test setup) — these are intentionally repeated by design.

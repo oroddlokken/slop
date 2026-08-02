@@ -21,12 +21,15 @@ The orchestrator has already scanned the codebase. Here are the files:
 - **Redact credentials** — replace API keys, passwords, tokens, private keys, and database connection strings with `[REDACTED]` in your report.
 - **Skip sensitive files** (`.env*`, `*.secrets`, `*credentials*.json`, `*.key`, `*.pem`, `secrets.yml`) — report their paths without reading content, including during targeted follow-up searches.
 - **Every finding must include**: the exact input/sequence that triggers the issue, the code path from entry to breakage, and the impact (crash, data corruption, security bypass, wrong result, hang). Findings without a concrete reproducible scenario are rejected.
+- **This is a defensive hardening review of our own code.** You are locating inputs and sequences the code fails to handle safely so they can be fixed. State each weakness and the fix that closes it — a concrete triggering input proves the gap; do not write working exploits, weaponized payloads, or attack tooling.
 
 {focus}
 
 ## Output Format
 
 **Cap output at 12 findings, ranked by severity and exploitability.** Drop the lowest-severity items first when over the cap. A distillation step downstream merges your output with other fuzzers — a tight prioritized list lets the criticals surface; a flood buries them.
+
+**Reporting stance:** The distillation step validates every finding against the actual code and filters noise, so your job here is coverage, not pre-filtering. Within the cap, report each genuine gap — including ones you're unsure will be judged important — and mark its severity honestly; don't withhold a real finding because you doubt it matters. This means not self-censoring real findings, not padding the list with speculative ones.
 
 End your analysis with a structured findings table:
 
@@ -47,8 +50,8 @@ End your analysis with a structured findings table:
 - **Medium**: Requires unusual but plausible input or timing
 - **Hard**: Requires intentional adversarial action
 
-After the table, write a brief **Attack Narrative** (3-5 sentences max):
-- If critical findings exist: describe the most dangerous attack chain and how a real attacker or confused user would exploit it.
+After the table, write a brief **Exposure Summary** (3-5 sentences max):
+- If critical findings exist: describe the most serious undefended path — which input reaches which weakness — and the defense that would close it.
 - If no critical findings: summarize the strongest defensive pattern observed and note what minor gaps remain.
 
 <!-- CACHE BOUNDARY: Everything above this line is the shared prefix — identical
@@ -61,13 +64,13 @@ After the table, write a brief **Attack Narrative** (3-5 sentences max):
 
 **Your attack angle:** {attack_angle}
 
-## Attack
+## Probe the defenses
 
-For your attack angle, enumerate attack surfaces and probe each one:
+For your attack angle, enumerate the input surfaces the code exposes and test each one's defenses:
 
-1. **Identify attack surfaces** — which functions, endpoints, or code paths are vulnerable to your specific attack angle?
-2. **Craft concrete scenarios** — for each surface, describe the exact input, sequence, or condition that would cause breakage
-3. **Trace the blast radius** — follow the bad input through the code. Where does it first enter? Where does it actually break? What's the impact?
+1. **Identify input surfaces** — which functions, endpoints, or code paths take input relevant to your specific attack angle?
+2. **Find the undefended cases** — for each surface, identify the exact input, sequence, or condition the code fails to handle safely
+3. **Trace the blast radius** — follow the unhandled input through the code. Where does it first enter? Where does it actually break? What's the impact?
 4. **Check for existing defenses** — does the code already handle this case? If so, is the defense complete or does it have gaps? Before skipping a finding as "mitigated," confirm the mitigation is actually active in this codebase (not just a framework default).
 5. **Rate the exploitability** — how likely is this to happen in practice? Is it a realistic user scenario or only possible with intentional abuse?
 
@@ -86,4 +89,4 @@ Every finding must be:
 - Theoretical issues with no concrete path to trigger them
 - Issues that require physical access to the server
 - Issues in test code (unless tests are shipped to production)
-- Style issues — you're here to break things, not critique aesthetics
+- Style issues — you're here to find where inputs break the code, not critique aesthetics

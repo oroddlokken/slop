@@ -46,7 +46,7 @@ If the user does not specify a mode, run Full mode automatically.
 Comments rarely cause data loss directly, so severity is measured by **how badly the prose misleads or costs a maintainer**:
 
 - **Critical**: A comment or doc that actively misdirects on a safety-critical property (thread-safety, locking, security, money handling, data integrity) such that trusting it causes a bug.
-- **High**: A comment/docstring that contradicts the code, or a genuinely non-obvious hazard left unexplained — a maintainer will be misled or will reintroduce a bug.
+- **High**: A comment/docstring that contradicts the code, or a genuinely non-obvious hazard left unexplained — a maintainer will be misled or will reintroduce a bug. Also prose that only resolves through a system outside the repo (ticket ids carrying the rationale) once it spans more than a handful of files: the reader can never resolve it and the fix is a codebase-wide sweep.
 - **Medium**: Rotting anecdotes, cross-layer redundancy, docstring gaps on public API, doc/README drift — real maintenance cost, no immediate trap.
 - **Low**: Rambling prose, restatements of the obvious, decorative noise — clutter, fix-when-nearby.
 
@@ -57,7 +57,7 @@ Available reviewers:
 | Reviewer | Lens |
 |----------|------|
 | rambling | Essay-length narrative, storytelling, over-explanation where a line would do |
-| transient | Baked-in live-instance anecdotes, ticket refs, dates, author names, "recently/new" notes that rot |
+| transient | Ticket/issue ids inlined in prose, live-instance anecdotes, dates, author names, "recently/new" notes that rot |
 | contradicts-code | Comment/docstring that no longer matches the code — drifted or wrong from birth |
 | restates-code | Comments that narrate what the code plainly says; docstrings echoing the signature |
 | missing-why | Non-obvious code (magic numbers, workarounds, ordering constraints) with no rationale where one is warranted |
