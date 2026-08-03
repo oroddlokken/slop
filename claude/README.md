@@ -14,26 +14,30 @@ ln -s "$SETUP_DIR/claude/skills" ~/.claude/skills
 
 ### Status line
 
-The status line script is shared across all profiles:
+Nothing to link. Both profiles' `settings.json` run
+`bash $SETUP_DIR/claude/statusline-command_x.sh`, and that wrapper sets the
+`CLAUDE_STATUSLINE_*` env vars before exec'ing `statusline-command.py` from its
+own directory in the repo.
+
+### Hooks
+
+The whole directory, so a new hook needs no second step on every machine:
 
 ```bash
-ln -sf "$SETUP_DIR/claude/statusline-command.py" ~/.claude/statusline-command.py
+ln -s "$SETUP_DIR/claude/hooks" ~/.claude/hooks
 ```
 
 ### Profile (settings)
 
-Each profile directory (`sbnorge/`, `personal/`, etc.) contains a `settings.json`. Symlink the appropriate profile into `~/.claude/`:
-
-**SB Norge (work):**
-
-```bash
-ln -sf "$SETUP_DIR/claude/sbnorge/settings.json" ~/.claude/settings.json
-```
-
-**Personal:**
+Each profile directory (`mbp2022/`, `sbnorge/`) holds `settings.json`,
+`settings.local.json` and `CLAUDE.md`. Profiles are named per config flavour,
+not per machine, so `config.ini` carries a separate `claude_profile` key when
+it differs from the machine profile.
 
 ```bash
-ln -sf "$SETUP_DIR/claude/personal/settings.json" ~/.claude/settings.json
+for f in settings.json settings.local.json CLAUDE.md; do
+  ln -sf "$SETUP_DIR/claude/<profile>/$f" ~/.claude/$f
+done
 ```
 
 ## Adding a new skill
@@ -47,17 +51,6 @@ claude/skills/
 ```
 
 The skill will be available immediately via the symlink.
-
-## Adding a new agent
-
-Create a markdown file under `agents/`:
-
-```
-claude/agents/
-  my-agent.md
-```
-
-Skills reference agents by reading `~/.claude/agents/<name>.md` and passing the contents as an agent prompt.
 
 ## Project grouping (ccreport)
 

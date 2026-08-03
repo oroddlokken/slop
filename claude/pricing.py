@@ -64,7 +64,7 @@ class UsageData(TypedDict, total=False):
     month_cost: float
     project_cost: float
 
-    # Peak info (from compute_peak_info)
+    # Peak info (from compute_peak_info; only present when CLAUDE_PEAK_HOURS=1)
     peak_is_peak: bool
     peak_flip_seconds: int
 

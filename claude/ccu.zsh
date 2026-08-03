@@ -6,7 +6,8 @@
 #        When changing any calculation, caching, or data format here,
 #        update CLAUDE.md to match.
 #
-# Usage: ccu.zsh [--force|-f]
+# Usage: ccu.zsh [--force|-f] [--json]
+#        --json prints the raw usage API response instead of the dashboard.
 
 set -euo pipefail
 
@@ -14,8 +15,15 @@ SETUP_DIR="${SETUP_DIR:-$HOME/git/macsetup}"
 
 # --- Fetch usage JSON ---
 
-local force_flag=""
-[[ "${1:-}" == "--force" || "${1:-}" == "-f" ]] && force_flag="--force"
+local force_flag="" json_only=0
+local arg
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f) force_flag="--force" ;;
+    --json)     json_only=1 ;;
+    *) echo "Usage: ccu [--force|-f] [--json]" >&2; exit 2 ;;
+  esac
+done
 
 local py=python3
 local p
@@ -24,6 +32,11 @@ for p in python3.14 python3.13 python3.12 python3.11 python3.10; do
 done
 
 local usage_script="$SETUP_DIR/claude/get_claude_usage.py"
+
+# --json is a passthrough of the API body — no cache, no rendering.
+if (( json_only )); then
+  exec "$py" "$usage_script" --raw
+fi
 
 local json
 json=$("$py" "$usage_script" $force_flag 2>/dev/null) || true
@@ -39,19 +52,22 @@ jq_out=$(echo "$json" | jq -r '[
   (.session_percent // ""),
   (.week_percent // ""),
   (.sonnet_percent // ""),
+  (.scoped_percent // ""),
+  (.scoped_model // ""),
   (.extra_percent // ""),
   (.extra_spent // ""),
   (.extra_limit // ""),
   (.session_reset // ""),
   (.week_reset // ""),
   (.sonnet_reset // ""),
+  (.scoped_reset // ""),
   (.extra_reset // ""),
   (.last_updated // ""),
   (.peak_is_peak // ""),
   (.peak_flip_seconds // "")
 ] | join("\u001f")')
-local s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated peak_is_peak peak_flip_s
-IFS=$'\x1f' read -r s_pct w_pct so_pct e_pct e_spent e_limit s_reset w_reset so_reset e_reset last_updated peak_is_peak peak_flip_s <<< "$jq_out"
+local s_pct w_pct so_pct sc_pct sc_model e_pct e_spent e_limit s_reset w_reset so_reset sc_reset e_reset last_updated peak_is_peak peak_flip_s
+IFS=$'\x1f' read -r s_pct w_pct so_pct sc_pct sc_model e_pct e_spent e_limit s_reset w_reset so_reset sc_reset e_reset last_updated peak_is_peak peak_flip_s <<< "$jq_out"
 
 if [[ -z "$s_pct" && -z "$w_pct" ]]; then
   echo "No usage data available" >&2
@@ -281,6 +297,11 @@ if [[ -n "$so_pct" ]]; then
   echo
   ccu_section "Current week (Sonnet only)" "$so_pct" "$so_reset"
 fi
+if [[ -n "$sc_pct" ]]; then
+  echo
+  local sc_label="${sc_model:-model}"
+  ccu_section "Current week (${sc_label} only)" "$sc_pct" "$sc_reset"
+fi
 if [[ -n "$e_pct" ]]; then
   echo
   local extra_info=""
@@ -289,7 +310,9 @@ if [[ -n "$e_pct" ]]; then
   fi
   ccu_section "Extra usage" "$e_pct" "$e_reset" "$extra_info"
 fi
-if [[ -n "$peak_is_peak" ]]; then
+# Peak hours no longer applies to the current plan — opt back in with CLAUDE_PEAK_HOURS=1
+# (get_claude_usage.py only emits the peak_* fields when the flag is set).
+if [[ -n "$peak_is_peak" && "${CLAUDE_PEAK_HOURS:-0}" != "0" ]]; then
   echo
   local flip_cd=""
   if [[ -n "$peak_flip_s" && "$peak_flip_s" != "0" ]]; then

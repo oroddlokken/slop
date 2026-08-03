@@ -12,6 +12,7 @@ update CLAUDE.md to match.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -135,6 +136,11 @@ def get_usage_token() -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def peak_enabled() -> bool:
+    """Peak hours no longer applies to the current plan — opt back in with CLAUDE_PEAK_HOURS=1."""
+    return os.environ.get("CLAUDE_PEAK_HOURS", "0") != "0"
+
+
 def compute_peak_info() -> dict[str, Any]:
     """Compute current peak/off-peak status and countdown to next flip.
 
@@ -179,10 +185,9 @@ def compute_peak_info() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def fetch_usage_api(token: str) -> dict[str, Any]:
-    """Fetch usage data from the Anthropic API.
+def request_usage_body(token: str) -> dict[str, Any]:
+    """GET the usage endpoint and return the untouched response body.
 
-    Returns dict with session_percent, week_percent, etc. mapped to our format.
     Raises on HTTP/network errors after exhausting retries for transient failures.
     """
     req = Request(
@@ -220,6 +225,16 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
     else:
         raise last_exc  # type: ignore[misc]
 
+    return body
+
+
+def fetch_usage_api(token: str) -> dict[str, Any]:
+    """Fetch usage data from the Anthropic API.
+
+    Returns dict with session_percent, week_percent, etc. mapped to our format.
+    """
+    body = request_usage_body(token)
+
     data: dict[str, Any] = {}
 
     # five_hour → session
@@ -242,6 +257,21 @@ def fetch_usage_api(token: str) -> dict[str, Any]:
         data["sonnet_percent"] = int(sonnet["utilization"])
     if sonnet and sonnet.get("resets_at"):
         data["sonnet_reset"] = sonnet["resets_at"]
+
+    # weekly_scoped model limit (e.g. Fable) → scoped
+    # Lives in limits[]; the scope carries the model's display name.
+    for lim in body.get("limits") or []:
+        if lim.get("kind") != "weekly_scoped" or lim.get("percent") is None:
+            continue
+        model = (lim.get("scope") or {}).get("model") or {}
+        name = model.get("display_name")
+        if not name:
+            continue
+        data["scoped_percent"] = int(lim["percent"])
+        data["scoped_model"] = name
+        if lim.get("resets_at"):
+            data["scoped_reset"] = lim["resets_at"]
+        break
 
     # extra_usage
     extra = body.get("extra_usage", {})
@@ -279,13 +309,36 @@ def _enrich_and_emit(
     except Exception as e:  # noqa: BLE001
         if warn_on_error:
             print(f"Warning: cost computation failed: {e}", file=sys.stderr)
-    data.update(compute_peak_info())
+    if peak_enabled():
+        data.update(compute_peak_info())
     print(json.dumps(data, indent=2))
 
 
-def _parse_cli_args() -> tuple[bool, int, str | None, str | None]:
-    """Parse CLI arguments. Returns (force, wait_timeout, session_id, cwd)."""
+def _emit_raw() -> None:
+    """Print the untouched API response body.
+
+    Bypasses the cache — only mapped fields are stored, never the raw body.
+    Failures here don't touch the fetch-failure backoff: this path is a manual
+    debugging tool, not the statusline's fetch.
+    """
+    token = get_usage_token()
+    if not token:
+        print("Error: no OAuth token found", file=sys.stderr)
+        sys.exit(1)
+    try:
+        print(json.dumps(request_usage_body(token), indent=2))
+    except HTTPError as e:
+        print(f"Error: API returned {e.code}", file=sys.stderr)
+        sys.exit(1)
+    except (URLError, OSError, json.JSONDecodeError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _parse_cli_args() -> tuple[bool, int, str | None, str | None, bool]:
+    """Parse CLI arguments. Returns (force, wait_timeout, session_id, cwd, raw)."""
     force = "--force" in sys.argv
+    raw = "--raw" in sys.argv
     wait_timeout = 30
     if "--wait-timeout" in sys.argv:
         idx = sys.argv.index("--wait-timeout")
@@ -304,7 +357,7 @@ def _parse_cli_args() -> tuple[bool, int, str | None, str | None]:
         idx = sys.argv.index("--cwd")
         if idx + 1 < len(sys.argv):
             cwd = sys.argv[idx + 1]
-    return force, wait_timeout, session_id, cwd
+    return force, wait_timeout, session_id, cwd, raw
 
 
 def _wait_for_leader(
@@ -332,7 +385,11 @@ def _wait_for_leader(
 
 def main() -> None:
     """Fetch and print Claude usage data, using cache when fresh."""
-    force, wait_timeout, session_id_arg, cwd_arg = _parse_cli_args()
+    force, wait_timeout, session_id_arg, cwd_arg, raw = _parse_cli_args()
+
+    if raw:
+        _emit_raw()
+        return
 
     if not force:
         cached = read_usage_cache(CACHE_MAX_AGE)
@@ -376,7 +433,8 @@ def main() -> None:
             print(f"Warning: cost computation failed: {e}", file=sys.stderr)
 
         write_usage_cache(data)
-        data.update(compute_peak_info())
+        if peak_enabled():
+            data.update(compute_peak_info())
         print(json.dumps(data, indent=2))
 
     except HTTPError as e:

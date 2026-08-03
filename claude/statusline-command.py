@@ -11,9 +11,10 @@ AUDIT: All calculations are documented in claude/CLAUDE.md.
        When changing any calculation, caching, or data format here,
        update CLAUDE.md to match.
 
-Layout adapts to terminal width (detected via $COLUMNS or /dev/tty):
-  >= 130 columns: 2 lines (top+session | usage+costs)
-  <  130 columns: 4 lines (top | session | usage | costs)
+Layout adapts to terminal width. Claude Code sets $COLUMNS itself (v2.1.153+);
+/dev/tty is only a fallback for direct invocation. See LAYOUT_WIDE_COLS:
+  >= 150 columns: 2 lines (top+session | usage+costs)
+  <  150 columns: 4 lines (top | session | usage | costs)
 
 Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_MODEL_BANNER            — colored banner showing the active model
@@ -27,9 +28,12 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_GIT                     — branch + indicators
   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
   CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation)
+  CLAUDE_STATUSLINE_RENDER_TIME             — how long this render took (0.235s)
   CLAUDE_STATUSLINE_SESSION                 — model, context window %
     CLAUDE_STATUSLINE_COST                  — session cost
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate %
+    CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as (xhigh)
+    CLAUDE_STATUSLINE_THINKING              — nothink marker when thinking is off
   CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on 80% usable window (auto-compact threshold)
   CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon)
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset)
@@ -486,6 +490,37 @@ def _adjust_passed_resets(data: dict, now: float) -> dict:
     return data
 
 
+def _native_rate_limits(data: dict) -> dict:
+    """Rate limits Claude Code sends on stdin — current on every render, no fetch.
+
+    Pro/Max only, and absent until the first API response of the session; each
+    window can be absent on its own. resets_at is epoch seconds here, converted
+    to ISO so the rest of the pipeline reads it like the cached OAuth values.
+    Percentages arrive as floats and are rounded to match the cache's ints.
+    """
+    rl = data.get("rate_limits") or {}
+    out: dict = {}
+    for window, pct_key, reset_key in (
+        ("five_hour", "session_percent", "session_reset"),
+        ("seven_day", "week_percent", "week_reset"),
+    ):
+        w = rl.get(window) or {}
+        try:
+            pct = w.get("used_percentage")
+            if pct is None:
+                continue
+            out[pct_key] = int(round(float(pct)))
+        except (TypeError, ValueError):
+            continue
+        resets = w.get("resets_at")
+        if resets:
+            try:
+                out[reset_key] = datetime.fromtimestamp(float(resets)).isoformat()  # noqa: DTZ006
+            except (TypeError, ValueError, OSError, OverflowError):
+                pass
+    return out
+
+
 def _fetch_usage(session_id: str, cwd: str) -> dict:
     """Get usage data: env var → cache bypass → detached get_claude_usage.py.
 
@@ -549,7 +584,17 @@ def _accumulate_cache_stats(
     input_fresh: int,
     total_in_tokens: int,
 ) -> tuple[int, int, int]:
-    """Accumulate per-message cache stats. Returns (cum_fresh, cum_create, cum_read)."""
+    """Accumulate per-message cache stats. Returns (cum_fresh, cum_create, cum_read).
+
+    total_in_tokens is the change key, not a running total: since v2.1.132 it is
+    the current context input, which equals the sum of the three current_usage
+    input fields. Compared with != rather than >, so a context that shrinks
+    after /compact still accumulates. Equality means the same API response we
+    already counted — the guard that keeps repeat renders (refreshInterval, mode
+    changes) from double-counting. Two consecutive responses with an identical
+    input total undercount by one; the payload carries no per-message id to key
+    on instead.
+    """
     if not session_id:
         return 0, 0, 0
     cached = read_cache_stats(session_id)
@@ -695,7 +740,10 @@ def _render_dogcat(dcat_data: dict) -> str:
     return f"dc[{parts}]"
 
 
-AUTOCOMPACT_BUFFER = 33_000  # tokens reserved by Claude Code before auto-compact
+# Tokens reserved by Claude Code before auto-compact. Estimate, not documented
+# anywhere: calibrated against a 200k window and applied flat, so a 1M window
+# reads as 967k. Verify against /context before trusting it at 1M.
+AUTOCOMPACT_BUFFER = 33_000
 
 
 def _render_ctx_pct(used: str, ctx_size: int) -> str:
@@ -993,7 +1041,9 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
                 rl_inners.insert(0, f"{SUBDUED}TTL:{ttl_s // 60}m{ttl_s % 60}s{RST}")
             else:
                 age_s = int(now - upd_epoch)
-                if age_s >= STALE_THRESHOLD_S:
+                # Age condemns only fetched data. With native S/W the marker
+                # still flags Sonnet/Extra/costs as old, but nothing is dropped.
+                if age_s >= STALE_THRESHOLD_S and not usage.get("_native_rl"):
                     rl_inners.clear()
                     have_rate_limits = False
                 else:
@@ -1098,8 +1148,24 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
     return session_rl, rl_line, cost_line
 
 
+def _render_effort(level: str) -> str:
+    """Reasoning effort for the session. Ultracode is not distinct — it reads as xhigh."""
+    if not _on("EFFORT") or not level:
+        return ""
+    return f"{SUBDUED}({level}){RST}"
+
+
+def _render_thinking(thinking_off: bool) -> str:
+    """Flag extended thinking being off — the state worth noticing."""
+    if not _on("THINKING") or not thinking_off:
+        return ""
+    return _c("0;33", "nothink")
+
+
 def _render_session(
     model: str,
+    effort: str,
+    thinking_off: bool,
     used: str,
     ctx_size: int,
     cum_fresh: int,
@@ -1115,6 +1181,11 @@ def _render_session(
         # "Opus 4.6 (1M context)" → "Opus 4.6 1M"
         short_model = re.sub(r"\s*\((\d+\w+)\s+context\)", r" \1", model)
         parts.append(f"{SUBDUED}{short_model}{RST}")
+
+    # Reasoning config sits with the model it configures
+    for seg in (_render_effort(effort), _render_thinking(thinking_off)):
+        if seg:
+            parts.append(seg)
 
     # Per-session cost (dynamic — standard dim)
     if _on("COST") and session_cost:
@@ -1180,6 +1251,8 @@ class _InputData(NamedTuple):
     """Parsed input fields from Claude status JSON."""
     cwd: str
     model: str
+    effort: str
+    thinking_off: bool
     used: str
     ctx_size: int
     lines_added: int
@@ -1193,16 +1266,27 @@ class _InputData(NamedTuple):
 
 def _parse_input(data: dict) -> _InputData:
     """Extract all needed fields from Claude status JSON."""
-    cwd = data.get("workspace", {}).get("current_dir") or data.get("cwd", "")
-    model = data.get("model", {}).get("display_name", "")
-    used_raw = data.get("context_window", {}).get("used_percentage", "")
+    # `or {}` throughout, not `.get(k, {})`: Claude Code sends several of these
+    # as explicit null rather than omitting them, and a default never applies to
+    # a key that is present. current_usage is null before the first API call and
+    # again after /compact until the next one.
+    cw = data.get("context_window") or {}
+    cur = cw.get("current_usage") or {}
+    cost_obj = data.get("cost") or {}
+    cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd", "")
+    model = (data.get("model") or {}).get("display_name", "")
+    used_raw = cw.get("used_percentage", "")
     used = str(used_raw) if used_raw is not None and used_raw != "" else ""
-    ctx_size = int(data.get("context_window", {}).get("context_window_size", 0) or 0)
-    cost_obj = data.get("cost", {})
-    cur = data.get("context_window", {}).get("current_usage", {})
+    ctx_size = int(cw.get("context_window_size", 0) or 0)
+    # effort is absent when the model has no effort parameter; thinking only
+    # counts as off when explicitly false, not when the field is missing
+    effort = str((data.get("effort") or {}).get("level", "") or "")
+    thinking_off = (data.get("thinking") or {}).get("enabled") is False
     return _InputData(
         cwd=cwd,
         model=model,
+        effort=effort,
+        thinking_off=thinking_off,
         used=used,
         ctx_size=ctx_size,
         lines_added=int(cost_obj.get("total_lines_added", 0) or 0),
@@ -1210,7 +1294,7 @@ def _parse_input(data: dict) -> _InputData:
         cache_create=int(cur.get("cache_creation_input_tokens", 0) or 0),
         cache_read=int(cur.get("cache_read_input_tokens", 0) or 0),
         input_fresh=int(cur.get("input_tokens", 0) or 0),
-        total_in=int(data.get("context_window", {}).get("total_input_tokens", 0) or 0),
+        total_in=int(cw.get("total_input_tokens", 0) or 0),
         session_id=data.get("session_id", ""),
     )
 
@@ -1237,7 +1321,11 @@ def _layout_and_print(
         upd = _parse_iso_epoch(str(usage_data.get("last_updated", "") or ""))
         if upd is not None and (now_epoch - upd) >= STALE_THRESHOLD_S:
             usage_stale_1h = True
-    if usage_stale_1h or (not usage_session_rl and (check_fetch_backoff() or usage_data.get("session_percent") is None)):
+    # Never claim the usage line is stale or failed while S/W come from stdin;
+    # the stale:Nm marker inside the line covers the fetched fields instead.
+    if usage_data.get("_native_rl"):
+        pass
+    elif usage_stale_1h or (not usage_session_rl and (check_fetch_backoff() or usage_data.get("session_percent") is None)):
         if usage_data and usage_data.get("_stale"):
             usage_session_rl = f"\033[0;33musage stale\033[0m"
         else:
@@ -1246,6 +1334,11 @@ def _layout_and_print(
     DOT = f"{SUBDUED} · {RST}"
 
     top = [s for s in top if s]
+    # Render time and active-session count trail the top line
+    if _on("RENDER_TIME"):
+        top.append(f"{SUBDUED}{time.monotonic() - _t_start:.3f}s{RST}")
+    if sessions:
+        top.append(sessions)
     top_str = " ".join(top)
     peak_str = _render_peak(now_epoch)
     session_parts = [s for s in [session, peak_str] if s]
@@ -1271,16 +1364,9 @@ def _layout_and_print(
         if rest:
             lines.append(DOT.join(rest))
 
-    _t_elapsed = time.monotonic() - _t_start
-    last_parts: list[str] = []
-    if macmon_str:
-        last_parts.append(macmon_str)
-    if battery_str:
-        last_parts.append(battery_str)
-    last_parts.append(f"{SUBDUED}{_t_elapsed:.3f}s{RST}")
-    if sessions:
-        last_parts.append(sessions)
-    lines.append(DOT.join(last_parts))
+    last_parts = [s for s in (macmon_str, battery_str) if s]
+    if last_parts:
+        lines.append(DOT.join(last_parts))
     if force_red:
         lines = [_force_red(line) for line in lines]
     banner = _model_banner(model)
@@ -1291,23 +1377,34 @@ def _layout_and_print(
 
 def main() -> None:
     _t_start = time.monotonic()
-    test_mode = "-t" in sys.argv
+    now_epoch = time.time()
+    test_null = "-t0" in sys.argv  # pre-first-API-call / post-compact null state
+    test_mode = "-t" in sys.argv or test_null
 
     if test_mode:
         cwd = os.getcwd()
         data = {
             "session_id": "mock-session-id",
+            "session_name": "mock-session",
+            "version": "2.1.220",
             "workspace": {"current_dir": cwd},
-            "model": {"display_name": "Opus 4.6"},
+            "model": {"id": "claude-opus-5[1m]", "display_name": "Opus 5 (1M context)"},
+            "effort": {"level": "xhigh"},
+            "thinking": {"enabled": True},
+            "fast_mode": False,
             "context_window": {
                 "used_percentage": 42.7,
-                "context_window_size": 200000,
-                "total_input_tokens": 16378,
+                "remaining_percentage": 57.3,
+                "context_window_size": 1000000,
+                # total_input_tokens is the sum of the three current_usage
+                # input fields, and used_percentage is that over the window
+                "total_input_tokens": 427_000,
                 "total_output_tokens": 15177,
                 "current_usage": {
-                    "input_tokens": 3,
-                    "cache_creation_input_tokens": 658,
-                    "cache_read_input_tokens": 60106,
+                    "input_tokens": 494,
+                    "output_tokens": 15177,
+                    "cache_creation_input_tokens": 6_500,
+                    "cache_read_input_tokens": 420_006,
                 },
             },
             "cost": {
@@ -1315,7 +1412,16 @@ def main() -> None:
                 "total_lines_added": 128,
                 "total_lines_removed": 34,
             },
+            "rate_limits": {
+                "five_hour": {"used_percentage": 23.5, "resets_at": now_epoch + 8100},
+                "seven_day": {"used_percentage": 41.2, "resets_at": now_epoch + 401_400},
+            },
         }
+        if test_null:
+            data["context_window"].update(
+                used_percentage=None, remaining_percentage=None,
+                current_usage=None, total_input_tokens=0, total_output_tokens=0,
+            )
     else:
         raw = sys.stdin.read()
         try:
@@ -1324,7 +1430,6 @@ def main() -> None:
             return
 
     inp = _parse_input(data)
-    now_epoch = time.time()
 
     # Start external commands (non-blocking) — runs while we do in-process work
     git_procs = _start_git(inp.cwd)
@@ -1341,6 +1446,14 @@ def main() -> None:
                 if "project_cost" in k:
                     del usage_data[k]
         _merge_cost_data(usage_data, inp.session_id, inp.cwd)
+        # S and W come from stdin when Claude Code sends them — always current,
+        # so they win over the cache. Applied after the cost merge, which keys
+        # its compute-vs-read choice on usage_data being empty. Sonnet, Extra
+        # and the cost windows still come from the fetch.
+        native_rl = _native_rate_limits(data)
+        if native_rl:
+            usage_data.update(native_rl)
+            usage_data["_native_rl"] = True
         dcat_data = _fetch_dcat(inp.cwd)
 
         # Collect git results and macmon data
@@ -1386,14 +1499,15 @@ def main() -> None:
         _render_git(git.status_out, git.stash_out, git.branch, git.insertions, git.deletions),
         _render_dogcat(dcat_data),
         _render_changes(inp.lines_added, inp.lines_removed),
-        _render_ctx_pct(inp.used, inp.ctx_size),
     ]
     chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
     chat_cost = str(chat_cost_val) if chat_cost_val > 0 else ""
     session = _render_session(
-        inp.model, inp.used, inp.ctx_size,
+        inp.model, inp.effort, inp.thinking_off, inp.used, inp.ctx_size,
         cum_fresh, cum_create, cum_read, chat_cost,
     )
+    # ctx% trails the token counts it summarizes; stays independent of SESSION
+    session = " ".join(s for s in (session, _render_ctx_pct(inp.used, inp.ctx_size)) if s)
     sessions = _render_sessions(inp.cwd, now_epoch)
     macmon_str = _render_macmon(macmon_data)
     battery_str = _render_battery(battery_data)
