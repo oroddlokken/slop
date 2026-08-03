@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# Wrapper that calls statusline-command.py with env vars.
-
-export CLAUDE_STATUSLINE_CHANGES=0
-export CLAUDE_STATUSLINE_24H_COST=1
-export CLAUDE_STATUSLINE_CACHE_HIT=0
-export CLAUDE_STATUSLINE_APPLE_SILICON=0
-export CLAUDE_STATUSLINE_BATTERY=0
-export CLAUDE_STATUSLINE_RENDER_TIME=0
-export CLAUDE_STATUSLINE_SESSIONS=0
+# Seam both profiles' settings.json point at. Segment defaults live in
+# statusline-command.py; per-machine CLAUDE_STATUSLINE_* overrides go here.
 
 exec "$(dirname "${BASH_SOURCE[0]}")/statusline-command.py" "$@"

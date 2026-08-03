@@ -17,27 +17,27 @@ Layout adapts to terminal width. Claude Code sets $COLUMNS itself (v2.1.153+);
   <  150 columns: 4 lines (top | session | usage | costs)
 
 Toggle sections via environment variables (1=enabled, 0=disabled):
-  CLAUDE_STATUSLINE_MODEL_BANNER            — colored banner showing the active model
+  CLAUDE_STATUSLINE_MODEL_BANNER            — colored banner showing the active model (default 0)
   CLAUDE_STATUSLINE_HAIKU_RED               — recolor entire status line red when on Haiku
   CLAUDE_STATUSLINE_TIMESTAMP               — HH:MM invocation timestamp
   CLAUDE_STATUSLINE_SESSION_ID              — short session UUID
-  CLAUDE_STATUSLINE_HOSTNAME                — green hostname
+  CLAUDE_STATUSLINE_HOSTNAME                — green hostname (default 0)
   CLAUDE_STATUSLINE_DIR                     — blue project directory
   CLAUDE_STATUSLINE_SANDBOX                 — sbx/!sbx badge from merged Claude settings
   CLAUDE_STATUSLINE_DSP                     — orange DSP marker when started with --dangerously-skip-permissions
   CLAUDE_STATUSLINE_GIT                     — branch + indicators
   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
-  CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation)
-  CLAUDE_STATUSLINE_RENDER_TIME             — how long this render took (0.235s)
+  CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation) (default 0)
+  CLAUDE_STATUSLINE_RENDER_TIME             — how long this render took (0.235s) (default 0)
   CLAUDE_STATUSLINE_SESSION                 — model, context window %
     CLAUDE_STATUSLINE_COST                  — session cost
-    CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate %
+    CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate % (default 0)
     CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as (xhigh)
     CLAUDE_STATUSLINE_THINKING              — nothink marker when thinking is off
   CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on 80% usable window (auto-compact threshold)
-  CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon)
-  CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset)
-  CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min
+  CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon) (default 0)
+  CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset) (default 0)
+  CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min (default 0)
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
     CLAUDE_STATUSLINE_WEEKLY_PACE            — weekly pace indicator (D3/7: On Pace)
     CLAUDE_STATUSLINE_SONNET                — Sonnet usage %
@@ -46,8 +46,9 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_SCOPED_THRESHOLD      — hide scoped limit below this % (default 25)
     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit + per-window deltas (S/W)
     CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — show Extra when S% >= this (default 60)
-    CLAUDE_STATUSLINE_TTL                   — time until next usage fetch (only
-                                              shown when S/W are not on stdin)
+    CLAUDE_STATUSLINE_TTL                   — time until next usage fetch (default 0;
+                                              only when S/W are not on stdin, which on
+                                              Pro/Max is the pre-first-message render)
     CLAUDE_STATUSLINE_HISTORIC_COST         — entire historic cost line (6H/12H/24H/7D/30D/AT)
       CLAUDE_STATUSLINE_6H_COST            — rolling 6-hour cost (default 0)
       CLAUDE_STATUSLINE_12H_COST           — rolling 12-hour cost (default 0)
@@ -96,6 +97,7 @@ TEMP_CRIT_C = 90           # °C — red alert for CPU/GPU temp
 BATT_WARN_PCT = 40         # % — yellow warning when discharging
 BATT_CRIT_PCT = 20         # % — red alert when discharging
 STALE_THRESHOLD_S = 3600   # seconds before usage data is considered too old
+STALE_GRACE_S = 1800       # age the stale marker waits for when S/W have no native source
 USAGE_FETCH_INTERVAL_S = 600    # normal cadence when the API is actually needed
 USAGE_HEARTBEAT_S = 3600   # ceiling on API staleness when nothing needs it now
 NEAR_THRESHOLD_MARGIN = 10  # % below a display threshold that still warrants fetching
@@ -269,7 +271,7 @@ def _collect_git(
 
 def _start_macmon() -> subprocess.Popen[bytes] | None:
     """Start macmon pipe as a non-blocking subprocess."""
-    if not _on("APPLE_SILICON"):
+    if not _on("APPLE_SILICON", default=False):
         return None
     try:
         return subprocess.Popen(
@@ -351,7 +353,7 @@ def _render_macmon(data: dict) -> str:
 
 def _start_battery() -> subprocess.Popen[bytes] | None:
     """Start pmset battery query as a non-blocking subprocess."""
-    if not _on("BATTERY"):
+    if not _on("BATTERY", default=False):
         return None
     try:
         return subprocess.Popen(
@@ -862,7 +864,7 @@ def _render_ctx_pct(used: str, ctx_size: int) -> str:
 
 
 def _render_changes(lines_added: int, lines_removed: int) -> str:
-    if not _on("CHANGES"):
+    if not _on("CHANGES", default=False):
         return ""
     if not lines_added and not lines_removed:
         return ""
@@ -1004,7 +1006,7 @@ def _fmt_money(v: str) -> str:
 
 def _render_sessions(cwd: str, now: float) -> str:
     """Active sessions: distinct projects from history in last 15 min."""
-    if not _on("SESSIONS"):
+    if not _on("SESSIONS", default=False):
         return ""
     history = Path.home() / ".claude" / "history.jsonl"
     if not history.exists():
@@ -1162,12 +1164,16 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
         age_s = int(now - upd_epoch)
         if not usage.get("_native_rl"):
             ttl_s = int(USAGE_FETCH_INTERVAL_S - age_s)
-            if _on("TTL") and ttl_s > 0:
+            if _on("TTL", default=False) and ttl_s > 0:
                 rl_inners.insert(0, f"{SUBDUED}TTL:{ttl_s // 60}m{ttl_s % 60}s{RST}")
             elif age_s >= STALE_THRESHOLD_S:
                 rl_inners.clear()
                 have_rate_limits = False
-            else:
+            elif age_s >= STALE_GRACE_S or check_fetch_backoff():
+                # Past the fetch interval is not yet worth a warning here: the
+                # session's first render has no native S/W either, and the
+                # refresh it spawns lands on the next one. Wait for the grace
+                # age, or for a recorded failure that says it will not land.
                 rl_inners.insert(0, f"\033[0;31mstale:{age_s // 60}m\033[0m")
         elif age_s >= STALE_THRESHOLD_S and (so_shown or sc_shown or _extra_is_material(usage)):
             rl_inners.insert(0, f"\033[0;31mstale:{age_s // 60}m\033[0m")
@@ -1323,7 +1329,7 @@ def _render_session(
             pass
 
     # Cumulative cache hit rate (structural)
-    if _on("CACHE_HIT"):
+    if _on("CACHE_HIT", default=False):
         ti = cum_fresh + cum_create + cum_read
         if ti > 0:
             ch = cum_read * 100 // ti
@@ -1464,7 +1470,7 @@ def _layout_and_print(
 
     top = [s for s in top if s]
     # Render time and active-session count trail the top line
-    if _on("RENDER_TIME"):
+    if _on("RENDER_TIME", default=False):
         top.append(f"{SUBDUED}{time.monotonic() - _t_start:.3f}s{RST}")
     if sessions:
         top.append(sessions)

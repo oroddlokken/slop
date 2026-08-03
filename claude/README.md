@@ -15,9 +15,11 @@ ln -s "$SETUP_DIR/claude/skills" ~/.claude/skills
 ### Status line
 
 Nothing to link. Both profiles' `settings.json` run
-`bash $SETUP_DIR/claude/statusline-command_x.sh`, and that wrapper sets the
-`CLAUDE_STATUSLINE_*` env vars before exec'ing `statusline-command.py` from its
-own directory in the repo.
+`bash $SETUP_DIR/claude/statusline-command_x.sh`, which exec's
+`statusline-command.py` from its own directory in the repo. Every segment default
+lives in the script, so the wrapper carries no exports — it stays as the seam
+where a per-machine `CLAUDE_STATUSLINE_*` override would go.
+The toggles and their defaults are listed in the script's module docstring.
 
 ### Hooks
 
