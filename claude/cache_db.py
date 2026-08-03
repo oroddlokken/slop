@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS usage (
     week_reset            TEXT,
     sonnet_percent        INTEGER,
     sonnet_reset          TEXT,
+    scoped_percent        INTEGER,
+    scoped_model          TEXT,
+    scoped_reset          TEXT,
     extra_percent         INTEGER,
     extra_spent           REAL,
     extra_limit           REAL,
@@ -179,6 +182,17 @@ def get_connection() -> sqlite3.Connection:
     ):
         try:
             _conn.execute(f"ALTER TABLE usage ADD COLUMN {col} REAL")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+    # Migrate: per-model weekly limit (API limits[], kind=weekly_scoped). Named
+    # columns rather than meta_json so the SELECT in _USAGE_FIELDS picks them up.
+    for col, col_type in (
+        ("scoped_percent", "INTEGER"), ("scoped_model", "TEXT"),
+        ("scoped_reset", "TEXT"),
+    ):
+        try:
+            _conn.execute(f"ALTER TABLE usage ADD COLUMN {col} {col_type}")
         except sqlite3.OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
@@ -403,7 +417,8 @@ def close_connection() -> None:
 
 _USAGE_FIELDS = [
     "session_percent", "session_reset", "week_percent", "week_reset",
-    "sonnet_percent", "sonnet_reset", "extra_percent", "extra_spent",
+    "sonnet_percent", "sonnet_reset",
+    "scoped_percent", "scoped_model", "scoped_reset", "extra_percent", "extra_spent",
     "extra_limit", "extra_reset", "last_updated",
     "session_cost", "session_window_cost", "week_cost", "month_cost",
     "six_hour_cost", "twelve_hour_cost", "twenty_four_hour_cost",
@@ -492,6 +507,7 @@ _LOCK_STALE_TIMEOUT = 30  # seconds before a held lock is considered abandoned
 
 
 _lock_owner: str | None = None  # UUID token set when this process holds the lock
+_costs_lock_owner: str | None = None  # same, for the costs-only refresh lock
 
 
 def _check_backoff_in_txn(conn: sqlite3.Connection, now: float) -> bool:
@@ -581,6 +597,58 @@ def release_fetch_lock() -> None:
     _lock_owner = None
 
 
+def try_acquire_costs_lock() -> bool:
+    """Atomically acquire the costs-only refresh lock. Returns True if acquired.
+
+    Deliberately separate from the fetch lock: a cost recompute must never make
+    a real API fetch fall into _wait_for_leader, where it would poll for a
+    freshness bump that a costs-only run never makes. Also skips the API error
+    backoff, which says nothing about whether local JSONL can be rescanned.
+    """
+    import uuid
+
+    global _costs_lock_owner
+
+    conn = get_connection()
+    now = time.time()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        locked_at_str = _get_meta(conn, "costs_lock_time")
+        if locked_at_str:
+            try:
+                if now - float(locked_at_str) < _LOCK_STALE_TIMEOUT:
+                    conn.execute("COMMIT")
+                    return False
+            except ValueError:
+                pass  # corrupt timestamp — treat as abandoned
+        owner = str(uuid.uuid4())
+        _set_meta(conn, "costs_lock_time", str(now))
+        _set_meta(conn, "costs_lock_owner", owner)
+        conn.execute("COMMIT")
+        _costs_lock_owner = owner
+        return True
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def release_costs_lock() -> None:
+    """Release the costs-only lock only if this process owns it."""
+    global _costs_lock_owner
+
+    conn = get_connection()
+    if _costs_lock_owner is not None:
+        stored = _get_meta(conn, "costs_lock_owner")
+        if stored != _costs_lock_owner:
+            _costs_lock_owner = None
+            return
+    conn.execute(
+        "DELETE FROM meta WHERE key IN ('costs_lock_time', 'costs_lock_owner')"
+    )
+    conn.commit()
+    _costs_lock_owner = None
+
+
 def record_fetch_failure() -> None:
     """Increment consecutive failure count and record time."""
     conn = get_connection()
@@ -659,8 +727,14 @@ def read_usage_for_statusline() -> dict[str, Any] | None:
     return None
 
 
-def write_usage_cache(data: dict[str, Any]) -> None:
-    """Write usage data to the usage table (INSERT OR REPLACE singleton row)."""
+def write_usage_cache(data: dict[str, Any], *, snapshot_extra: bool = True) -> None:
+    """Write usage data to the usage table (INSERT OR REPLACE singleton row).
+
+    *snapshot_extra* is False for costs-only refreshes, which carry an
+    extra_spent value copied from the existing row rather than a fresh reading.
+    Re-snapshotting it would stamp a stale figure with a current timestamp and
+    skew the per-window deltas.
+    """
     conn = get_connection()
     # Separate structured fields from extra blobs
     extra: dict[str, Any] = {}
@@ -678,7 +752,7 @@ def write_usage_cache(data: dict[str, Any]) -> None:
     )
 
     # Record extra_spent snapshot for per-window delta tracking
-    es = data.get("extra_spent")
+    es = data.get("extra_spent") if snapshot_extra else None
     if es is not None:
         now_ts = time.time()
         conn.execute(

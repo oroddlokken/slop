@@ -64,10 +64,6 @@ class UsageData(TypedDict, total=False):
     month_cost: float
     project_cost: float
 
-    # Peak info (from compute_peak_info; only present when CLAUDE_PEAK_HOURS=1)
-    peak_is_peak: bool
-    peak_flip_seconds: int
-
 
 def _local_tz() -> ZoneInfo:
     """Return the system's local timezone using full zone rules (DST-aware)."""
@@ -177,6 +173,17 @@ PRICING_HISTORY: list[dict[str, Any]] = [
         },
     },
     {
+        # Sonnet 5 introductory pricing, $2/$10 per MTok through 2026-08-31.
+        # Release date unknown; 2026-06-01 covers all current records.
+        "effective": "2026-06-01",
+        "models": {
+            "claude-sonnet-5": {
+                "input": 2e-06, "output": 10e-06,
+                "cache_create": 2.5e-06, "cache_read": 0.2e-06,
+            },
+        },
+    },
+    {
         # Fable 5 first seen 2026-06-08. $10/$50 per MTok, cache write
         # 1.25x input og cache read 0.1x input (standard Anthropic-ratio).
         # Mythos 5 (Project Glasswing only) matches Fable 5 pricing exactly.
@@ -189,17 +196,6 @@ PRICING_HISTORY: list[dict[str, Any]] = [
             "claude-mythos-5": {
                 "input": 10e-06, "output": 50e-06,
                 "cache_create": 12.5e-06, "cache_read": 1e-06,
-            },
-        },
-    },
-    {
-        # Sonnet 5 introductory pricing, $2/$10 per MTok through 2026-08-31.
-        # Release date unknown; 2026-06-01 covers all current records.
-        "effective": "2026-06-01",
-        "models": {
-            "claude-sonnet-5": {
-                "input": 2e-06, "output": 10e-06,
-                "cache_create": 2.5e-06, "cache_read": 0.2e-06,
             },
         },
     },

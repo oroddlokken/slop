@@ -62,12 +62,10 @@ jq_out=$(echo "$json" | jq -r '[
   (.sonnet_reset // ""),
   (.scoped_reset // ""),
   (.extra_reset // ""),
-  (.last_updated // ""),
-  (.peak_is_peak // ""),
-  (.peak_flip_seconds // "")
+  (.last_updated // "")
 ] | join("\u001f")')
-local s_pct w_pct so_pct sc_pct sc_model e_pct e_spent e_limit s_reset w_reset so_reset sc_reset e_reset last_updated peak_is_peak peak_flip_s
-IFS=$'\x1f' read -r s_pct w_pct so_pct sc_pct sc_model e_pct e_spent e_limit s_reset w_reset so_reset sc_reset e_reset last_updated peak_is_peak peak_flip_s <<< "$jq_out"
+local s_pct w_pct so_pct sc_pct sc_model e_pct e_spent e_limit s_reset w_reset so_reset sc_reset e_reset last_updated
+IFS=$'\x1f' read -r s_pct w_pct so_pct sc_pct sc_model e_pct e_spent e_limit s_reset w_reset so_reset sc_reset e_reset last_updated <<< "$jq_out"
 
 if [[ -z "$s_pct" && -z "$w_pct" ]]; then
   echo "No usage data available" >&2
@@ -309,21 +307,5 @@ if [[ -n "$e_pct" ]]; then
     extra_info=$(printf '$%.2f / $%.2f spent' "$e_spent" "$e_limit")
   fi
   ccu_section "Extra usage" "$e_pct" "$e_reset" "$extra_info"
-fi
-# Peak hours no longer applies to the current plan — opt back in with CLAUDE_PEAK_HOURS=1
-# (get_claude_usage.py only emits the peak_* fields when the flag is set).
-if [[ -n "$peak_is_peak" && "${CLAUDE_PEAK_HOURS:-0}" != "0" ]]; then
-  echo
-  local flip_cd=""
-  if [[ -n "$peak_flip_s" && "$peak_flip_s" != "0" ]]; then
-    flip_cd=$(ccu_countdown "$(( $(date +%s) + peak_flip_s ))")
-  fi
-  if [[ "$peak_is_peak" == "true" ]]; then
-    printf '\033[1;31mPeak hours\033[0m (weekdays 1PM–7PM UTC)\n'
-    [[ -n "$flip_cd" ]] && echo "Off-peak in $flip_cd"
-  else
-    printf '\033[1;32mOff-peak\033[0m\n'
-    [[ -n "$flip_cd" ]] && echo "Peak starts in $flip_cd"
-  fi
 fi
 echo

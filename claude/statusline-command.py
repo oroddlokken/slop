@@ -37,15 +37,17 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on 80% usable window (auto-compact threshold)
   CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon)
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset)
-  CLAUDE_STATUSLINE_PEAK                    — peak/off-peak indicator with countdown (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
     CLAUDE_STATUSLINE_WEEKLY_PACE            — weekly pace indicator (D3/7: On Pace)
     CLAUDE_STATUSLINE_SONNET                — Sonnet usage %
     CLAUDE_STATUSLINE_SONNET_THRESHOLD      — hide Sonnet below this % (default 25)
+    CLAUDE_STATUSLINE_SCOPED                — per-model weekly limit (label from the model)
+    CLAUDE_STATUSLINE_SCOPED_THRESHOLD      — hide scoped limit below this % (default 25)
     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit + per-window deltas (S/W)
     CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — show Extra when S% >= this (default 60)
-    CLAUDE_STATUSLINE_TTL                   — time until next usage fetch
+    CLAUDE_STATUSLINE_TTL                   — time until next usage fetch (only
+                                              shown when S/W are not on stdin)
     CLAUDE_STATUSLINE_HISTORIC_COST         — entire historic cost line (6H/12H/24H/7D/30D/AT)
       CLAUDE_STATUSLINE_6H_COST            — rolling 6-hour cost (default 0)
       CLAUDE_STATUSLINE_12H_COST           — rolling 12-hour cost (default 0)
@@ -94,10 +96,13 @@ TEMP_CRIT_C = 90           # °C — red alert for CPU/GPU temp
 BATT_WARN_PCT = 40         # % — yellow warning when discharging
 BATT_CRIT_PCT = 20         # % — red alert when discharging
 STALE_THRESHOLD_S = 3600   # seconds before usage data is considered too old
+USAGE_FETCH_INTERVAL_S = 600    # normal cadence when the API is actually needed
+USAGE_HEARTBEAT_S = 3600   # ceiling on API staleness when nothing needs it now
+NEAR_THRESHOLD_MARGIN = 10  # % below a display threshold that still warrants fetching
+COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays usable
+EXTRA_ACCRUAL_PCT = 90     # session % from which extra credits could start accruing
 LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
 SESSION_WINDOW_MS = 900_000  # 15 min — active sessions lookback
-PEAK_WARN_MIN = 30         # minutes before peak: show yellow warning
-PEAK_SHOW_COUNTDOWN_MIN = 300  # minutes before peak: show green countdown
 
 def _env(name: str, default: str = "1") -> str:
     return os.environ.get(f"CLAUDE_STATUSLINE_{name}", default)
@@ -168,6 +173,8 @@ def _model_banner(model: str) -> str:
         bg, label = "44", "SONNET"  # blue
     elif "opus" in m_low:
         bg, label = "48;5;93", "OPUS"    # deep purple
+    elif "fable" in m_low:
+        bg, label = "48;5;28", "FABLE"   # green — clear of the reds, blue, purple
     else:
         bg = "100"  # bright black / grey fallback
         label = re.sub(r"\s*\(.*\)\s*$", "", model).strip().upper()
@@ -480,6 +487,7 @@ def _adjust_passed_resets(data: dict, now: float) -> dict:
         ("session_percent", "session_reset"),
         ("week_percent", "week_reset"),
         ("sonnet_percent", "sonnet_reset"),
+        ("scoped_percent", "scoped_reset"),
     ]:
         reset_iso = data.get(reset_key)
         if reset_iso:
@@ -521,12 +529,97 @@ def _native_rate_limits(data: dict) -> dict:
     return out
 
 
-def _fetch_usage(session_id: str, cwd: str) -> dict:
+def _api_fetch_needed(usage: dict, native_rl: dict, now: float) -> bool:
+    """Whether the usage API can still change what the render shows.
+
+    S and W arrive natively on stdin, so the API is only worth calling for the
+    fields it alone supplies: Sonnet %, the scoped per-model limit, and Extra
+    spend. When none of those can surface, the call is skipped and costs are
+    refreshed locally instead.
+
+    A heartbeat still fires every USAGE_HEARTBEAT_S. Without it the cached
+    Sonnet/scoped percentages could only ever justify a fetch using their own
+    frozen values — a quota climbing past its threshold would never be noticed.
+    """
+    if not native_rl:
+        return True  # no native S/W — the API is the only source for them
+    upd_epoch = _parse_iso_epoch(str(usage.get("last_updated", "") or ""))
+    if upd_epoch is None:
+        return True  # cold cache — fetch once to learn what applies
+    if now - upd_epoch >= USAGE_HEARTBEAT_S:
+        return True
+    # Extra is displayed once the session window crosses its threshold — which
+    # some profiles set to 0, making it permanent. A frozen $0 is still harmless
+    # there: extra credits only accrue after the 5-hour window is exhausted. So
+    # refresh it when spend has actually started, or when the window is close
+    # enough that spend could start before the next heartbeat.
+    if _on("EXTRA"):
+        try:
+            s_pct = int(native_rl.get("session_percent", 0))
+        except (TypeError, ValueError):
+            s_pct = 0
+        if s_pct >= _env_int("EXTRA_SESSION_THRESHOLD", 60):
+            try:
+                spent = float(usage.get("extra_spent") or 0)
+            except (TypeError, ValueError):
+                spent = 0.0
+            if spent > 0 or s_pct >= EXTRA_ACCRUAL_PCT:
+                return True
+    # Sonnet and scoped: track once the cached value is within reach of showing.
+    for on_key, pct_key, thr_key in (
+        ("SONNET", "sonnet_percent", "SONNET_THRESHOLD"),
+        ("SCOPED", "scoped_percent", "SCOPED_THRESHOLD"),
+    ):
+        if not _on(on_key):
+            continue
+        raw = usage.get(pct_key)
+        if raw is None or raw == "":
+            continue  # null on this plan — nothing to track
+        try:
+            pct = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if pct >= _env_int(thr_key, 25) - NEAR_THRESHOLD_MARGIN:
+            return True
+    return False
+
+
+def _spawn_usage_refresh(session_id: str, cwd: str, usage: dict, *, costs_only: bool) -> None:
+    """Spawn the detached refresh subprocess (survives parent kill)."""
+    script = Path(__file__).resolve().parent / "get_claude_usage.py"
+    if not script.exists():
+        return
+    cmd = [sys.executable, str(script), "--session", session_id, "--cwd", cwd]
+    if costs_only:
+        # Pass the native window bounds so session_window_cost is computed
+        # against the real window rather than the cached reset times.
+        cmd.append("--costs-only")
+        for flag, key in (("--session-reset", "session_reset"), ("--week-reset", "week_reset")):
+            val = _ustr(usage, key)
+            if val:
+                cmd += [flag, val]
+    else:
+        cmd += ["--wait-timeout", "4"]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _fetch_usage(session_id: str, cwd: str, native_rl: dict) -> dict:
     """Get usage data: env var → cache bypass → detached get_claude_usage.py.
 
-    The fetch subprocess is detached (start_new_session=True) so it survives
+    The refresh subprocess is detached (start_new_session=True) so it survives
     the parent being killed by the statusline framework (e.g. tmux interval).
     Stale cached data is returned for this render; fresh data appears next call.
+
+    When the API cannot affect the render the spawn becomes --costs-only, which
+    skips the network entirely but keeps the cost windows current.
     """
     now = time.time()
     pre = os.environ.get("CLAUDE_STATUSLINE_USAGE_JSON", "")
@@ -535,23 +628,22 @@ def _fetch_usage(session_id: str, cwd: str) -> dict:
             return _adjust_passed_resets(json.loads(pre), now)
         except json.JSONDecodeError:
             return {}
+    stale = read_usage_stale() or {}
+    want_api = _api_fetch_needed(stale, native_rl, now)
     cached = _try_cache_bypass()
     if cached is not None:
         return _adjust_passed_resets(cached, now)
-    # Cache is stale — spawn detached fetch (survives parent kill)
-    script = Path(__file__).resolve().parent / "get_claude_usage.py"
-    if script.exists():
-        try:
-            subprocess.Popen(
-                [sys.executable, str(script), "--wait-timeout", "4", "--session", session_id, "--cwd", cwd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError:
-            pass
+    if not want_api:
+        # API data is deliberately left to age; only refresh costs, and only
+        # when the summary the render reads has actually expired.
+        from cache_db import read_cost_summary
+
+        if read_cost_summary(max_age=COST_SUMMARY_MAX_AGE, cwd=cwd) is None:
+            _spawn_usage_refresh(session_id, cwd, stale, costs_only=True)
+        return _adjust_passed_resets(stale, now)
+    _spawn_usage_refresh(session_id, cwd, stale, costs_only=False)
     # Return stale data for this render; fresh data will be in cache next call
-    return _adjust_passed_resets(read_usage_stale() or {}, now)
+    return _adjust_passed_resets(stale, now)
 
 
 # --- Dcat status ---
@@ -746,6 +838,16 @@ def _render_dogcat(dcat_data: dict) -> str:
 AUTOCOMPACT_BUFFER = 33_000
 
 
+def _fmt_window_size(ctx_size: int) -> str:
+    """Nominal context window as a compact label: 1000000 → 1M, 200000 → 200k."""
+    if ctx_size <= 0:
+        return ""
+    k = ctx_size // 1000
+    if k >= 1000:
+        return f"{k / 1000:g}M"
+    return f"{k}k"
+
+
 def _render_ctx_pct(used: str, ctx_size: int) -> str:
     if not used:
         return ""
@@ -900,29 +1002,6 @@ def _fmt_money(v: str) -> str:
     return re.sub(r"(\.[^0])0$", r"\1", f)
 
 
-def _render_peak(_now_epoch: float) -> str:
-    """Peak/off-peak indicator with countdown to next flip."""
-    if not _on("PEAK", default=False):
-        return ""
-    from get_claude_usage import compute_peak_info
-
-    info = compute_peak_info()
-    peak = info["peak_is_peak"]
-    mins = info["peak_flip_seconds"] // 60
-    hrs, m = divmod(mins, 60)
-    countdown = f"{hrs}h{m:02d}m" if hrs else f"{m}m"
-
-    if peak:
-        # Banner: white-on-red — peak is active, you're paying premium now
-        return f"\033[1;97;41m PEAK {countdown} \033[0m"
-    if mins < PEAK_WARN_MIN:
-        # Banner: black-on-yellow — peak imminent
-        return f"\033[1;30;43m OFFPK {countdown} \033[0m"
-    if mins < PEAK_SHOW_COUNTDOWN_MIN:
-        return f"{SUBDUED}OffPk({countdown}){RST}"
-    return f"{SUBDUED}OffPk{RST}"
-
-
 def _render_sessions(cwd: str, now: float) -> str:
     """Active sessions: distinct projects from history in last 15 min."""
     if not _on("SESSIONS"):
@@ -988,6 +1067,24 @@ def _ustr(d: dict, key: str) -> str:
     return str(d.get(key, "") or "")
 
 
+def _extra_is_material(usage: dict) -> bool:
+    """Whether the Extra segment is both displayed and carrying real spend.
+
+    Some profiles pin EXTRA_SESSION_THRESHOLD to 0, so being on screen says
+    nothing on its own; only actual spend makes its age worth flagging.
+    """
+    if not _on("EXTRA"):
+        return False
+    try:
+        if float(usage.get("extra_spent") or 0) <= 0:
+            return False
+        return int(usage.get("session_percent") or 0) >= _env_int(
+            "EXTRA_SESSION_THRESHOLD", 60,
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
     """Build rate-limit inner sections (S/W/So + TTL).
 
@@ -1022,33 +1119,58 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
     # Sonnet (hidden below threshold)
     so_pct_raw = usage.get("sonnet_percent", "")
     so_pct = str(so_pct_raw) if so_pct_raw is not None and so_pct_raw != "" else ""
+    so_shown = False
     if _on("SONNET") and so_pct:
         try:
             if int(so_pct) >= _env_int("SONNET_THRESHOLD", 25):
                 sonnet_line = _usage_combined("So", so_pct, usage.get("sonnet_reset", ""), "", now)
                 if sonnet_line:
                     rl_inners.append(sonnet_line)
+                    so_shown = True
         except ValueError:
             pass
 
-    # TTL or staleness age
+    # Per-model weekly limit — a quota separate from W, scoped to one model.
+    # Label comes from the API's display_name ("Fable" → Fa) since which model
+    # is capped varies; skipped when it would duplicate the Sonnet segment.
+    sc_pct_raw = usage.get("scoped_percent", "")
+    sc_pct = str(sc_pct_raw) if sc_pct_raw is not None and sc_pct_raw != "" else ""
+    sc_model = _ustr(usage, "scoped_model")
+    sc_shown = False
+    if _on("SCOPED") and sc_pct and sc_model:
+        if not (so_shown and sc_model.lower().startswith("sonnet")):
+            try:
+                if int(sc_pct) >= _env_int("SCOPED_THRESHOLD", 25):
+                    scoped_line = _usage_combined(
+                        sc_model[:2].title(), sc_pct,
+                        usage.get("scoped_reset", ""), "", now,
+                    )
+                    if scoped_line:
+                        rl_inners.append(scoped_line)
+                        sc_shown = True
+            except ValueError:
+                pass
+
+    # TTL and staleness. S/W arrive on stdin every render, so the fetch clock
+    # only earns space when it still drives something: TTL when the API is the
+    # source for S/W at all, the red marker when a fetched field is actually on
+    # screen and overdue. A displayed E:$0 with no spend does not count — it
+    # cannot move until the window is exhausted.
     have_rate_limits = True
-    if _on("TTL"):
-        upd_epoch = _parse_iso_epoch(_ustr(usage, "last_updated"))
-        if upd_epoch is not None:
-            ttl_s = int(600 - (now - upd_epoch))
-            if ttl_s > 0:
+    upd_epoch = _parse_iso_epoch(_ustr(usage, "last_updated"))
+    if upd_epoch is not None:
+        age_s = int(now - upd_epoch)
+        if not usage.get("_native_rl"):
+            ttl_s = int(USAGE_FETCH_INTERVAL_S - age_s)
+            if _on("TTL") and ttl_s > 0:
                 rl_inners.insert(0, f"{SUBDUED}TTL:{ttl_s // 60}m{ttl_s % 60}s{RST}")
+            elif age_s >= STALE_THRESHOLD_S:
+                rl_inners.clear()
+                have_rate_limits = False
             else:
-                age_s = int(now - upd_epoch)
-                # Age condemns only fetched data. With native S/W the marker
-                # still flags Sonnet/Extra/costs as old, but nothing is dropped.
-                if age_s >= STALE_THRESHOLD_S and not usage.get("_native_rl"):
-                    rl_inners.clear()
-                    have_rate_limits = False
-                else:
-                    age_fmt = f"{age_s // 60}m"
-                    rl_inners.insert(0, f"\033[0;31mstale:{age_fmt}\033[0m")
+                rl_inners.insert(0, f"\033[0;31mstale:{age_s // 60}m\033[0m")
+        elif age_s >= STALE_THRESHOLD_S and (so_shown or sc_shown or _extra_is_material(usage)):
+            rl_inners.insert(0, f"\033[0;31mstale:{age_s // 60}m\033[0m")
 
     return rl_inners, have_rate_limits
 
@@ -1178,9 +1300,13 @@ def _render_session(
     parts: list[str] = []
 
     if model:
-        # "Opus 4.6 (1M context)" → "Opus 4.6 1M"
-        short_model = re.sub(r"\s*\((\d+\w+)\s+context\)", r" \1", model)
-        parts.append(f"{SUBDUED}{short_model}{RST}")
+        # Window size comes from context_window_size, the only field that always
+        # carries it: Fable 5 and Sonnet 5 report 1M windows with no
+        # "(1M context)" suffix in display_name, so scraping the name showed a
+        # size for Opus alone. The suffix is still stripped to avoid doubling it.
+        base = re.sub(r"\s*\(\d+\w+\s+context\)", "", model)
+        size = _fmt_window_size(ctx_size)
+        parts.append(f"{SUBDUED}{base} {size}{RST}" if size else f"{SUBDUED}{base}{RST}")
 
     # Reasoning config sits with the model it configures
     for seg in (_render_effort(effort), _render_thinking(thinking_off)):
@@ -1230,9 +1356,12 @@ def _merge_cost_data(usage_data: dict, session_id: str, cwd: str) -> None:
     if usage_data and _on("HISTORIC_COST"):
         try:
             from cache_db import read_cost_summary
-            cost_summary = read_cost_summary(max_age=900, cwd=cwd)
+            cost_summary = read_cost_summary(max_age=COST_SUMMARY_MAX_AGE, cwd=cwd)
             if cost_summary:
                 for k in (
+                    # The S/W window costs come from here too, not just the usage
+                    # row, so they stay current when the API fetch is skipped.
+                    "session_window_cost", "week_cost",
                     "six_hour_cost", "twelve_hour_cost", "twenty_four_hour_cost",
                     "seven_day_cost", "thirty_day_cost", "all_time_cost",
                     "six_hour_project_cost", "twelve_hour_project_cost",
@@ -1340,24 +1469,21 @@ def _layout_and_print(
     if sessions:
         top.append(sessions)
     top_str = " ".join(top)
-    peak_str = _render_peak(now_epoch)
-    session_parts = [s for s in [session, peak_str] if s]
-    session_str = DOT.join(session_parts) if session_parts else ""
     usage_parts = [s for s in [usage_session_rl, usage_rl, usage_cost] if s]
     usage_str = DOT.join(usage_parts) if usage_parts else ""
 
     # Adaptive layout based on terminal width
     term_cols = _get_terminal_cols()
     if term_cols >= LAYOUT_WIDE_COLS:
-        line1_parts = [s for s in [top_str, session_str] if s]
+        line1_parts = [s for s in [top_str, session] if s]
         line2_parts = [s for s in [usage_str] if s]
         lines = [DOT.join(line1_parts)]
         if line2_parts:
             lines.append(" ".join(line2_parts))
     else:
         lines = [top_str]
-        if session_str:
-            lines.append(session_str)
+        if session:
+            lines.append(session)
         if usage_session_rl:
             lines.append(usage_session_rl)
         rest = [s for s in [usage_rl, usage_cost] if s]
@@ -1437,8 +1563,11 @@ def main() -> None:
     battery_proc = _start_battery()
     dsp_proc = _start_dsp_check()
     try:
+        # Computed before the fetch decision (it gates whether the API is worth
+        # calling) but applied after the cost merge — see below.
+        native_rl = _native_rate_limits(data)
         # In-process: usage cache + dcat library (no subprocess)
-        usage_data = _fetch_usage(inp.session_id, inp.cwd)
+        usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl)
         # Strip project-scoped costs from usage cache — they belong to
         # whichever project last wrote the singleton row (macsetup-1zeq)
         if usage_data:
@@ -1449,8 +1578,7 @@ def main() -> None:
         # S and W come from stdin when Claude Code sends them — always current,
         # so they win over the cache. Applied after the cost merge, which keys
         # its compute-vs-read choice on usage_data being empty. Sonnet, Extra
-        # and the cost windows still come from the fetch.
-        native_rl = _native_rate_limits(data)
+        # and the scoped limit still come from the fetch.
         if native_rl:
             usage_data.update(native_rl)
             usage_data["_native_rl"] = True

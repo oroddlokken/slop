@@ -12,7 +12,6 @@ update CLAUDE.md to match.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -25,8 +24,11 @@ from urllib.request import Request, urlopen
 from cache_db import (
     clear_fetch_failures,
     read_usage_cache,
+    read_usage_stale,
     record_fetch_failure,
+    release_costs_lock,
     release_fetch_lock,
+    try_acquire_costs_lock,
     try_acquire_fetch_lock,
     write_usage_cache,
 )
@@ -129,55 +131,6 @@ def get_usage_token() -> str | None:
             if token:
                 return token
     return _read_token_from_credentials_file()
-
-
-# ---------------------------------------------------------------------------
-# Peak window
-# ---------------------------------------------------------------------------
-
-
-def peak_enabled() -> bool:
-    """Peak hours no longer applies to the current plan — opt back in with CLAUDE_PEAK_HOURS=1."""
-    return os.environ.get("CLAUDE_PEAK_HOURS", "0") != "0"
-
-
-def compute_peak_info() -> dict[str, Any]:
-    """Compute current peak/off-peak status and countdown to next flip.
-
-    Peak hours: weekdays 13:00-19:00 UTC (1 PM-7 PM GMT).
-    Weekends are always off-peak.
-    """
-    from datetime import timedelta
-
-    now = datetime.now(tz=timezone.utc)
-    h = now.hour
-    wd = now.weekday()  # 0=Mon ... 6=Sun
-    weekend = wd >= 5
-
-    peak_start, peak_end = 13, 19
-    is_peak = not weekend and peak_start <= h < peak_end
-
-    if weekend:
-        days_until_mon = (7 - wd) % 7 or 7  # Sat=2, Sun=1
-        target = now.replace(hour=peak_start, minute=0, second=0, microsecond=0) + timedelta(days=days_until_mon)
-    elif is_peak:
-        target = now.replace(hour=peak_end, minute=0, second=0, microsecond=0)
-    elif h >= peak_end:
-        # After peak ends — next peak is tomorrow, unless tomorrow is a weekend
-        days_ahead = 1
-        next_wd = (wd + 1) % 7
-        if next_wd >= 5:  # Saturday or Sunday
-            days_ahead = 7 - wd  # skip to Monday
-        target = now.replace(hour=peak_start, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
-    else:
-        target = now.replace(hour=peak_start, minute=0, second=0, microsecond=0)
-
-    flip_seconds = max(0, int((target - now).total_seconds()))
-
-    return {
-        "peak_is_peak": is_peak,
-        "peak_flip_seconds": flip_seconds,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +251,7 @@ def _enrich_and_emit(
     *,
     warn_on_error: bool = True,
 ) -> None:
-    """Merge cost info and peak info into *data*, then print as JSON."""
+    """Merge cost info into *data*, then print as JSON."""
     try:
         costs = compute_costs(
             session_id=session_id, cwd=cwd,
@@ -309,8 +262,6 @@ def _enrich_and_emit(
     except Exception as e:  # noqa: BLE001
         if warn_on_error:
             print(f"Warning: cost computation failed: {e}", file=sys.stderr)
-    if peak_enabled():
-        data.update(compute_peak_info())
     print(json.dumps(data, indent=2))
 
 
@@ -333,6 +284,49 @@ def _emit_raw() -> None:
     except (URLError, OSError, json.JSONDecodeError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def _arg_value(flag: str) -> str | None:
+    """Value following *flag* in argv, or None."""
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return None
+
+
+def _run_costs_only(session_id: str | None, cwd: str | None) -> None:
+    """Recompute costs and refresh the cache without calling the usage API.
+
+    The statusline spawns this instead of a full fetch when S/W arrive natively
+    on stdin and no fetch-only field (Sonnet, scoped, Extra) can affect the
+    render — see _api_fetch_needed there. Every API-derived column is carried
+    over from the existing row, including last_updated, so the TTL and
+    staleness markers keep describing the last *real* fetch rather than
+    claiming freshness this run did not obtain.
+
+    Window starts come from --session-reset/--week-reset when given (the native
+    stdin values, always current) and fall back to the cached ones.
+    """
+    if not try_acquire_costs_lock():
+        return  # another process is already recomputing
+    try:
+        row = read_usage_stale() or {}
+        row.pop("_stale", None)
+        try:
+            costs = compute_costs(
+                session_id=session_id, cwd=cwd,
+                session_reset_iso=_arg_value("--session-reset") or row.get("session_reset"),
+                week_reset_iso=_arg_value("--week-reset") or row.get("week_reset"),
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"Error: cost computation failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        row.update(costs)
+        write_usage_cache(row, snapshot_extra=False)
+        print(json.dumps(row, indent=2))
+    finally:
+        release_costs_lock()
 
 
 def _parse_cli_args() -> tuple[bool, int, str | None, str | None, bool]:
@@ -373,7 +367,6 @@ def _wait_for_leader(
             _enrich_and_emit(cached, session_id, cwd)
             sys.exit(0)
     # Leader failed — emit stale data if available (macsetup-348k)
-    from cache_db import read_usage_stale
     stale = read_usage_stale()
     if stale:
         stale["_stale"] = True
@@ -389,6 +382,10 @@ def main() -> None:
 
     if raw:
         _emit_raw()
+        return
+
+    if "--costs-only" in sys.argv:
+        _run_costs_only(session_id_arg, cwd_arg)
         return
 
     if not force:
@@ -433,8 +430,6 @@ def main() -> None:
             print(f"Warning: cost computation failed: {e}", file=sys.stderr)
 
         write_usage_cache(data)
-        if peak_enabled():
-            data.update(compute_peak_info())
         print(json.dumps(data, indent=2))
 
     except HTTPError as e:
