@@ -314,22 +314,51 @@ def calc_cost(
 
 CLAUDE_DIR = Path.home() / ".claude"
 SESSION_WINDOW_HOURS = 5
+SESSION_WINDOW_S = SESSION_WINDOW_HOURS * 3600
+WEEK_WINDOW_S = 7 * 86400
 
-# Rolling cost window definitions: (name, timedelta offset from now).
+
+class RollingWindow(NamedTuple):
+    """One rolling cost window: key prefix, span, and the label a report prints.
+
+    The label is carried rather than derived: `timedelta(hours=24)` is a day as
+    far as timedelta is concerned, but the segment says 24H.
+    """
+
+    name: str
+    delta: timedelta
+    label: str
+
+
+# Rolling cost window definitions.
 # Order matters — must be longest→shortest so the bucket cascade works
 # with early-exit optimisation (if ts < longest, skip all).
-ROLLING_WINDOWS: list[tuple[str, timedelta]] = [
-    ("thirty_day", timedelta(days=30)),
-    ("seven_day", timedelta(days=7)),
-    ("twenty_four_hour", timedelta(hours=24)),
-    ("twelve_hour", timedelta(hours=12)),
-    ("six_hour", timedelta(hours=6)),
+ROLLING_WINDOWS: list[RollingWindow] = [
+    RollingWindow("thirty_day", timedelta(days=30), "30D"),
+    RollingWindow("seven_day", timedelta(days=7), "7D"),
+    RollingWindow("twenty_four_hour", timedelta(hours=24), "24H"),
+    RollingWindow("twelve_hour", timedelta(hours=12), "12H"),
+    RollingWindow("six_hour", timedelta(hours=6), "6H"),
 ]
+
+# Every bucket compute_costs() keys by window prefix, including the untimed one.
+ROLLING_COST_NAMES: list[str] = [w.name for w in ROLLING_WINDOWS] + ["all_time"]
+
+
+def rolling_cost_keys() -> list[str]:
+    """The `<window>_cost` / `<window>_project_cost` pair for every window.
+
+    The usage table columns, cache_db's field list and the statusline's merge
+    list all read this instead of restating the six window names.
+    """
+    return [f"{name}{suffix}"
+            for name in ROLLING_COST_NAMES
+            for suffix in ("_cost", "_project_cost")]
 
 
 def _rolling_thresholds(now_local: datetime) -> dict[str, float]:
     """Compute epoch timestamps for each rolling window boundary."""
-    return {name: (now_local - delta).timestamp() for name, delta in ROLLING_WINDOWS}
+    return {w.name: (now_local - w.delta).timestamp() for w in ROLLING_WINDOWS}
 
 
 def _bucket_rolling_cost(
@@ -345,11 +374,11 @@ def _bucket_rolling_cost(
     Mutates *totals* (and optionally *proj_totals*) in place.
     *thresholds* maps window name → epoch cutoff.
     """
-    for name, _ in ROLLING_WINDOWS:
-        if ts_epoch >= thresholds[name]:
-            totals[name] = totals.get(name, 0.0) + cost
+    for w in ROLLING_WINDOWS:
+        if ts_epoch >= thresholds[w.name]:
+            totals[w.name] = totals.get(w.name, 0.0) + cost
             if is_project and proj_totals is not None:
-                proj_totals[name] = proj_totals.get(name, 0.0) + cost
+                proj_totals[w.name] = proj_totals.get(w.name, 0.0) + cost
 
 
 def extract_assistant_fields(
@@ -388,6 +417,24 @@ def extract_assistant_fields(
     return msg, usage, message_id, request_id, dk, ts
 
 
+def project_key(cwd: str) -> str:
+    """Claude Code's projects-dir name for a working directory.
+
+    One spelling of the encoding: it names directories under
+    ~/.claude/projects/ and scopes cache_db's cost-summary keys, where a
+    writer/reader disagreement would be a permanent silent cache miss rather
+    than an error. ccreport's reverse decoding is a separate problem — it has
+    to resolve the "-" ambiguity — and stays separate.
+    """
+    return cwd.replace("/", "-")
+
+
+def project_path_prefixes(cwd: str, projects_dirs: list[Path]) -> list[str]:
+    """Path prefixes that mark a cached file as belonging to *cwd*."""
+    key = project_key(cwd)
+    return [str(d / key) + "/" for d in projects_dirs]
+
+
 def _get_projects_dirs() -> list[Path]:
     """Return existing Claude project directories."""
     dirs: list[Path] = []
@@ -405,10 +452,10 @@ def _find_session_files(
     """Find JSONL files belonging to a session."""
     if projects_dirs is None:
         projects_dirs = _get_projects_dirs()
-    project_key = cwd.replace("/", "-")
+    key = project_key(cwd)
     files: set[str] = set()
     for d in projects_dirs:
-        base = d / project_key
+        base = d / key
         main = base / f"{session_id}.jsonl"
         if main.exists():
             files.add(str(main))
@@ -482,9 +529,7 @@ def compute_session_cost(session_id: str, cwd: str) -> float:
         try:
             from cache_db import bulk_load_ccreport_cache
             _, ccr_records_by_file = bulk_load_ccreport_cache()
-            project_key = cwd.replace("/", "-")
-            proj_dirs = _get_projects_dirs()
-            project_prefixes = [str(d / project_key) + "/" for d in proj_dirs]
+            project_prefixes = project_path_prefixes(cwd, _get_projects_dirs())
             total = 0.0
             seen: set[str] = set()
             for fp, recs in ccr_records_by_file.items():
@@ -543,7 +588,7 @@ def _accumulate_orphaned_costs(
     totals: dict[str, float],
     proj_totals: dict[str, float] | None = None,
     project_name: str = "",
-    project_path_prefixes: list[str] | None = None,
+    path_prefixes: list[str] | None = None,
     extra_thresholds: dict[str, float] | None = None,
     extra_totals: dict[str, float] | None = None,
 ) -> None:
@@ -555,8 +600,8 @@ def _accumulate_orphaned_costs(
     for fp, recs in ccr_records_by_file.items():
         if fp in live_paths:
             continue
-        if project_path_prefixes is not None:
-            is_ours = any(fp.startswith(p) for p in project_path_prefixes)
+        if path_prefixes is not None:
+            is_ours = any(fp.startswith(p) for p in path_prefixes)
         else:
             is_ours = False
         for rec in recs:
@@ -598,7 +643,7 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
     if not cwd:
         return {}
 
-    project_key = cwd.replace("/", "-")
+    proj_key = project_key(cwd)
     projects_dirs = _get_projects_dirs()
 
     now_local = datetime.now(tz=_local_tz())
@@ -607,7 +652,7 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
     seen_keys: set[str] = set()
 
     for d in projects_dirs:
-        proj_dir = d / project_key
+        proj_dir = d / proj_key
         if not proj_dir.is_dir():
             continue
         for jsonl_path in sorted(proj_dir.rglob("*.jsonl")):
@@ -619,29 +664,51 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
     try:
         from cache_db import bulk_load_ccreport_cache
         _, ccr_records_by_file = bulk_load_ccreport_cache()
-        project_path_prefixes = [str(d / project_key) + "/" for d in projects_dirs]
+        prefixes = project_path_prefixes(cwd, projects_dirs)
         # Filter to only orphaned records from this project's directories
         # to avoid inflating project costs with other projects' data.
         project_ccr = {
             fp: recs for fp, recs in ccr_records_by_file.items()
-            if any(fp.startswith(p) for p in project_path_prefixes)
+            if any(fp.startswith(p) for p in prefixes)
         }
         live_paths: set[str] = set()
         for d in projects_dirs:
-            proj_dir = d / project_key
+            proj_dir = d / proj_key
             if proj_dir.is_dir():
                 live_paths.update(str(p) for p in proj_dir.rglob("*.jsonl"))
         _accumulate_orphaned_costs(
             project_ccr, live_paths, seen_keys, thresholds,
-            totals, project_path_prefixes=project_path_prefixes,
+            totals, path_prefixes=prefixes,
         )
     except Exception:  # noqa: BLE001
         pass
 
     return {
         f"{name}_project_cost": round(totals.get(name, 0.0), 4)
-        for name in [n for n, _ in ROLLING_WINDOWS] + ["all_time"]
+        for name in ROLLING_COST_NAMES
     }
+
+
+def window_start_epoch(
+    reset_iso: str | None, window_seconds: int, now: float,
+) -> float | None:
+    """Epoch start of the rate-limit window that resets at *reset_iso*.
+
+    A reset time already in the past IS the start of the window we are in — it
+    just rolled over. A reset in the future means we are inside the window, so
+    its length comes off. None when the string is missing or unparseable.
+
+    Naive strings count as local time: Claude Code's stdin rate limits arrive as
+    epoch seconds and reach us as naive local ISO, while the usage API sends
+    offset-aware strings.
+    """
+    if not reset_iso:
+        return None
+    try:
+        epoch = datetime.fromisoformat(str(reset_iso)).timestamp()
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
+    return epoch if epoch <= now else epoch - window_seconds
 
 
 def _parse_window_starts(
@@ -654,35 +721,20 @@ def _parse_window_starts(
     session_window_start is None if the reset time is unavailable.
     week_window_start falls back to Monday 00:00 local time.
     """
-    now = datetime.now(tz=_local_tz())
+    tz = _local_tz()
+    now = datetime.now(tz=tz)
 
-    session_window_start: datetime | None = None
-    if session_reset_iso:
-        try:
-            sr = datetime.fromisoformat(session_reset_iso)
-            if sr <= now:
-                session_window_start = sr
-            else:
-                session_window_start = sr - timedelta(hours=SESSION_WINDOW_HOURS)
-        except (ValueError, TypeError):
-            pass
+    def as_local(epoch: float | None) -> datetime | None:
+        return datetime.fromtimestamp(epoch, tz=tz) if epoch is not None else None
 
-    week_window_start: datetime
-    if week_reset_iso:
-        try:
-            wr = datetime.fromisoformat(week_reset_iso)
-            if wr <= now:
-                week_window_start = wr
-            else:
-                week_window_start = wr - timedelta(days=7)
-        except (ValueError, TypeError):
-            week_window_start = (now - timedelta(days=now.weekday())).replace(
-                hour=0, minute=0, second=0, microsecond=0,
-            )
-    else:
-        week_window_start = (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0,
-        )
+    session_window_start = as_local(
+        window_start_epoch(session_reset_iso, SESSION_WINDOW_S, now.timestamp()),
+    )
+    week_window_start = as_local(
+        window_start_epoch(week_reset_iso, WEEK_WINDOW_S, now.timestamp()),
+    ) or (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
 
     return session_window_start, week_window_start
 
@@ -742,7 +794,6 @@ def _try_cached_file(
     ccr_records_by_file: dict[str, list[dict]],
     seen_keys: set[str],
     thresholds: dict[str, float],
-    oldest_ts: float,
     sw_ts: float | None,
     td_ts: float,
     rolling_totals: dict[str, float],
@@ -915,8 +966,7 @@ def compute_costs(
     project_prefixes: list[str] = []
     project_name = ""
     if cwd:
-        project_key = cwd.replace("/", "-")
-        project_prefixes = [str(d / project_key) + "/" for d in projects_dirs]
+        project_prefixes = project_path_prefixes(cwd, projects_dirs)
         project_name = Path(cwd).name
 
     # Bulk-load ccreport cache for fast rolling cost computation
@@ -936,7 +986,6 @@ def compute_costs(
     mw_ts = month_window_start.timestamp()
     ww_ts = week_window_start.timestamp()
     td_ts = thresholds["thirty_day"]
-    oldest_ts = min(mw_ts, td_ts)
 
     live_paths: set[str] = set()
 
@@ -973,7 +1022,7 @@ def compute_costs(
             # --- Try cache-based handling (branches 1-3) ---
             hit = _try_cached_file(
                 ctx, cached_entry, ccr_records_by_file, seen_keys,
-                thresholds, oldest_ts, sw_ts, td_ts,
+                thresholds, sw_ts, td_ts,
                 rolling_totals, rolling_proj,
             )
             if hit is not None:
@@ -1023,11 +1072,11 @@ def compute_costs(
                 dirty = True
 
             sw_total += scan.sw_cost
-            for name, _ in ROLLING_WINDOWS:
-                fc = scan.file_rolling.get(name, 0.0)
-                rolling_totals[name] = rolling_totals.get(name, 0.0) + fc
+            for w in ROLLING_WINDOWS:
+                fc = scan.file_rolling.get(w.name, 0.0)
+                rolling_totals[w.name] = rolling_totals.get(w.name, 0.0) + fc
                 if ctx.is_project_file:
-                    rolling_proj[name] = rolling_proj.get(name, 0.0) + fc
+                    rolling_proj[w.name] = rolling_proj.get(w.name, 0.0) + fc
 
     if dirty or set(new_entries) != set(file_cache):
         try:
@@ -1051,13 +1100,15 @@ def compute_costs(
 
     result = {
         "session_cost": round(session_total, 4),
-        "session_window_cost": round(sw_total, 4),
         "week_cost": round(week_total, 4),
         "month_cost": round(month_total, 4),
-        "all_time_cost": round(rolling_totals.get("all_time", 0.0), 4),
-        "all_time_project_cost": round(rolling_proj.get("all_time", 0.0), 4),
     }
-    for name, _ in ROLLING_WINDOWS:
+    if session_window_start is not None:
+        # Omitted, not zeroed, without a reset time: callers merge this dict over
+        # existing data, and a 0.0 here is indistinguishable from "not computed"
+        # — it would overwrite a real total with an empty window (macsetup-4uja).
+        result["session_window_cost"] = round(sw_total, 4)
+    for name in ROLLING_COST_NAMES:
         result[f"{name}_cost"] = round(rolling_totals.get(name, 0.0), 4)
         result[f"{name}_project_cost"] = round(rolling_proj.get(name, 0.0), 4)
 

@@ -334,24 +334,13 @@ def _parse_cli_args() -> tuple[bool, int, str | None, str | None, bool]:
     force = "--force" in sys.argv
     raw = "--raw" in sys.argv
     wait_timeout = 30
-    if "--wait-timeout" in sys.argv:
-        idx = sys.argv.index("--wait-timeout")
-        if idx + 1 < len(sys.argv):
-            try:
-                wait_timeout = int(sys.argv[idx + 1])
-            except ValueError:
-                pass
-    session_id: str | None = None
-    if "--session" in sys.argv:
-        idx = sys.argv.index("--session")
-        if idx + 1 < len(sys.argv):
-            session_id = sys.argv[idx + 1]
-    cwd: str | None = None
-    if "--cwd" in sys.argv:
-        idx = sys.argv.index("--cwd")
-        if idx + 1 < len(sys.argv):
-            cwd = sys.argv[idx + 1]
-    return force, wait_timeout, session_id, cwd, raw
+    wt = _arg_value("--wait-timeout")
+    if wt:
+        try:
+            wait_timeout = int(wt)
+        except ValueError:
+            pass
+    return force, wait_timeout, _arg_value("--session"), _arg_value("--cwd"), raw
 
 
 def _wait_for_leader(

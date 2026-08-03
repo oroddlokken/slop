@@ -20,6 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# pricing.py imports cache_db only inside functions, so this direction is safe.
+from pricing import project_key, rolling_cost_keys
+
 DB_PATH = Path.home() / ".cache" / "macsetup" / "claude" / "cache.db"
 
 # Snapshots live outside ~/.cache so aggressive cache cleanup can't take out
@@ -154,6 +157,38 @@ CREATE TABLE IF NOT EXISTS exchange_rates (
 """
 
 
+# Columns a DB created before them is missing. CREATE TABLE covers new DBs;
+# these ALTERs bring an existing one up to the same shape.
+#
+# - the per-window cost columns, derived so a new rolling window needs no
+#   migration of its own (the project half arrived after the totals)
+# - ccreport cwd: NULL for orphan rows whose source JSONL is already gone —
+#   those names are frozen in `project`
+# - ccreport repo: normalized git remote, captured at parse time while the
+#   working dir still exists. NULL for orphans parsed before this existed.
+# - the weekly_scoped per-model limit, as named columns rather than meta_json
+#   so the SELECT built from _USAGE_FIELDS picks them up
+_ADDED_COLUMNS: list[tuple[str, str, str]] = [
+    *(("usage", key, "REAL") for key in rolling_cost_keys()),
+    ("usage", "scoped_percent", "INTEGER"),
+    ("usage", "scoped_model", "TEXT"),
+    ("usage", "scoped_reset", "TEXT"),
+    ("ccreport_records", "cwd", "TEXT"),
+    ("ccreport_records", "repo", "TEXT"),
+]
+
+
+def _add_column(
+    conn: sqlite3.Connection, table: str, col: str, col_type: str,
+) -> None:
+    """ALTER TABLE ADD COLUMN, tolerating a column that is already there."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+
+
 # ---------------------------------------------------------------------------
 # Connection management
 # ---------------------------------------------------------------------------
@@ -174,42 +209,8 @@ def get_connection() -> sqlite3.Connection:
     if db_existed:
         _maybe_snapshot(_conn)
     _conn.executescript(_SCHEMA_SQL)
-    # Migrate: add project cost columns to existing usage tables
-    for col in (
-        "six_hour_project_cost", "twelve_hour_project_cost",
-        "twenty_four_hour_project_cost", "seven_day_project_cost",
-        "thirty_day_project_cost", "all_time_project_cost",
-    ):
-        try:
-            _conn.execute(f"ALTER TABLE usage ADD COLUMN {col} REAL")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e).lower():
-                raise
-    # Migrate: per-model weekly limit (API limits[], kind=weekly_scoped). Named
-    # columns rather than meta_json so the SELECT in _USAGE_FIELDS picks them up.
-    for col, col_type in (
-        ("scoped_percent", "INTEGER"), ("scoped_model", "TEXT"),
-        ("scoped_reset", "TEXT"),
-    ):
-        try:
-            _conn.execute(f"ALTER TABLE usage ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e).lower():
-                raise
-    # Add cwd column to ccreport_records on existing DBs (NULL for orphan rows
-    # whose source JSONL is already gone — those names are frozen in `project`).
-    try:
-        _conn.execute("ALTER TABLE ccreport_records ADD COLUMN cwd TEXT")
-    except sqlite3.OperationalError as e:
-        if "duplicate column" not in str(e).lower():
-            raise
-    # Add repo column (normalized git remote, captured at parse time while the
-    # working dir still exists). NULL for orphans parsed before this existed.
-    try:
-        _conn.execute("ALTER TABLE ccreport_records ADD COLUMN repo TEXT")
-    except sqlite3.OperationalError as e:
-        if "duplicate column" not in str(e).lower():
-            raise
+    for table, col, col_type in _ADDED_COLUMNS:
+        _add_column(_conn, table, col, col_type)
     migration_ran = _run_migrations(_conn)
     if db_existed and migration_ran:
         _sanity_check(_conn)
@@ -421,11 +422,10 @@ _USAGE_FIELDS = [
     "scoped_percent", "scoped_model", "scoped_reset", "extra_percent", "extra_spent",
     "extra_limit", "extra_reset", "last_updated",
     "session_cost", "session_window_cost", "week_cost", "month_cost",
-    "six_hour_cost", "twelve_hour_cost", "twenty_four_hour_cost",
-    "seven_day_cost", "thirty_day_cost", "all_time_cost",
-    "six_hour_project_cost", "twelve_hour_project_cost",
-    "twenty_four_hour_project_cost", "seven_day_project_cost",
-    "thirty_day_project_cost", "all_time_project_cost",
+    # The rolling window columns come from pricing.ROLLING_WINDOWS, so adding a
+    # window there reaches the cache without a second edit. Order is internal —
+    # the SELECT, the INSERT and the row mapping all read this one list.
+    *rolling_cost_keys(),
 ]
 
 
@@ -506,12 +506,17 @@ _BACKOFF_SCHEDULE = [45, 120, 240]  # seconds, indexed by consecutive failures
 _LOCK_STALE_TIMEOUT = 30  # seconds before a held lock is considered abandoned
 
 
-_lock_owner: str | None = None  # UUID token set when this process holds the lock
-_costs_lock_owner: str | None = None  # same, for the costs-only refresh lock
+# UUID token per lock prefix, set while this process holds that lock.
+_lock_owners: dict[str, str] = {}
 
 
 def _check_backoff_in_txn(conn: sqlite3.Connection, now: float) -> bool:
-    """Check if we're in error backoff. Must be called inside a transaction."""
+    """Whether we are inside the error backoff window.
+
+    Reads only, so it is safe outside a transaction; the lock path calls it
+    inside its BEGIN IMMEDIATE so a failure cannot be recorded between the
+    backoff check and the lock write.
+    """
     count_str = _get_meta(conn, "fetch_fail_count")
     if not count_str:
         return False
@@ -532,121 +537,89 @@ def _check_backoff_in_txn(conn: sqlite3.Connection, now: float) -> bool:
     return elapsed < _BACKOFF_SCHEDULE[idx]
 
 
-def try_acquire_fetch_lock() -> bool:
-    """Atomically acquire fetch lock with backoff check. Returns True if acquired.
+def _try_acquire_lock(prefix: str, *, check_backoff: bool) -> bool:
+    """Atomically acquire the ``{prefix}_lock``. Returns True if acquired.
 
     Uses BEGIN IMMEDIATE to serialise concurrent writers so the
     read-check-write is atomic.  A lock older than _LOCK_STALE_TIMEOUT
-    is treated as abandoned (e.g. crashed process).
-
-    The backoff check is folded into the same transaction to prevent
-    a failure being recorded between the two checks.
+    is treated as abandoned (e.g. crashed process), and so is one whose
+    timestamp does not parse.
 
     An owner token (UUID) is stored alongside the lock so that only
     the process that acquired the lock can release it.
     """
     import uuid
 
-    global _lock_owner
-
     conn = get_connection()
     now = time.time()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        if _check_backoff_in_txn(conn, now):
+        # Folded into the same transaction so a failure cannot be recorded
+        # between the backoff check and the lock write.
+        if check_backoff and _check_backoff_in_txn(conn, now):
             conn.execute("COMMIT")
             return False
 
-        locked_at_str = _get_meta(conn, "fetch_lock_time")
+        locked_at_str = _get_meta(conn, f"{prefix}_lock_time")
         if locked_at_str:
             try:
                 if now - float(locked_at_str) < _LOCK_STALE_TIMEOUT:
                     conn.execute("COMMIT")
                     return False
             except ValueError:
-                # Corrupt lock timestamp — treat as stale and allow acquisition
-                import sys
-                print(f"Warning: corrupt fetch_lock_time {locked_at_str!r}, treating as stale",
-                      file=sys.stderr)
+                print(f"Warning: corrupt {prefix}_lock_time {locked_at_str!r}, "
+                      f"treating as stale", file=sys.stderr)
         owner = str(uuid.uuid4())
-        _set_meta(conn, "fetch_lock_time", str(now))
-        _set_meta(conn, "fetch_lock_owner", owner)
+        _set_meta(conn, f"{prefix}_lock_time", str(now))
+        _set_meta(conn, f"{prefix}_lock_owner", owner)
         conn.execute("COMMIT")
-        _lock_owner = owner
+        _lock_owners[prefix] = owner
         return True
     except Exception:
         conn.execute("ROLLBACK")
         raise
 
 
-def release_fetch_lock() -> None:
-    """Release the fetch lock only if this process owns it."""
-    global _lock_owner
-
+def _release_lock(prefix: str) -> None:
+    """Release the ``{prefix}_lock`` only if this process owns it."""
     conn = get_connection()
-    if _lock_owner is not None:
-        stored = _get_meta(conn, "fetch_lock_owner")
-        if stored != _lock_owner:
-            # Not our lock — another process took over after staleness timeout
-            _lock_owner = None
-            return
+    owner = _lock_owners.get(prefix)
+    if owner is not None and _get_meta(conn, f"{prefix}_lock_owner") != owner:
+        # Not our lock — another process took over after staleness timeout
+        _lock_owners.pop(prefix, None)
+        return
     conn.execute(
-        "DELETE FROM meta WHERE key IN ('fetch_lock_time', 'fetch_lock_owner')"
+        "DELETE FROM meta WHERE key IN (?, ?)",
+        (f"{prefix}_lock_time", f"{prefix}_lock_owner"),
     )
     conn.commit()
-    _lock_owner = None
+    _lock_owners.pop(prefix, None)
+
+
+def try_acquire_fetch_lock() -> bool:
+    """Acquire the API fetch lock, refusing while in error backoff."""
+    return _try_acquire_lock("fetch", check_backoff=True)
+
+
+def release_fetch_lock() -> None:
+    """Release the fetch lock only if this process owns it."""
+    _release_lock("fetch")
 
 
 def try_acquire_costs_lock() -> bool:
-    """Atomically acquire the costs-only refresh lock. Returns True if acquired.
+    """Acquire the costs-only refresh lock. Returns True if acquired.
 
     Deliberately separate from the fetch lock: a cost recompute must never make
     a real API fetch fall into _wait_for_leader, where it would poll for a
     freshness bump that a costs-only run never makes. Also skips the API error
     backoff, which says nothing about whether local JSONL can be rescanned.
     """
-    import uuid
-
-    global _costs_lock_owner
-
-    conn = get_connection()
-    now = time.time()
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        locked_at_str = _get_meta(conn, "costs_lock_time")
-        if locked_at_str:
-            try:
-                if now - float(locked_at_str) < _LOCK_STALE_TIMEOUT:
-                    conn.execute("COMMIT")
-                    return False
-            except ValueError:
-                pass  # corrupt timestamp — treat as abandoned
-        owner = str(uuid.uuid4())
-        _set_meta(conn, "costs_lock_time", str(now))
-        _set_meta(conn, "costs_lock_owner", owner)
-        conn.execute("COMMIT")
-        _costs_lock_owner = owner
-        return True
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    return _try_acquire_lock("costs", check_backoff=False)
 
 
 def release_costs_lock() -> None:
     """Release the costs-only lock only if this process owns it."""
-    global _costs_lock_owner
-
-    conn = get_connection()
-    if _costs_lock_owner is not None:
-        stored = _get_meta(conn, "costs_lock_owner")
-        if stored != _costs_lock_owner:
-            _costs_lock_owner = None
-            return
-    conn.execute(
-        "DELETE FROM meta WHERE key IN ('costs_lock_time', 'costs_lock_owner')"
-    )
-    conn.commit()
-    _costs_lock_owner = None
+    _release_lock("costs")
 
 
 def record_fetch_failure() -> None:
@@ -673,25 +646,7 @@ def clear_fetch_failures() -> None:
 
 def check_fetch_backoff() -> bool:
     """Return True if we should skip fetching due to error backoff."""
-    conn = get_connection()
-    count_str = _get_meta(conn, "fetch_fail_count")
-    if not count_str:
-        return False
-    try:
-        count = int(count_str)
-    except ValueError:
-        return False
-    if count <= 0:
-        return False
-    fail_time_str = _get_meta(conn, "fetch_fail_time")
-    if not fail_time_str:
-        return False
-    try:
-        elapsed = time.time() - float(fail_time_str)
-    except ValueError:
-        return False
-    idx = min(count - 1, len(_BACKOFF_SCHEDULE) - 1)
-    return elapsed < _BACKOFF_SCHEDULE[idx]
+    return _check_backoff_in_txn(get_connection(), time.time())
 
 
 def _is_fetch_blocked() -> bool:
@@ -1017,6 +972,21 @@ def get_ccreport_file(path: str) -> tuple[int, int] | None:
     return row
 
 
+# The record columns every ccreport reader selects, in the order
+# _ccr_row_to_dict unpacks them. bulk_load_ccreport_cache prepends file_path
+# and strips it off the row before mapping.
+_CCR_COLS = ("mid, model, ts, sid, project, cwd, repo, dk, cost, "
+             "input_tokens, output_tokens, cache_create, cache_read")
+
+
+def _ccr_row_to_dict(row: tuple) -> dict:
+    """One ccreport_records row in the compact format ccreport.py reads."""
+    mid, model, ts, sid, project, cwd, repo, dk, cost, inp, out, cc, cr = row
+    return {"mid": mid, "model": model, "ts": ts, "sid": sid,
+            "project": project, "cwd": cwd, "repo": repo, "dk": dk, "cost": cost,
+            "t": [inp, out, cc, cr]}
+
+
 def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, list[dict]]]:
     """Bulk-load all ccreport file metadata and records.
 
@@ -1032,16 +1002,11 @@ def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, li
         return {}, {}
     # All records
     rec_rows = conn.execute(
-        "SELECT file_path, mid, model, ts, sid, project, cwd, repo, dk, cost, "
-        "input_tokens, output_tokens, cache_create, cache_read "
-        "FROM ccreport_records"
+        f"SELECT file_path, {_CCR_COLS} FROM ccreport_records"
     ).fetchall()
     records_by_file: dict[str, list[dict]] = {}
-    for fp, mid, model, ts, sid, project, cwd, repo, dk, cost, inp, out, cc, cr in rec_rows:
-        rec = {"mid": mid, "model": model, "ts": ts, "sid": sid,
-               "project": project, "cwd": cwd, "repo": repo, "dk": dk, "cost": cost,
-               "t": [inp, out, cc, cr]}
-        records_by_file.setdefault(fp, []).append(rec)
+    for row in rec_rows:
+        records_by_file.setdefault(row[0], []).append(_ccr_row_to_dict(row[1:]))
     return file_meta, records_by_file
 
 
@@ -1053,19 +1018,10 @@ def get_ccreport_records(path: str) -> list[dict]:
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT mid, model, ts, sid, project, cwd, repo, dk, cost, "
-        "input_tokens, output_tokens, cache_create, cache_read "
-        "FROM ccreport_records WHERE file_path = ?",
+        f"SELECT {_CCR_COLS} FROM ccreport_records WHERE file_path = ?",
         (path,),
     ).fetchall()
-    return [
-        {
-            "mid": r[0], "model": r[1], "ts": r[2], "sid": r[3],
-            "project": r[4], "cwd": r[5], "repo": r[6], "dk": r[7], "cost": r[8],
-            "t": [r[9], r[10], r[11], r[12]],
-        }
-        for r in rows
-    ]
+    return [_ccr_row_to_dict(r) for r in rows]
 
 
 def save_ccreport_file(
@@ -1110,19 +1066,11 @@ def get_ccreport_orphaned_records(live_paths: set[str]) -> list[dict]:
         return []
     placeholders = ",".join("?" * len(orphaned))
     rows = conn.execute(
-        f"SELECT mid, model, ts, sid, project, cwd, repo, dk, cost, "
-        f"input_tokens, output_tokens, cache_create, cache_read "
-        f"FROM ccreport_records WHERE file_path IN ({placeholders})",
+        f"SELECT {_CCR_COLS} FROM ccreport_records "
+        f"WHERE file_path IN ({placeholders})",
         orphaned,
     ).fetchall()
-    return [
-        {
-            "mid": r[0], "model": r[1], "ts": r[2], "sid": r[3],
-            "project": r[4], "cwd": r[5], "repo": r[6], "dk": r[7], "cost": r[8],
-            "t": [r[9], r[10], r[11], r[12]],
-        }
-        for r in rows
-    ]
+    return [_ccr_row_to_dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1173,13 +1121,20 @@ def delete_project_override(match_value: str, match_kind: str | None = None) -> 
 # Cost summary cache (written by compute_costs, read by statusline)
 # ---------------------------------------------------------------------------
 
+def _cost_summary_suffix(cwd: str | None) -> str:
+    """Project scope for the cost-summary keys. The writer and the reader must
+    agree exactly: a divergence here is a permanent silent cache miss, not an
+    error, so both read it from here."""
+    return f":{project_key(cwd)}" if cwd else ""
+
+
 def write_cost_summary(costs: dict[str, Any], cwd: str | None = None) -> None:
     """Cache the latest compute_costs() result for fast statusline reads.
 
     Scoped by project (cwd) to prevent cross-contamination between terminals.
     """
     conn = get_connection()
-    suffix = f":{cwd.replace('/', '-')}" if cwd else ""
+    suffix = _cost_summary_suffix(cwd)
     _set_meta(conn, f"cost_summary{suffix}", json.dumps(costs))
     _set_meta(conn, f"cost_summary_time{suffix}", str(time.time()))
     conn.commit()
@@ -1188,7 +1143,7 @@ def write_cost_summary(costs: dict[str, Any], cwd: str | None = None) -> None:
 def read_cost_summary(max_age: int = 600, cwd: str | None = None) -> dict[str, Any] | None:
     """Read cached cost summary if fresh enough, scoped by project."""
     conn = get_connection()
-    suffix = f":{cwd.replace('/', '-')}" if cwd else ""
+    suffix = _cost_summary_suffix(cwd)
     ts_str = _get_meta(conn, f"cost_summary_time{suffix}")
     if not ts_str:
         return None

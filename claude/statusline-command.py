@@ -18,6 +18,7 @@ Layout adapts to terminal width. Claude Code sets $COLUMNS itself (v2.1.153+);
 
 Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_MODEL_BANNER            — colored banner showing the active model (default 0)
+  CLAUDE_STATUSLINE_RED                     — recolor entire status line red, any model (default 0)
   CLAUDE_STATUSLINE_HAIKU_RED               — recolor entire status line red when on Haiku
   CLAUDE_STATUSLINE_TIMESTAMP               — HH:MM invocation timestamp
   CLAUDE_STATUSLINE_SESSION_ID              — short session UUID
@@ -34,7 +35,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate % (default 0)
     CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as (xhigh)
     CLAUDE_STATUSLINE_THINKING              — nothink marker when thinking is off
-  CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on 80% usable window (auto-compact threshold)
+  CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on the usable window (nominal minus the ~33k auto-compact reserve)
   CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon) (default 0)
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset) (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min (default 0)
@@ -87,7 +88,16 @@ from cache_db import (
     read_usage_stale,
     write_cache_stats,
 )
-from pricing import compute_costs, compute_project_rolling_costs, compute_session_cost
+from pricing import (
+    ROLLING_WINDOWS,
+    SESSION_WINDOW_S,
+    WEEK_WINDOW_S,
+    compute_costs,
+    compute_project_rolling_costs,
+    compute_session_cost,
+    rolling_cost_keys,
+    window_start_epoch,
+)
 
 # --- Config ---
 
@@ -427,6 +437,16 @@ def _start_dsp_check() -> subprocess.Popen[bytes] | None:
         return None
 
 
+def _kill(proc: subprocess.Popen[bytes] | None) -> None:
+    """Kill a helper subprocess if it is still around. Never raises."""
+    if proc is None:
+        return
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def _collect_dsp(proc: subprocess.Popen[bytes] | None) -> bool:
     if proc is None:
         return False
@@ -470,11 +490,6 @@ def _render_dsp(active: bool) -> str:
 
 
 # --- Usage data ---
-
-
-def _try_cache_bypass() -> dict | None:
-    """Read usage data from SQLite cache if fresh."""
-    return read_usage_for_statusline()
 
 
 def _adjust_passed_resets(data: dict, now: float) -> dict:
@@ -557,10 +572,12 @@ def _api_fetch_needed(usage: dict, native_rl: dict, now: float) -> bool:
     # enough that spend could start before the next heartbeat.
     if _on("EXTRA"):
         try:
-            s_pct = int(native_rl.get("session_percent", 0))
+            s_pct = int(native_rl.get("session_percent", 0) or 0)
         except (TypeError, ValueError):
             s_pct = 0
-        if s_pct >= _env_int("EXTRA_SESSION_THRESHOLD", 60):
+        # The threshold comparison is the render's, against the native reading
+        # rather than the cached one.
+        if _extra_threshold_met(s_pct):
             try:
                 spent = float(usage.get("extra_spent") or 0)
             except (TypeError, ValueError):
@@ -632,7 +649,7 @@ def _fetch_usage(session_id: str, cwd: str, native_rl: dict) -> dict:
             return {}
     stale = read_usage_stale() or {}
     want_api = _api_fetch_needed(stale, native_rl, now)
-    cached = _try_cache_bypass()
+    cached = read_usage_for_statusline()
     if cached is not None:
         return _adjust_passed_resets(cached, now)
     if not want_api:
@@ -840,25 +857,33 @@ def _render_dogcat(dcat_data: dict) -> str:
 AUTOCOMPACT_BUFFER = 33_000
 
 
-def _fmt_window_size(ctx_size: int) -> str:
-    """Nominal context window as a compact label: 1000000 → 1M, 200000 → 200k."""
-    if ctx_size <= 0:
-        return ""
-    k = ctx_size // 1000
-    if k >= 1000:
-        return f"{k / 1000:g}M"
-    return f"{k}k"
-
-
-def _render_ctx_pct(used: str, ctx_size: int) -> str:
-    if not used:
-        return ""
-    used_f = float(used)
-    # Usable context: auto-compact reserves ~33k tokens, scale to usable range
+def _usable_ctx(ctx_size: int) -> int:
+    """Window the session can actually fill, minus the auto-compact reserve."""
     if _on("USABLE_CTX") and ctx_size > AUTOCOMPACT_BUFFER:
-        usable_ratio = (ctx_size - AUTOCOMPACT_BUFFER) / ctx_size
-        used_f = min(100.0, used_f / usable_ratio)
-    used_int = math.ceil(used_f)
+        return ctx_size - AUTOCOMPACT_BUFFER
+    return ctx_size
+
+
+def _used_tokens(used: str, ctx_size: int, total_in: int) -> int | None:
+    """Input tokens in context, exact where possible. None when unknown.
+
+    total_input_tokens is the sum of the three current_usage input fields, the
+    same input-only basis used_percentage reports, so preferring it costs nothing
+    and avoids reconstructing tokens from an integer percentage — 1% is 10k
+    tokens on a 1M window. It reads 0 before the first API response and again
+    after /compact until the next call, which is where used_percentage fills in.
+    """
+    if total_in > 0:
+        return total_in
+    if used and ctx_size > 0:
+        return round(ctx_size * float(used) / 100)
+    return None
+
+
+def _render_ctx_pct(used_tokens: int | None, ctx_size: int) -> str:
+    if used_tokens is None or ctx_size <= 0:
+        return ""
+    used_int = min(100, math.ceil(used_tokens * 100 / _usable_ctx(ctx_size)))
     col = "31" if used_int >= 70 else "33" if used_int >= 50 else "32"
     return f"\033[0;90mctx:\033[0;{col}m{used_int}%\033[0m"
 
@@ -912,16 +937,16 @@ def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
     if not w_pct_s:
         return ""
     reset_epoch = _parse_iso_epoch(reset_iso)
-    if reset_epoch is None:
+    week_start = window_start_epoch(reset_iso, WEEK_WINDOW_S, now)
+    if reset_epoch is None or week_start is None:
         return ""
     try:
         actual = int(w_pct_s)
     except ValueError:
         return ""
     pace = _pace_days()
-    week_start = reset_epoch - 7 * 86400
     elapsed_s = now - week_start
-    elapsed_frac = elapsed_s / (7 * 86400)
+    elapsed_frac = elapsed_s / WEEK_WINDOW_S
     if elapsed_frac <= 0 or elapsed_frac > 1:
         return ""
     # Expected usage: consume 100% in pace_days, not 7 (cap at 100)
@@ -1037,36 +1062,44 @@ def _render_sessions(cwd: str, now: float) -> str:
 
 def _extra_deltas(current_spent: float, usage: dict, now: float) -> dict[str, float | None]:
     """Compute extra usage deltas for session window (5h) and week (7d)."""
-    from datetime import timedelta
-
-    session_start_epoch: float | None = None
-    sr_iso = usage.get("session_reset", "")
-    if sr_iso:
-        sr_epoch = _parse_iso_epoch(str(sr_iso))
-        if sr_epoch is not None:
-            if sr_epoch <= now:
-                session_start_epoch = sr_epoch
-            else:
-                session_start_epoch = sr_epoch - 5 * 3600
-
-    week_start_epoch: float | None = None
-    wr_iso = usage.get("week_reset", "")
-    if wr_iso:
-        wr_epoch = _parse_iso_epoch(str(wr_iso))
-        if wr_epoch is not None:
-            if wr_epoch <= now:
-                week_start_epoch = wr_epoch
-            else:
-                week_start_epoch = wr_epoch - 7 * 86400
-
     return compute_extra_window_deltas(
-        current_spent, session_start_epoch, week_start_epoch,
+        current_spent,
+        window_start_epoch(usage.get("session_reset", ""), SESSION_WINDOW_S, now),
+        window_start_epoch(usage.get("week_reset", ""), WEEK_WINDOW_S, now),
     )
 
 
 def _ustr(d: dict, key: str) -> str:
     """Safely extract a string value from a usage dict."""
     return str(d.get(key, "") or "")
+
+
+def _pct_str(d: dict, key: str) -> str:
+    """A percentage as a string. 0 is a reading; absent is not — unlike _ustr.
+
+    _ustr collapses 0 to "" via `or`, which is right for a cost and wrong for a
+    quota: 0% means the window just reset, and the segment should render it.
+    """
+    raw = d.get(key, "")
+    return str(raw) if raw is not None and raw != "" else ""
+
+
+def _extra_threshold_met(session_percent: object) -> bool:
+    """Whether the session window is far enough along for Extra to matter.
+
+    One comparison for the fetch decision and the render decision: if they
+    disagree, a fetch spends a subprocess on a field the render then drops. A
+    missing or unreadable percentage is not a reading, so the answer is no — a
+    threshold pinned to 0 must not turn "unknown" into "over the line". A real
+    0 does count.
+    """
+    if session_percent is None or session_percent == "":
+        return False
+    try:
+        pct = int(session_percent)
+    except (TypeError, ValueError):
+        return False
+    return pct >= _env_int("EXTRA_SESSION_THRESHOLD", 60)
 
 
 def _extra_is_material(usage: dict) -> bool:
@@ -1080,11 +1113,9 @@ def _extra_is_material(usage: dict) -> bool:
     try:
         if float(usage.get("extra_spent") or 0) <= 0:
             return False
-        return int(usage.get("session_percent") or 0) >= _env_int(
-            "EXTRA_SESSION_THRESHOLD", 60,
-        )
     except (TypeError, ValueError):
         return False
+    return _extra_threshold_met(usage.get("session_percent"))
 
 
 def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
@@ -1093,10 +1124,8 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
     Returns (rl_inners, have_rate_limits). *have_rate_limits* may be set to
     False if data is too stale, even when it was True on entry.
     """
-    s_pct_raw = usage.get("session_percent", "")
-    w_pct_raw = usage.get("week_percent", "")
-    s_pct = str(s_pct_raw) if s_pct_raw is not None and s_pct_raw != "" else ""
-    w_pct = str(w_pct_raw) if w_pct_raw is not None and w_pct_raw != "" else ""
+    s_pct = _pct_str(usage, "session_percent")
+    w_pct = _pct_str(usage, "week_percent")
     if not (s_pct or w_pct):
         return [], False
 
@@ -1119,8 +1148,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
         rl_inners.append(week_line)
 
     # Sonnet (hidden below threshold)
-    so_pct_raw = usage.get("sonnet_percent", "")
-    so_pct = str(so_pct_raw) if so_pct_raw is not None and so_pct_raw != "" else ""
+    so_pct = _pct_str(usage, "sonnet_percent")
     so_shown = False
     if _on("SONNET") and so_pct:
         try:
@@ -1135,8 +1163,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
     # Per-model weekly limit — a quota separate from W, scoped to one model.
     # Label comes from the API's display_name ("Fable" → Fa) since which model
     # is capped varies; skipped when it would duplicate the Sonnet segment.
-    sc_pct_raw = usage.get("scoped_percent", "")
-    sc_pct = str(sc_pct_raw) if sc_pct_raw is not None and sc_pct_raw != "" else ""
+    sc_pct = _pct_str(usage, "scoped_percent")
     sc_model = _ustr(usage, "scoped_model")
     sc_shown = False
     if _on("SCOPED") and sc_pct and sc_model:
@@ -1183,14 +1210,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
 
 def _render_extra_usage(usage: dict, now: float) -> str:
     """Render Extra usage section (only when session % >= threshold)."""
-    s_pct_raw = usage.get("session_percent", "")
-    s_pct = str(s_pct_raw) if s_pct_raw is not None and s_pct_raw != "" else ""
-    if not (_on("EXTRA") and s_pct):
-        return ""
-    try:
-        if int(s_pct) < _env_int("EXTRA_SESSION_THRESHOLD", 60):
-            return ""
-    except ValueError:
+    if not _extra_is_material(usage):
         return ""
 
     es = _ustr(usage, "extra_spent")
@@ -1217,21 +1237,29 @@ def _render_extra_usage(usage: dict, now: float) -> str:
     return extra_str
 
 
+# Env toggle and default per rolling window. Written out so `6H_COST` is
+# greppable; the key names and labels are derived from ROLLING_WINDOWS.
+_COST_WINDOW_TOGGLES = {
+    "six_hour": ("6H_COST", False),
+    "twelve_hour": ("12H_COST", False),
+    "twenty_four_hour": ("24H_COST", True),
+    "seven_day": ("7D_COST", True),
+    "thirty_day": ("30D_COST", True),
+}
+
+
 def _render_cost_windows(usage: dict) -> str:
     """Render historic cost window line (6H/12H/24H/7D/30D/AT)."""
     SEP = f"{SUBDUED} · {RST}"
     cost_parts: list[str] = []
-    _COST_WINDOWS = [
-        ("6H_COST",  False, "6H",  "six_hour_cost",         "six_hour_project_cost"),
-        ("12H_COST", False, "12H", "twelve_hour_cost",       "twelve_hour_project_cost"),
-        ("24H_COST", True,  "24H", "twenty_four_hour_cost",  "twenty_four_hour_project_cost"),
-        ("7D_COST",  True,  "7D",  "seven_day_cost",         "seven_day_project_cost"),
-        ("30D_COST", True,  "30D", "thirty_day_cost",        "thirty_day_project_cost"),
-    ]
-    for env_key, default, label, total_key, proj_key in _COST_WINDOWS:
+    # Shortest window first, the order the line reads in. Labels and key names
+    # come from pricing.ROLLING_WINDOWS; only the toggle and its default are a
+    # per-window choice, so only those live here.
+    for w in reversed(ROLLING_WINDOWS):
+        env_key, default = _COST_WINDOW_TOGGLES[w.name]
         if _on(env_key, default=default):
-            cost_line = _usage_cost(label, _ustr(usage, total_key),
-                            _ustr(usage, proj_key))
+            cost_line = _usage_cost(w.label, _ustr(usage, f"{w.name}_cost"),
+                            _ustr(usage, f"{w.name}_project_cost"))
             if cost_line:
                 cost_parts.append(cost_line)
 
@@ -1294,7 +1322,7 @@ def _render_session(
     model: str,
     effort: str,
     thinking_off: bool,
-    used: str,
+    used_tokens: int | None,
     ctx_size: int,
     cum_fresh: int,
     cum_create: int,
@@ -1306,13 +1334,10 @@ def _render_session(
     parts: list[str] = []
 
     if model:
-        # Window size comes from context_window_size, the only field that always
-        # carries it: Fable 5 and Sonnet 5 report 1M windows with no
-        # "(1M context)" suffix in display_name, so scraping the name showed a
-        # size for Opus alone. The suffix is still stripped to avoid doubling it.
+        # Opus carries a "(1M context)" suffix in display_name; strip it so the
+        # name reads the same across models.
         base = re.sub(r"\s*\(\d+\w+\s+context\)", "", model)
-        size = _fmt_window_size(ctx_size)
-        parts.append(f"{SUBDUED}{base} {size}{RST}" if size else f"{SUBDUED}{base}{RST}")
+        parts.append(f"{SUBDUED}{base}{RST}")
 
     # Reasoning config sits with the model it configures
     for seg in (_render_effort(effort), _render_thinking(thinking_off)):
@@ -1336,12 +1361,12 @@ def _render_session(
             parts.append(f"{SUBDUED}CH:{ch}%{RST}")
 
     # Context window token counts (structural)
-    if used and ctx_size > 0:
-        used_int = math.ceil(float(used))
-        used_k = (ctx_size * used_int + 99999) // 100000
-        effective_size = max(1, ctx_size - AUTOCOMPACT_BUFFER) if _on("USABLE_CTX") else ctx_size
-        total_k = (effective_size + 999) // 1000
-        total_str = f"{total_k // 1000}M" if total_k >= 1000 else f"{total_k}k"
+    if used_tokens is not None and ctx_size > 0:
+        used_k = (used_tokens + 999) // 1000
+        total_k = (_usable_ctx(ctx_size) + 999) // 1000
+        # 1000/1000 renders "1M", 1500/1000 renders "1.5M" — a truncating //
+        # turned a 1.5M window into 1M.
+        total_str = f"{total_k / 1000:g}M" if total_k >= 1000 else f"{total_k}k"
         parts.append(f"{SUBDUED}{used_k}k/{total_str}{RST}")
 
     if not parts:
@@ -1352,11 +1377,20 @@ def _render_session(
 # --- Main ---
 
 
-def _merge_cost_data(usage_data: dict, session_id: str, cwd: str) -> None:
+def _merge_cost_data(
+    usage_data: dict, session_id: str, cwd: str, native_rl: dict | None = None,
+) -> None:
     """Enrich usage_data with cost data from JSONL and cost summary cache."""
     if not usage_data and _on("HISTORIC_COST"):
+        # Cold start: no cached row, so the window bounds can only come from
+        # stdin. Without them compute_costs has no session window to total.
+        rl = native_rl or {}
         try:
-            usage_data.update(compute_costs(session_id=session_id, cwd=cwd))
+            usage_data.update(compute_costs(
+                session_id=session_id, cwd=cwd,
+                session_reset_iso=rl.get("session_reset"),
+                week_reset_iso=rl.get("week_reset"),
+            ))
         except Exception:  # noqa: BLE001
             pass
     if usage_data and _on("HISTORIC_COST"):
@@ -1367,12 +1401,7 @@ def _merge_cost_data(usage_data: dict, session_id: str, cwd: str) -> None:
                 for k in (
                     # The S/W window costs come from here too, not just the usage
                     # row, so they stay current when the API fetch is skipped.
-                    "session_window_cost", "week_cost",
-                    "six_hour_cost", "twelve_hour_cost", "twenty_four_hour_cost",
-                    "seven_day_cost", "thirty_day_cost", "all_time_cost",
-                    "six_hour_project_cost", "twelve_hour_project_cost",
-                    "twenty_four_hour_project_cost", "seven_day_project_cost",
-                    "thirty_day_project_cost", "all_time_project_cost",
+                    "session_window_cost", "week_cost", *rolling_cost_keys(),
                 ):
                     if k in cost_summary:
                         usage_data[k] = cost_summary[k]
@@ -1410,8 +1439,7 @@ def _parse_input(data: dict) -> _InputData:
     cost_obj = data.get("cost") or {}
     cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd", "")
     model = (data.get("model") or {}).get("display_name", "")
-    used_raw = cw.get("used_percentage", "")
-    used = str(used_raw) if used_raw is not None and used_raw != "" else ""
+    used = _pct_str(cw, "used_percentage")
     ctx_size = int(cw.get("context_window_size", 0) or 0)
     # effort is absent when the model has no effort parameter; thinking only
     # counts as off when explicitly false, not when the field is missing
@@ -1580,7 +1608,7 @@ def main() -> None:
             for k in list(usage_data):
                 if "project_cost" in k:
                     del usage_data[k]
-        _merge_cost_data(usage_data, inp.session_id, inp.cwd)
+        _merge_cost_data(usage_data, inp.session_id, inp.cwd, native_rl)
         # S and W come from stdin when Claude Code sends them — always current,
         # so they win over the cache. Applied after the cost merge, which keys
         # its compute-vs-read choice on usage_data being empty. Sonnet, Extra
@@ -1596,26 +1624,8 @@ def main() -> None:
         battery_data = _collect_battery(battery_proc)
         dsp_active = _collect_dsp(dsp_proc)
     finally:
-        for p in git_procs.values():
-            try:
-                p.kill()
-            except OSError:
-                pass
-        if macmon_proc:
-            try:
-                macmon_proc.kill()
-            except OSError:
-                pass
-        if battery_proc:
-            try:
-                battery_proc.kill()
-            except OSError:
-                pass
-        if dsp_proc:
-            try:
-                dsp_proc.kill()
-            except OSError:
-                pass
+        for p in (*git_procs.values(), macmon_proc, battery_proc, dsp_proc):
+            _kill(p)
 
     # Cache stats
     cum_fresh, cum_create, cum_read = _accumulate_cache_stats(
@@ -1636,12 +1646,13 @@ def main() -> None:
     ]
     chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
     chat_cost = str(chat_cost_val) if chat_cost_val > 0 else ""
+    used_tokens = _used_tokens(inp.used, inp.ctx_size, inp.total_in)
     session = _render_session(
-        inp.model, inp.effort, inp.thinking_off, inp.used, inp.ctx_size,
+        inp.model, inp.effort, inp.thinking_off, used_tokens, inp.ctx_size,
         cum_fresh, cum_create, cum_read, chat_cost,
     )
     # ctx% trails the token counts it summarizes; stays independent of SESSION
-    session = " ".join(s for s in (session, _render_ctx_pct(inp.used, inp.ctx_size)) if s)
+    session = " ".join(s for s in (session, _render_ctx_pct(used_tokens, inp.ctx_size)) if s)
     sessions = _render_sessions(inp.cwd, now_epoch)
     macmon_str = _render_macmon(macmon_data)
     battery_str = _render_battery(battery_data)
@@ -1650,7 +1661,8 @@ def main() -> None:
     _layout_and_print(
         top, session, usage_session_rl, usage_rl, usage_cost,
         usage_data, macmon_str, battery_str, sessions, now_epoch, _t_start,
-        force_red=_on("HAIKU_RED") and "haiku" in inp.model.lower(),
+        force_red=_on("RED", default=False)
+        or (_on("HAIKU_RED") and "haiku" in inp.model.lower()),
         model=inp.model,
     )
 
