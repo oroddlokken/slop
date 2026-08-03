@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["dogcat"]
+# dependencies = []
 # ///
 """Claude Code status line — Python implementation for performance.
 
@@ -669,17 +669,35 @@ def _fetch_usage(session_id: str, cwd: str, native_rl: dict) -> dict:
 
 
 def _fetch_dcat(cwd: str) -> dict:
-    """Get dcat issue counts using dogcat library (in-process)."""
+    """Count dcat issues by status, reading .dogcats/issues.jsonl directly.
+
+    Parsing dogcat's own storage instead of importing the library keeps this
+    script free of third-party dependencies, so the statusline still renders on
+    machines without dogcat. The trade is a coupling to the on-disk format: if
+    that changes, the dc[] badge disappears rather than the statusline breaking.
+
+    issues.jsonl is an append log — later records for an id supersede earlier
+    ones, and tombstoned issues are dropped. Archived issues live in
+    .dogcats/archive/ and are excluded, which matches plain `dcat list`.
+    """
     if not _on("DOGCAT") or not cwd:
         return {}
     try:
-        from dogcat.cli._helpers import get_storage
-
-        storage = get_storage(f"{cwd}/.dogcats")
+        latest: dict[str, dict] = {}
+        with open(f"{cwd}/.dogcats/issues.jsonl", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                if rec.get("record_type") == "issue":
+                    latest[rec["id"]] = rec
         by_status: dict[str, int] = {}
-        for issue in storage.list():
-            s = issue.status.value
-            by_status[s] = by_status.get(s, 0) + 1
+        for rec in latest.values():
+            if rec.get("deleted_at"):
+                continue
+            status = rec.get("status")
+            if status:
+                by_status[status] = by_status.get(status, 0) + 1
         return {"by_status": by_status}
     except Exception:  # noqa: BLE001
         return {}
@@ -1600,7 +1618,7 @@ def main() -> None:
         # Computed before the fetch decision (it gates whether the API is worth
         # calling) but applied after the cost merge — see below.
         native_rl = _native_rate_limits(data)
-        # In-process: usage cache + dcat library (no subprocess)
+        # In-process: usage cache + .dogcats log (no subprocess)
         usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl)
         # Strip project-scoped costs from usage cache — they belong to
         # whichever project last wrote the singleton row (macsetup-1zeq)
