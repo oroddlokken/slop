@@ -1,6 +1,6 @@
 ---
 name: fuzz-my-stuff-up
-description: "Adversarial code exploration. Launches ~20 agents — sequentially (default, cheapest) or in parallel — each trying to break the code from a different angle (empty inputs, unicode chaos, race conditions, injection, state machine abuse, etc.) — then distills all findings into prioritized action points."
+description: "Adversarial code exploration. Launches ~20 agents — sequentially (default) or in parallel — each trying to break the code from a different angle (empty inputs, unicode chaos, race conditions, injection, state machine abuse, etc.) — then distills all findings into prioritized action points."
 args:
   - name: area
     description: The directory, feature, or component to fuzz (optional)
@@ -19,7 +19,7 @@ Launch ~20 parallel adversarial agents, each trying to break the codebase from a
 
 ## Rules
 
-- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential. Everything above `---` in the agent template is identical across agents and gets cached by the API after the first agent, reducing input cost by ~90%.
+- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
 - **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
 - **Agents inherit the default model** — do not override with a specific model.
 - **Agents analyze code without modifying files.** Users review findings before acting.
@@ -113,7 +113,7 @@ Drop fuzzers whose target patterns aren't in the codebase. Note each drop in the
 Check if the project uses **dcat**. Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to each agent so they can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
 ### Step 4.4: Check Snapshot Cache
 
-A prior run of this or another meta-skill may have already produced a snapshot of this codebase. Reuse it before re-reading ~200K of files.
+A prior run of this skill may have already produced a snapshot of this codebase. Reuse it before re-reading ~200K of files.
 
 **Build the cache key**:
 1. `git_rev` = output of `git rev-parse HEAD` (or `no-git` if not a git repo)
@@ -130,7 +130,7 @@ Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 
 - If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 4.5.
 - Otherwise, proceed to Step 4.5. After building the snapshot there, write it to `.claude-cache/fuzz-my-stuff-up-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
 
-The 1-hour TTL matches Anthropic's prompt-cache window — `/codehealth` followed by `/fuzz-my-stuff-up` 40 minutes later still hits both layers (this disk cache and the prompt cache when the next skill primes its first agent).
+The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. Both caches are per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
 
 ### Step 4.5: Prescan the Codebase (orchestrator does this once)
 
@@ -145,17 +145,25 @@ Read `scan-steps.md` from this skill's directory and follow its scan procedure. 
 
 Use the agent template (`fuzzer-agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
 
+**Spawn contract** — how you call the Agent tool, in every launch mode:
+
+- **Never pass `name:`.** A named agent becomes an addressable mailbox teammate, not a subagent. The tool result is `Spawned successfully` plus an agent_id, the findings never come back, and `run_in_background: false` is ignored. `TaskList` and `TaskOutput` cannot see it either. Recovering costs a round of `SendMessage` to every agent asking it to resend.
+- **Pass `run_in_background: false`.** You need each agent's findings in hand before the distill step.
+- **The Agent tool's return value is the findings.** Read them out of the tool result. Do not wait for a message, a notification, or an idle ping — none of those carry the report.
+
 **Launch strategy** — Ask the user:
 
-- **Sequential** (default) — Launch agents one at a time, each after the previous completes. First agent primes the cache; every subsequent agent reads the shared prefix at ~90% cheaper input. Slowest, cheapest.
-- **1+Parallel** — Launch one agent first to prime the cache, then launch remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Nearly as cheap as Sequential, much faster.
+- **Sequential** (default) — Launch agents one at a time, each after the previous completes. Spreads token spend across the run instead of bursting it against the 5-hour quota. Slowest.
+- **1+Parallel** — Launch one agent, then the remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Same cost as Sequential, much faster.
 
 If the user doesn't specify, use **Sequential**.
 
-**Cache structure** — The `---` divider in fuzzer-agent.md is the cache boundary. Everything above it is the shared prefix (identical for all agents). Everything below is per-agent. API prompt caching matches byte-for-byte prefixes, so:
-- Shared prefix placeholders (`{codebase_snapshot}`, `{path}`, `{languages}`, `{focus}`, `{known_issues}`) resolve to the **same value** for all agents. Resolve these once and reuse the identical string.
-- Per-agent placeholders (`{fuzzer}`, `{attack_angle}`) differ per agent. These go below `---` and do not affect cache matching.
-- **Never insert per-agent content above the `---` line.** This includes scope boundary rules — append those after per-agent content, not in the shared prefix.
+**Prompt caching** — Agents do not share cached prompt content with each other. Measured over a 16-agent run (2026-08-04): every agent read back the same ~7K tokens of system prompt and tool definitions, then created everything else fresh — including a byte-identical 11K-token snapshot, once per agent.
+
+The cause is breakpoint placement. Caching matches a byte prefix ending at a `cache_control` breakpoint, and the harness sets one after the system prompt and one at the end of each message. The Agent tool takes a single prompt string, so the shared snapshot and the per-agent assignment land inside the same cached unit and can never match across agents. Sharing would require the shared half in its own content block with a breakpoint at that boundary; the Agent tool exposes no way to ask for one.
+
+- **The `---` divider is a section divider, not a cache boundary.** Shared placeholders (`{codebase_snapshot}`, `{path}`, `{languages}`, `{focus}`, `{known_issues}`) still resolve once and stay identical across agents, and per-agent placeholders still go below the line — that keeps the template readable and the resolve step cheap. No cost depends on it.
+- **Snapshot size is the lever that does matter.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves money; launch order does not.
 
 **Build the shared prefix once:**
 1. Read `fuzzer-agent.md` from this skill's directory
@@ -181,6 +189,18 @@ Concentrate your fuzzing primarily on **{area}**. Go deeper on {area}-related co
 Other areas are still worth probing but give {area} roughly 3x the attention.
 ```
 
+### Amending the Brief Mid-Run
+
+The resolved template is **frozen once the first agent launches** — do not edit it, and do not edit the snapshot file it was built from. Agents that already ran cannot see the change, so editing mid-run leaves two populations of findings built on different facts, with nothing recording which is which.
+
+When you find the brief is wrong mid-run — a prescan claim an agent contradicts, a mis-stated invariant, a file that does not exist — record the correction instead of applying it:
+
+1. **Append to an errata list** for this run. One entry per correction: what the brief claimed, what is actually true, and a `file:line` citation for the correction.
+2. **Append the errata to the per-agent half** (below `---`) of every agent launched from then on, under a `## Errata` heading introduced by: "The brief contains errors. The entries below are authoritative wherever they contradict it."
+3. **Pass the errata to distill**, noting which agents ran before each entry was added. Distill drops or annotates any earlier finding that rests on a corrected claim.
+
+Agents surface corrections too — a lens that checks a prescan claim and finds it false. Treat those the same way: add an entry, and it binds every agent launched after it.
+
 ### Step 6: Distill
 
 Spawn a fresh sub-agent for distillation:
@@ -191,7 +211,9 @@ Spawn a fresh sub-agent for distillation:
 - **Input**: the `## Findings Summary` table from each completed fuzzer, prefixed with `### Fuzzer: {name}`. Strip surrounding prose — tables only. Also include which fuzzers ran, which were skipped, the dcat issues list (if any), and the focus area (if any).
 - **Do not pass the codebase snapshot.** Distill works on structured findings; the snapshot would inflate input by ~200K tokens for no gain (file references in findings already point at the code).
 
-Return the agent's output to the user.
+Paste the distill agent's output into your own reply, verbatim and in full.
+
+Only your reply is rendered to the user — the agent's report is not. Never point at it with "the findings are above", "see the report", or similar. Length is not a reason to summarize instead: if the list is long, your reply is long.
 
 ### Error Handling
 

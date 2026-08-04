@@ -262,11 +262,11 @@ Spawn a single sub-agent (`subagent_type: "Explore"`) that applies all selected 
     {lens instructions verbatim}
     ```
 
-6. Pass the assembled prompt to the agent. Wait for completion.
+6. Pass the assembled prompt to the agent, with `run_in_background: false` and **no `name:`**. A named agent becomes a mailbox teammate instead of a subagent: the tool result is `Spawned successfully` and the findings never come back. Wait for completion; the tool's return value is the findings.
 
 ### Step 4: Present Findings
 
-The agent returns findings already deduplicated (lenses that flagged the same issue are merged with all flagging lenses listed) and grouped by file, in the format specified inside `audit-agent.md`. Pass the output through to the user, then ask: "Want me to apply these changes?"
+The agent returns findings already deduplicated (lenses that flagged the same issue are merged with all flagging lenses listed) and grouped by file, in the format specified inside `audit-agent.md`. Paste the output into your own reply, verbatim and in full — only your reply is rendered to the user, so never point at the agent's output with "see above". Then ask: "Want me to apply these changes?"
 
 If the agent's output deviates from the expected structure, reformat it for presentation — do not re-audit or add new findings. The audit is the agent's.
 

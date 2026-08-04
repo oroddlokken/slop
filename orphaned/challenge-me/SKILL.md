@@ -37,8 +37,8 @@ Use the agent template (`agent.md`). Replace placeholders:
 - `{approach}` — the approach summary from Step 1
 - `{context}` — the actual code, plan, or output content (include file paths and line numbers when available)
 
-Spawn with `model: "sonnet"`.
+Spawn with `model: "sonnet"`, `run_in_background: false`, and **no `name:`**. A named agent becomes a mailbox teammate instead of a subagent: the tool result is `Spawned successfully` and the response never comes back.
 
 ### Step 3: Report
 
-Return the Sonnet agent's response directly to the user.
+Paste the Sonnet agent's response into your own reply, verbatim and in full. Only your reply is rendered to the user — the agent's output is not, so never point at it with "see above".

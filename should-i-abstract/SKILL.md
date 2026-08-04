@@ -43,7 +43,7 @@ Detect which languages are in scope:
 Check if the project uses **dcat**. Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to the agent so it can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
 ### Step 3.5: Check Snapshot Cache
 
-A prior run of this or another meta-skill may have already produced a snapshot of this codebase. Reuse it before re-reading files.
+A prior run of this skill may have already produced a snapshot of this codebase. Reuse it before re-reading files.
 
 **Build the cache key**:
 1. `git_rev` = output of `git rev-parse HEAD` (or `no-git` if not a git repo)
@@ -60,7 +60,7 @@ Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 
 - If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 4.
 - Otherwise, proceed to Step 4. After building the snapshot there, write it to `.claude-cache/should-i-abstract-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
 
-The 1-hour TTL matches Anthropic's prompt-cache window — `/codehealth` followed by `/should-i-abstract` 40 minutes later still hits both layers.
+The 1-hour TTL is a staleness backstop: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. The cache is per-skill by design — every meta-skill scans for different things. This skill runs a single agent, so there is no shared prompt prefix to prime.
 
 ### Step 4: Prescan the Codebase
 
@@ -80,7 +80,7 @@ Read `agent.md` from this skill's directory and resolve placeholders:
 3. Replace `{languages}` with the confirmed language list
 4. If the user specified a focus area, replace `{focus}` with the focus block below, replacing `{area}` with the user's specified area. Otherwise replace `{focus}` with an empty string.
 5. If dcat issues were found, replace `{known_issues}` with a `## Known Issues (skip these)` section listing them. Otherwise replace with an empty string.
-6. Pass the result as the agent prompt
+6. Pass the result as the agent prompt, with `run_in_background: false` and **no `name:`**. A named agent becomes a mailbox teammate instead of a subagent: the tool result is `Spawned successfully` and the findings never come back.
 
 **Focus block** (inserted when focus is set):
 ```
@@ -93,7 +93,7 @@ Other areas are still worth reviewing but give {area} roughly 3x the attention.
 
 ### Step 6: Report
 
-Return the agent's findings directly to the user. After presenting results, ask if they want to start working on any items.
+Paste the agent's findings into your own reply, verbatim and in full. Only your reply is rendered to the user — the agent's output is not, so never point at it with "see above". After presenting results, ask if they want to start working on any items.
 
 ### Error Handling
 

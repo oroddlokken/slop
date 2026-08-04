@@ -19,6 +19,17 @@ You do not receive the string inventory. Read specific file:line references on d
 
 Build a canonical list as an internal scratchpad. The user does not see this.
 
+### 1.0 Apply errata
+
+You may receive an **errata list** — corrections the orchestrator made to the shared brief after some agents had already run. Each entry states what the brief claimed, what is actually true with a `file:line` citation, and which agents ran before it was added. Skip this step when no errata were passed.
+
+Errata override the brief. For every finding from an agent that ran *before* an entry was added:
+
+- The finding depends on the corrected claim → drop it, mark `stale-brief`, keep a count.
+- The finding merely repeats the claim in passing → keep it, and correct the wording.
+
+Findings from agents launched after an entry already had it, so leave them alone.
+
 ### 1.1 Validate
 
 For each finding, read the cited file:line. Confirm three things:
@@ -114,6 +125,7 @@ Widget narration, redundant tails, isolated slop, interior scaffold filler.
 - {N} findings dropped as noise or subjective preference.
 - {N} findings kept as hints carrying a unit, source, limit or consequence the screen cannot show (protected from deletion).
 - {N} findings discarded as hallucinated (quoted string did not match the file).
+- {N} findings dropped as `stale-brief` (rested on a claim the errata corrected) — omit when no errata were passed.
 - Reviewers run: {list}. Reviewers skipped: {list with reason}.
 ```
 
