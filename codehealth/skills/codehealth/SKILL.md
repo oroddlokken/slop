@@ -1,11 +1,8 @@
 ---
 name: codehealth
-description: "Meta code quality review. Spins up parallel agents — each reviewing through a different lens (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs) — then distills all findings into prioritized action points."
-args:
-  - name: area
-    description: The directory or area to review (optional)
-    required: false
-user-invocable: true
+description: "Broad code-quality sweep over a whole codebase. Use when asked to review code health, find technical debt, clean up a codebase, hunt duplication or dead code, or answer what should we refactor — and after a structural change settles, to catch what the refactor left behind. Spins up parallel agents (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs), then distills findings into prioritized action points. For money math use accountant, for SQL depth use dba, for security use whitehat."
+argument-hint: "[area]"
+disable-model-invocation: true
 ---
 
 # Code Health
@@ -23,6 +20,7 @@ Launch parallel code-quality agents, each analyzing the codebase through a diffe
 - **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
 - **Agents inherit the default model** — do not override with a specific model.
 - **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
+
 ## Workflow
 
 ### Step 1: Choose Mode
@@ -102,6 +100,7 @@ Drop reviewers whose target patterns aren't in the codebase. Note each drop in t
 ### Step 1.75: Check for Existing Issue Tracker
 
 Check if the project uses **dcat** — a local issue tracker (CLI tool). Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to each agent so they can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
+
 ### Step 2: Determine Target
 
 Ask the user (if not already clear):
@@ -134,7 +133,7 @@ Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 
 - If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 2.5.
 - Otherwise, proceed to Step 2.5. After building the snapshot there, write it to `.claude-cache/codehealth-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
 
-The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. Both caches are per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
+The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. The cache is per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 

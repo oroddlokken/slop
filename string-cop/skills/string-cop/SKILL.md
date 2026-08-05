@@ -1,11 +1,8 @@
 ---
 name: string-cop
-description: "Interface copy quality review. Spins up parallel agents — each reviewing through a different lens (contradicts-view, reassurance, self-justification, lecture, widget-narration, redundancy, scaffold-filler, cross-screen, empty-and-error, llm-slop) — then distills all findings into prioritized action points. Reviews what the screen SAYS, not how it looks."
-args:
-  - name: area
-    description: The directory or area to review (optional)
-    required: false
-user-invocable: true
+description: "Reviews what the screen SAYS, not how it looks. Use when asked to review UI copy, labels, hints, tooltips, empty states, error messages, or flash text; when an interface reads as over-explained or self-congratulatory; or when a hint might contradict what the page actually renders. Covers templates plus the view and domain code that supplies strings. Spins up parallel agents (contradicts-view, reassurance, self-justification, lecture, widget-narration, redundancy, scaffold-filler, cross-screen, empty-and-error, llm-slop), then distills findings into prioritized action points. Layout, spacing, and color are out of scope; for comments use comment-cop."
+argument-hint: "[area]"
+disable-model-invocation: true
 ---
 
 # String Cop
@@ -157,7 +154,7 @@ Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{layers}` and take the first 12
 
 **Note:** String Cop needs strings extracted with file:line, not whole files. Never reuse a snapshot produced by `comment-cop` or `codehealth` — the cache key includes `{skill}`, so they will not collide.
 
-The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. Both caches are per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
+The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. The cache is per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
 
 ### Step 2.5: Extract the String Inventory (orchestrator does this once)
 
@@ -189,7 +186,7 @@ If the user doesn't specify, use **Sequential**.
 
 The cause is breakpoint placement. Caching matches a byte prefix ending at a `cache_control` breakpoint, and the harness sets one after the system prompt and one at the end of each message. The Agent tool takes a single prompt string, so the shared snapshot and the per-agent assignment land inside the same cached unit and can never match across agents. Sharing would require the shared half in its own content block with a breakpoint at that boundary; the Agent tool exposes no way to ask for one.
 
-- **The `---` divider is a section divider, not a cache boundary.** Shared placeholders (`{codebase_snapshot}`, `{path}`, `{languages}`, `{focus}`, `{known_issues}`) still resolve once and stay identical across agents, and per-agent placeholders still go below the line — that keeps the template readable and the resolve step cheap. No cost depends on it.
+- **The `---` divider is a section divider, not a cache boundary.** Shared placeholders (`{string_inventory}`, `{path}`, `{render_layers}`, `{focus}`, `{known_issues}`) still resolve once and stay identical across agents, and per-agent placeholders still go below the line — that keeps the template readable and the resolve step cheap. No cost depends on it.
 - **Snapshot size is the lever that does matter.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves money; launch order does not.
 
 **Build the shared prefix once:**

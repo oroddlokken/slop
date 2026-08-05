@@ -1,11 +1,7 @@
 ---
 name: challenge-me
 description: "Quick sanity check on your current approach. Spawns a fast Sonnet agent to challenge whether you're solving the right problem the right way. Use after building something, before committing to a direction, or when something feels off."
-args:
-  - name: target
-    description: What to challenge — a file, plan, or recent work (optional)
-    required: false
-user-invocable: true
+argument-hint: "[target]"
 ---
 
 # Challenge Me

@@ -1,11 +1,8 @@
 ---
 name: should-i-abstract
 description: "Pragmatic DRY review. Finds both under-DRY (true knowledge duplication worth consolidating) and over-DRY (wrong abstractions worth inlining). A single focused agent that makes judgment calls — when to share, when to split, and when to leave it alone."
-args:
-  - name: area
-    description: The directory or area to review (optional)
-    required: false
-user-invocable: true
+argument-hint: "[area]"
+disable-model-invocation: true
 ---
 
 # Should I Abstract?
@@ -17,6 +14,7 @@ Launch a single focused agent to review the codebase through a pragmatic DRY len
 - **The orchestrator prescans the codebase once and passes the snapshot to the agent.**
 - **The agent inherits the default model** — do not override with a specific model.
 - **Single agent, single pass.** This is a judgment-heavy review, not a mechanical scan. The agent needs the full picture to make good tradeoff calls.
+
 ## Workflow
 
 ### Step 1: Determine Target
@@ -41,6 +39,7 @@ Detect which languages are in scope:
 ### Step 3: Check for Existing Issue Tracker
 
 Check if the project uses **dcat**. Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to the agent so it can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
+
 ### Step 3.5: Check Snapshot Cache
 
 A prior run of this skill may have already produced a snapshot of this codebase. Reuse it before re-reading files.

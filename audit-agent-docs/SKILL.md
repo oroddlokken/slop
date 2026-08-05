@@ -1,6 +1,7 @@
 ---
 name: audit-agent-docs
 description: "Audit agent-facing documentation (CLAUDE.md, AGENTS.md, copilot-instructions.md) for redundancies, contradictions, gaps, and misplaced content. Supports Claude Code, OpenAI Codex, and GitHub Copilot. For a general agent's system prompt, persona, or tool descriptions (not repo docs), use audit-agent-prompt. Use when the user wants to review or improve their agent instructions."
+disable-model-invocation: true
 ---
 
 # Audit Docs

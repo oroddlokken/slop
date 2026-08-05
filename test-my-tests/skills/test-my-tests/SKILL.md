@@ -1,11 +1,8 @@
 ---
 name: test-my-tests
-description: "Test quality deep-dive. Spins up parallel agents — each reviewing tests through a different lens (coverage gaps, user flows, mock debt, assertion quality, error paths, data realism, etc.) — then distills all findings into prioritized action points."
-args:
-  - name: area
-    description: The directory or area to review (optional)
-    required: false
-user-invocable: true
+description: "Test-suite quality deep-dive: not whether tests exist, but whether they would catch a real bug. Use when asked to review tests, check coverage gaps, judge whether a suite is trustworthy, investigate flaky tests, or work out why a bug shipped past green tests. Spins up parallel agents (coverage-gaps, happy-path-only, user-flows, mock-debt, assertion-quality, fragile-tests, data-realism, error-paths, boundary-values, flaky-risks), then distills findings into prioritized action points. Reads the tests; never runs them."
+argument-hint: "[area]"
+disable-model-invocation: true
 ---
 
 # Test My Tests
@@ -24,6 +21,7 @@ Launch parallel test-quality agents, each analyzing the test suite through a dif
 - **Agents inherit the default model** — do not override with a specific model.
 - **Agents analyze tests without modifying files.** No running tests, no modifying code.
 - **Run distillation after all agents complete.** Distillation needs the full picture to deduplicate and prioritize.
+
 ## Workflow
 
 ### Step 1: Choose Mode
@@ -91,6 +89,7 @@ Drop reviewers whose target patterns aren't in the codebase. Note each drop in t
 ### Step 1.75: Check for Existing Issue Tracker
 
 Check if the project uses **dcat**. Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to each agent so they can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
+
 ### Step 2: Determine Target
 
 Ask the user (if not already clear):
@@ -116,7 +115,7 @@ Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 
 - If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 2.5.
 - Otherwise, proceed to Step 2.5. After building the snapshot there, write it to `.claude-cache/test-my-tests-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
 
-The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. Both caches are per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
+The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. The cache is per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 

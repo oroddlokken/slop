@@ -1,58 +1,103 @@
-# Claude Code Configuration
+# Claude Code tooling
 
-Custom Claude Code configuration managed via this repo and symlinked into `~/.claude/`.
+Status line, usage dashboard, cost reporting and hooks for Claude Code. Public
+copy of what I run on my own machines. The private setup repo it comes from
+links all of this into `~/.claude/` from a symlink manifest; the setup below is
+the manual version of that, and works from a clone in any directory.
 
-## Setup on a new machine
+## What's here
 
-If `~/.claude/` doesn't exist yet, run `claude` once first to initialize it.
+| Path | What it is |
+|---|---|
+| `statusline-command.py` | The status line. Every segment is toggled by a `CLAUDE_STATUSLINE_*` env var; the script's module docstring is the full list, with defaults. Layout switches between 2 and 4 lines at 150 columns. |
+| `statusline-command_x.sh` | The wrapper `settings.json` points at. It execs the script from its own directory, so the clone can live anywhere. |
+| `ccu.zsh` + `get_claude_usage.py` | `ccu` — terminal dashboard for the numbers `/usage` shows, with reset countdowns. Reads the OAuth token from the macOS Keychain or `~/.claude/.credentials.json`, cached 10 minutes. |
+| `ccreport.py` | `ccreport` — token and cost report over the local JSONL logs, by day, month, project or session. Costs in USD and NOK (Norges Bank spot rate, 25 % MVA added unless `--no-mva`). |
+| `pricing.py`, `exchange.py`, `cache_db.py` | Model price table, USD/NOK rates, and the shared SQLite cache all of the above read. |
+| `hooks/` | `block-git-stash-worktree.sh`, a `PreToolUse` hook that blocks stash and worktree commands. Fixtures in `block-git-stash-tests/`. |
+| `stop-phrase-guard/` | A `Stop` hook that catches ownership-dodging and session-quitting phrases. Non-blocking — the assistant still stops, but the matched rule surfaces as a `systemMessage`. Fixtures alongside it. |
 
-### Skills
+Requirements: Python 3.12+, `zsh` for `ccu`, `jq` for `stop-phrase-guard`. The
+status line resolves its own dependencies through `uv` via a PEP 723 shebang.
+
+## Status line
+
+![Status line](claude.png)
+
+In `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash /path/to/slop/claude/statusline-command_x.sh"
+  }
+}
+```
+
+Every segment default lives in the script, so the wrapper carries no exports —
+it stays as the seam where a per-machine `CLAUDE_STATUSLINE_*` override goes.
+
+## ccu
+
+![ccu](ccu.png)
+
+`ccu.zsh` finds `get_claude_usage.py` through `$SETUP_DIR`, which defaults to
+`~/git/macsetup` — point it at the clone instead:
 
 ```bash
-ln -s "$SETUP_DIR/claude/skills" ~/.claude/skills
+alias ccu='SETUP_DIR=/path/to/slop /path/to/slop/claude/ccu.zsh'
 ```
 
-### Status line
+## ccreport
 
-Nothing to link. Both profiles' `settings.json` run
-`bash $SETUP_DIR/claude/statusline-command_x.sh`, which exec's
-`statusline-command.py` from its own directory in the repo. Every segment default
-lives in the script, so the wrapper carries no exports — it stays as the seam
-where a per-machine `CLAUDE_STATUSLINE_*` override would go.
-The toggles and their defaults are listed in the script's module docstring.
-
-### Hooks
-
-The whole directory, so a new hook needs no second step on every machine:
+![ccreport](ccreport.png)
 
 ```bash
-ln -s "$SETUP_DIR/claude/hooks" ~/.claude/hooks
+alias ccreport=/path/to/slop/claude/ccreport.py
 ```
 
-### Profile (settings)
+## Hooks
 
-Each profile directory (`mbp2022/`, `sbnorge/`) holds `settings.json`,
-`settings.local.json` and `CLAUDE.md`. Profiles are named per config flavour,
-not per machine, so `config.ini` carries a separate `claude_profile` key when
-it differs from the machine profile.
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Agent|Task|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/slop/claude/hooks/block-git-stash-worktree.sh",
+            "statusMessage": "Checking for blocked git commands..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/slop/claude/stop-phrase-guard/stop-phrase-guard.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Both fixture suites take a `HOOK_PATH` override and exit with the failure count:
 
 ```bash
-for f in settings.json settings.local.json CLAUDE.md; do
-  ln -sf "$SETUP_DIR/claude/<profile>/$f" ~/.claude/$f
-done
+claude/block-git-stash-tests/run-tests.sh
+claude/stop-phrase-guard/run-tests.sh
 ```
 
-## Adding a new skill
-
-Create a subdirectory under `skills/` with a `SKILL.md` file:
-
-```
-claude/skills/
-  my-skill/
-    SKILL.md
-```
-
-The skill will be available immediately via the symlink.
+`stop-phrase-guard` matches against phrasing my own `CLAUDE.md` rules forbid, so
+its pattern list is worth reading before you wire it up — the rules it enforces
+are not yours.
 
 ## Project grouping (ccreport)
 

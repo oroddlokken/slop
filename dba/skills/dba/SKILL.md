@@ -1,11 +1,8 @@
 ---
 name: dba
-description: "Database & SQL deep-dive. Spins up parallel agents — each reviewing through a different lens (injection, n-plus-one, schema-drift, index-coverage, transaction-gaps, query-scatter, connection-mgmt, migration-safety, orm-antipatterns, raw-perf, data-integrity, privilege-scope) — then distills all findings into prioritized action points."
-args:
-  - name: area
-    description: The directory or area to review (optional)
-    required: false
-user-invocable: true
+description: "Deep database and SQL audit for relational codebases. Use when asked to review queries, schema, migrations, or indexes; when pages are slow and the database is the suspect; before shipping a migration; or when checking for SQL injection and missing constraints. Twelve specialized lenses instead of codehealth's single query-smells reviewer. Spins up parallel agents (injection, n-plus-one, schema-drift, index-coverage, transaction-gaps, query-scatter, connection-mgmt, migration-safety, orm-antipatterns, raw-perf, data-integrity, privilege-scope), then distills findings into prioritized action points. Relational only — NoSQL is out of scope."
+argument-hint: "[area]"
+disable-model-invocation: true
 ---
 
 # SQL Health
@@ -27,6 +24,7 @@ Launch parallel database-focused agents, each analyzing the codebase through a d
 - **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
 - **Agents inherit the default model** — do not override with a specific model.
 - **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
+
 ## Workflow
 
 ### Step 1: Choose Mode
@@ -124,6 +122,7 @@ Drop reviewers whose target patterns aren't in the codebase. Note each drop in t
 ### Step 1.75: Check for Existing Issue Tracker
 
 Check if the project uses **dcat** (a local CLI issue tracker that stores issues in a `.dogcats/` directory). Try running `dcat list --agent-only` directly. If it succeeds, pass the issue list to each agent so they can skip already-tracked concerns. If it errors (dcat not installed, no `.dogcats/` directory), skip this step.
+
 ### Step 2: Determine Target
 
 Ask the user (if not already clear):
@@ -156,7 +155,7 @@ Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 
 - If the file exists and was modified within the last hour, read it and use its contents as `{codebase_snapshot}`. Skip Step 2.5.
 - Otherwise, proceed to Step 2.5. After building the snapshot there, write it to `.claude-cache/dba-snapshot-{hash}.md`. Create `.claude-cache/` if missing, and add `.claude-cache/` to `.gitignore` if not already listed.
 
-The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. Both caches are per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
+The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. The cache is per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 

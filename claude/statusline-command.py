@@ -33,7 +33,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_SESSION                 — model, context window %
     CLAUDE_STATUSLINE_COST                  — session cost
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate % (default 0)
-    CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as (xhigh)
+    CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as (xhigh); folded into MODEL_BANNER when that is on
     CLAUDE_STATUSLINE_THINKING              — nothink marker when thinking is off
   CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on the usable window (nominal minus the ~33k auto-compact reserve)
   CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon) (default 0)
@@ -162,6 +162,8 @@ SUBDUED = "\033[38;5;242m"  # 256-color dark grey — structural info
 RST = "\033[0m"
 
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+# A model badge: bold white on a background, opened and closed in one run.
+_BADGE_RE = re.compile(r"\033\[1;97;[0-9;]+m[^\033]*\033\[0m")
 
 
 def _c(code: str, text: str) -> str:
@@ -169,27 +171,56 @@ def _c(code: str, text: str) -> str:
 
 
 def _force_red(text: str) -> str:
-    """Strip existing ANSI color codes and recolor everything bold bright red."""
-    return f"\033[1;91m{_ANSI_RE.sub('', text)}\033[0m"
+    """Strip existing ANSI color codes and recolor everything bold bright red.
+
+    The model badge keeps its own colors — it is the one token whose background
+    still has to read at a glance once the rest of the line is flat red.
+    """
+    badges: list[str] = []
+
+    def _stash(m: re.Match[str]) -> str:
+        badges.append(m.group(0))
+        return f"\0{len(badges) - 1}\0"
+
+    out = f"\033[1;91m{_ANSI_RE.sub('', _BADGE_RE.sub(_stash, text))}\033[0m"
+    for i, badge in enumerate(badges):
+        out = out.replace(f"\0{i}\0", f"{RST}{badge}\033[1;91m")
+    return out
 
 
-def _model_banner(model: str) -> str:
-    """Render an inverse-color banner showing the active model family."""
+# Levels whose own name doesn't capitalize into a word. Only the badge spells
+# them out; the plain-name fallback keeps the raw (xhigh).
+_EFFORT_BADGE_LABELS = {"xhigh": "Extra"}
+
+
+def _model_banner(model: str, effort: str = "") -> str:
+    """Render an inverse-color banner showing the active model.
+
+    Stands in for the plain model name in the session segment, so it carries the
+    whole name rather than just the family. `effort` folds inside the background
+    instead of trailing it — the banner has to stay one bold-white run for
+    _force_red's _BADGE_RE to stash it whole.
+    """
     if not _on("MODEL_BANNER", default=False) or not model:
         return ""
     m_low = model.lower()
     if "haiku" in m_low:
         # Different red than Opus when HAIKU_RED is on, magenta otherwise.
-        bg, label = ("48;5;196", "HAIKU") if _on("HAIKU_RED") else ("45", "HAIKU")
+        bg = "48;5;196" if _on("HAIKU_RED") else "45"
     elif "sonnet" in m_low:
-        bg, label = "44", "SONNET"  # blue
+        bg = "44"  # blue
     elif "opus" in m_low:
-        bg, label = "48;5;93", "OPUS"    # deep purple
+        bg = "48;5;93"    # deep purple
     elif "fable" in m_low:
-        bg, label = "48;5;28", "FABLE"   # green — clear of the reds, blue, purple
+        bg = "48;5;28"   # green — clear of the reds, blue, purple
     else:
         bg = "100"  # bright black / grey fallback
-        label = re.sub(r"\s*\(.*\)\s*$", "", model).strip().upper()
+    # Drops the "(1M context)" suffix Opus carries in display_name.
+    label = re.sub(r"\s*\(.*\)\s*$", "", model).strip().upper()
+    # Capitalized, no parens: inside the badge the effort needs no bracketing to
+    # separate it from the shouted model name, only a different case.
+    if effort:
+        label = f"{label} {_EFFORT_BADGE_LABELS.get(effort, effort.capitalize())}"
     return f"\033[1;97;{bg}m {label} \033[0m"
 
 
@@ -782,7 +813,7 @@ def _render_sandbox(cwd: str, toplevel: str) -> str:
     """Show sbx/!sbx from merged Claude settings.
 
     Walks local → project → user settings; first file with sandbox.enabled wins.
-    Empty when unset everywhere (same state clax shows as "(unset)").
+    Empty when unset everywhere.
     """
     if not _on("SANDBOX"):
         return ""
@@ -934,6 +965,13 @@ def _usage_countdown(reset_iso: str, now_epoch: float) -> str:
     return f"{d // 60}m"
 
 
+def _usage_reset_clock(reset_iso: str, now_epoch: float) -> str:
+    """Local wall-clock time the window resets at, e.g. "16:30"."""
+    epoch = _parse_iso_epoch(reset_iso)
+    if epoch is None or epoch <= now_epoch:
+        return ""
+    return datetime.fromtimestamp(epoch).strftime("%H:%M")  # noqa: DTZ006
+
 
 def _pace_days() -> int:
     """Return the pace window in days from CLAUDE_CODE_PACE_DAYS env var (default 7)."""
@@ -991,9 +1029,12 @@ def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
 
 def _usage_combined(
     label: str, pct_s: str, reset_iso: str, cost_s: str, now: float,
-    *, pace: str = "",
+    *, pace: str = "", clock: bool = False,
 ) -> str:
-    """Render compact usage: W:26% $293 1d6h/7d 5d17h"""
+    """Render compact usage: W:26% $293 1d6h/7d 5d17h
+
+    clock appends the wall-clock reset time to the countdown: "1h20m(16:30)".
+    """
     if not pct_s:
         return ""
     try:
@@ -1014,7 +1055,8 @@ def _usage_combined(
     else:
         cd = _usage_countdown(reset_iso, now)
         if cd:
-            parts.append(f"\033[0;90m{cd}\033[0m")
+            at = _usage_reset_clock(reset_iso, now) if clock else ""
+            parts.append(f"\033[0;90m{cd}({at})\033[0m" if at else f"\033[0;90m{cd}\033[0m")
     return " ".join(parts)
 
 
@@ -1152,6 +1194,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
     session_line = _usage_combined(
         "S", s_pct, usage.get("session_reset", ""),
         _ustr(usage, "session_window_cost"), now,
+        clock=True,
     )
     if session_line:
         rl_inners.append(session_line)
@@ -1351,14 +1394,17 @@ def _render_session(
         return ""
     parts: list[str] = []
 
+    effort_seg = _render_effort(effort)
+    banner = _model_banner(model, effort if effort_seg else "")
     if model:
         # Opus carries a "(1M context)" suffix in display_name; strip it so the
         # name reads the same across models.
         base = re.sub(r"\s*\(\d+\w+\s+context\)", "", model)
-        parts.append(f"{SUBDUED}{base}{RST}")
+        parts.append(banner or f"{SUBDUED}{base}{RST}")
 
-    # Reasoning config sits with the model it configures
-    for seg in (_render_effort(effort), _render_thinking(thinking_off)):
+    # Reasoning config sits with the model it configures. The banner already
+    # carries the effort, so only the plain-name fallback repeats it here.
+    for seg in ("" if banner else effort_seg, _render_thinking(thinking_off)):
         if seg:
             parts.append(seg)
 
@@ -1493,7 +1539,6 @@ def _layout_and_print(
     now_epoch: float,
     _t_start: float,
     force_red: bool = False,
-    model: str = "",
 ) -> None:
     """Assemble rendered sections into adaptive layout and print."""
     # Show failure/stale indicator when usage is empty or outdated
@@ -1529,7 +1574,10 @@ def _layout_and_print(
     if term_cols >= LAYOUT_WIDE_COLS:
         line1_parts = [s for s in [top_str, session] if s]
         line2_parts = [s for s in [usage_str] if s]
-        lines = [DOT.join(line1_parts)]
+        # A badge opens the session segment with its own background, which
+        # separates it from git on its own — the dot there reads as clutter.
+        sep = " " if _BADGE_RE.match(session) else DOT
+        lines = [sep.join(line1_parts)]
         if line2_parts:
             lines.append(" ".join(line2_parts))
     else:
@@ -1547,9 +1595,6 @@ def _layout_and_print(
         lines.append(DOT.join(last_parts))
     if force_red:
         lines = [_force_red(line) for line in lines]
-    banner = _model_banner(model)
-    if banner and lines:
-        lines[0] = f"{banner} {lines[0]}"
     print("\n".join(lines))
 
 
@@ -1681,7 +1726,6 @@ def main() -> None:
         usage_data, macmon_str, battery_str, sessions, now_epoch, _t_start,
         force_red=_on("RED", default=False)
         or (_on("HAIKU_RED") and "haiku" in inp.model.lower()),
-        model=inp.model,
     )
 
 

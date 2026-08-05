@@ -1,0 +1,287 @@
+#!/usr/bin/env -S uv run --script
+#
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["rich", "textual>=7,<8"]
+# ///
+"""Browse the Claude Code memories belonging to the current git repo.
+
+Usage: claudemem [--json]
+
+Opens a two-pane TUI: the repo's memories on the left, the selected file on
+the right. Arrows navigate, e opens the file in $EDITOR, D deletes it, u undoes
+the last delete, r reloads, q quits.
+
+--json prints the same memories on stdout instead of starting the TUI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from rich.syntax import Syntax
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, VerticalScroll
+from textual.widgets import Footer, Header, Label, ListItem, ListView, Static
+
+# The order the memory types are grouped in; anything else sorts after these.
+TYPE_ORDER = ("user", "feedback", "project", "reference")
+
+# MEMORY.md is the index Claude Code loads each session, not a memory itself.
+INDEX_NAME = "MEMORY.md"
+
+
+@dataclass
+class Memory:
+    path: Path
+    name: str
+    type: str
+    description: str
+
+    def read(self) -> str:
+        return self.path.read_text()
+
+
+def parse_frontmatter(text: str) -> tuple[str, str]:
+    """Pull `description` and `metadata.type` out of a memory's frontmatter."""
+    type_ = ""
+    description = ""
+    fences = 0
+    for line in text.splitlines():
+        if line.strip() == "---":
+            fences += 1
+            if fences == 2:
+                break
+            continue
+        if line.startswith("description:"):
+            description = line.removeprefix("description:").strip()
+            if description.startswith('"') and description.endswith('"'):
+                description = description[1:-1].replace('\\"', '"')
+        elif line.strip().startswith("type:"):
+            type_ = line.split("type:", 1)[1].strip()
+    return type_ or "unknown", description
+
+
+def repo_root() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return Path.cwd()
+    return Path(result.stdout.strip())
+
+
+def memory_dir(root: Path) -> Path:
+    # Claude Code keys each project's storage on the launch directory with every
+    # non-alphanumeric character replaced by a dash.
+    slug = re.sub(r"[^a-zA-Z0-9]", "-", str(root))
+    return Path.home() / ".claude" / "projects" / slug / "memory"
+
+
+def load_memories(mem_dir: Path) -> list[Memory]:
+    memories = []
+    for path in mem_dir.glob("*.md"):
+        if path.name == INDEX_NAME:
+            continue
+        type_, description = parse_frontmatter(path.read_text())
+        memories.append(Memory(path, path.stem, type_, description))
+
+    def sort_key(m: Memory) -> tuple[int, str, str]:
+        rank = TYPE_ORDER.index(m.type) if m.type in TYPE_ORDER else len(TYPE_ORDER)
+        return (rank, m.type, m.name)
+
+    return sorted(memories, key=sort_key)
+
+
+def drop_index_line(mem_dir: Path, name: str) -> tuple[int, str] | None:
+    """Remove `name`'s pointer from MEMORY.md so the index keeps no dead links."""
+    index = mem_dir / INDEX_NAME
+    if not index.exists():
+        return None
+    lines = index.read_text().splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if f"({name}.md)" in line:
+            lines.pop(i)
+            index.write_text("".join(lines))
+            return (i, line)
+    return None
+
+
+def restore_index_line(mem_dir: Path, position: int, line: str) -> None:
+    index = mem_dir / INDEX_NAME
+    lines = index.read_text().splitlines(keepends=True) if index.exists() else []
+    lines.insert(min(position, len(lines)), line)
+    index.write_text("".join(lines))
+
+
+class MemoryItem(ListItem):
+    def __init__(self, memory: Memory, name_col: int) -> None:
+        label = Text.assemble(memory.name.ljust(name_col), "  ", (memory.type, "dim italic"))
+        super().__init__(Label(label))
+        self.memory = memory
+
+
+class ClaudeMem(App[None]):
+    CSS = """
+    #memories {
+        width: auto;
+        max-width: 50%;
+        border-right: solid $panel;
+    }
+    #preview {
+        padding: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("e", "edit", "Edit"),
+        Binding("D", "delete", "Delete"),
+        Binding("u", "undo", "Undo"),
+        Binding("r", "reload", "Reload"),
+        Binding("q", "quit", "Quit"),
+    ]
+
+    def __init__(self, root: Path, mem_dir: Path) -> None:
+        super().__init__()
+        self.root = root
+        self.mem_dir = mem_dir
+        self.memories: list[Memory] = []
+        # (memory, file text, index position, index line) per delete, newest last.
+        self.deleted: list[tuple[Memory, str, int | None, str | None]] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            yield ListView(id="memories")
+            with VerticalScroll():
+                yield Static(id="preview")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        self.title = self.root.name
+        await self.action_reload()
+        self.query_one(ListView).focus()
+
+    @property
+    def current(self) -> Memory | None:
+        item = self.query_one(ListView).highlighted_child
+        return item.memory if isinstance(item, MemoryItem) else None
+
+    async def action_reload(self, keep_index: int | None = None) -> None:
+        listview = self.query_one(ListView)
+        if keep_index is None:
+            keep_index = listview.index or 0
+        self.memories = load_memories(self.mem_dir)
+        self.sub_title = f"{len(self.memories)} memories"
+
+        name_col = max((len(m.name) for m in self.memories), default=0)
+        await listview.clear()
+        await listview.extend(MemoryItem(m, name_col) for m in self.memories)
+        if self.memories:
+            listview.index = max(0, min(keep_index, len(self.memories) - 1))
+        else:
+            self.show_preview(None)
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        self.show_preview(event.item.memory if isinstance(event.item, MemoryItem) else None)
+
+    def show_preview(self, memory: Memory | None) -> None:
+        preview = self.query_one("#preview", Static)
+        if memory is None:
+            preview.update(Text("No memories for this repo.", style="dim"))
+            return
+        preview.update(
+            Syntax(
+                memory.read(),
+                "markdown",
+                word_wrap=True,
+                background_color="default",
+            )
+        )
+
+    async def action_edit(self) -> None:
+        memory = self.current
+        if memory is None:
+            return
+        editor = shlex.split(os.environ.get("EDITOR", "vi"))
+        with self.suspend():
+            subprocess.call([*editor, str(memory.path)])
+        await self.action_reload()
+
+    async def action_delete(self) -> None:
+        memory = self.current
+        if memory is None:
+            return
+        text = memory.read()
+        dropped = drop_index_line(self.mem_dir, memory.name)
+        memory.path.unlink()
+        position, line = dropped if dropped else (None, None)
+        self.deleted.append((memory, text, position, line))
+        await self.action_reload()
+        self.notify(f"Deleted {memory.name} — u to undo")
+
+    async def action_undo(self) -> None:
+        if not self.deleted:
+            self.notify("Nothing to undo", severity="warning")
+            return
+        memory, text, position, line = self.deleted.pop()
+        memory.path.write_text(text)
+        if line is not None:
+            restore_index_line(self.mem_dir, position, line)
+        await self.action_reload()
+        self.notify(f"Restored {memory.name}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print the memories as JSON instead of starting the TUI",
+    )
+    args = parser.parse_args()
+
+    root = repo_root()
+    mem_dir = memory_dir(root)
+    memories = load_memories(mem_dir) if mem_dir.is_dir() else []
+
+    if args.json:
+        json.dump(
+            [
+                {
+                    "name": m.name,
+                    "type": m.type,
+                    "description": m.description,
+                    "path": str(m.path),
+                    "body": m.read(),
+                }
+                for m in memories
+            ],
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    if not memories:
+        print(f"No memories for {root.name} ({mem_dir})")
+        return 0
+
+    ClaudeMem(root, mem_dir).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

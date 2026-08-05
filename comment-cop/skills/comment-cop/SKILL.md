@@ -1,11 +1,8 @@
 ---
 name: comment-cop
-description: "Comment & documentation quality review. Spins up parallel agents — each reviewing through a different lens (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, noise, llm-slop) — then distills all findings into prioritized action points. Reviews what the comments SAY, not what the code does."
-args:
-  - name: area
-    description: The directory or area to review (optional)
-    required: false
-user-invocable: true
+description: "Reviews what the comments and docs SAY, not what the code does. Use when asked to clean up comments, docstrings, or README prose; when a codebase feels buried under stale or self-indulgent explanation; when checking whether docstrings still match their signatures; or when hunting machine-written filler. Protects why-comments that carry a real gotcha and flags the rest. Spins up parallel agents (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, noise, llm-slop), then distills findings into prioritized action points. For user-facing strings use string-cop; for the logic itself use codehealth."
+argument-hint: "[area]"
+disable-model-invocation: true
 ---
 
 # Comment Cop
@@ -143,11 +140,11 @@ Concatenate as `{skill}|{path}|{git_rev}|{dirty}|{langs}` and take the first 12 
 
 **Note:** Comment Cop needs comments preserved verbatim. Do not reuse a snapshot produced by a skill that strips comments — the cache key includes `{skill}`, so a comment-cop snapshot is distinct from a codehealth one and they will not collide.
 
-The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. Both caches are per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
+The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a file that is already dirty leaves `git status --porcelain` unchanged, so the key alone can go stale. The cache is per-skill by design — every meta-skill scans for different things, so nothing here is reused by another skill.
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 
-Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 9 agents each independently scanning the same files.
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 10 agents each independently scanning the same files.
 
 1. Replace `{languages}` and `{focus}` in `scan-steps.md`
 2. Follow the scan procedure — read source files (comments intact), README, and markdown docs
