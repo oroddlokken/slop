@@ -15,15 +15,13 @@ import argparse
 import calendar
 import hashlib
 import json
-import os
 import re
 import subprocess
 import sys
-import tomllib
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,72 +37,28 @@ from cache_db import (
     add_project_override,
     bulk_load_ccreport_cache,
     check_ccreport_valid,
+    count_ccreport_records_without_signals,
     delete_project_override,
-    get_ccreport_orphaned_records,
     get_project_overrides,
     init_ccreport_meta,
     invalidate_ccreport,
-    save_ccreport_file,
+    save_ccreport_files,
 )
+import project_identity
 from exchange import get_rate, load_rates, to_oslo_date
-from pricing import calc_cost, extract_assistant_fields
+from pricing import calc_cost, dedup_identity, extract_assistant_fields
+
+# Project naming and the merge/override rules are shared with pricing.py, which
+# scopes the statusline's per-project costs by them; see project_identity.
+_CONFIG_PATH = project_identity.CONFIG_PATH
+_build_override_fn = project_identity.build_override_fn
+_implied_name = project_identity.implied_name
+_repo_from_path = project_identity.repo_from_path
 
 _PROJECT_ROOTS = (
     Path.home() / ".claude" / "projects",
     Path.home() / ".config" / "claude" / "projects",
 )
-
-# Repos live directly beneath repo-root container dirs. A session's project
-# is the segment just under the deepest matching root, so subdirectories and
-# git worktrees collapse into their repo (e.g. ~/git/ren.no/web -> ren.no)
-# and a repo opened from two places stays one. ~/git is always a repo root;
-# per-machine layouts (~/dev and friends) are added via the config file,
-# which can only ever add roots, never remove the baseline.
-_CONFIG_PATH = Path(
-    os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-) / "macsetup" / "claude" / "ccreport.toml"
-
-_BASELINE_REPO_ROOT = Path.home() / "git"
-
-
-def _load_repo_roots() -> tuple[str, ...]:
-    """Return the ~/git baseline plus repo_roots from the config file.
-
-    Sorted deepest-first, which makes matching longest-prefix regardless of
-    config order. No config file (or no repo_roots key) leaves just the
-    baseline; a malformed file warns instead of taking the reports down
-    with it.
-    """
-    roots = {str(_BASELINE_REPO_ROOT)}
-    try:
-        with open(_CONFIG_PATH, "rb") as f:
-            extra = tomllib.load(f).get("repo_roots", [])
-    except FileNotFoundError:
-        extra = []
-    except (tomllib.TOMLDecodeError, OSError) as e:
-        print(f"warning: ignoring {_CONFIG_PATH}: {e}", file=sys.stderr)
-        extra = []
-    roots.update(str(Path(r).expanduser()) for r in extra if isinstance(r, str))
-    return tuple(sorted(roots, key=len, reverse=True))
-
-
-_REPO_ROOTS = _load_repo_roots()
-
-
-def _repo_from_path(cwd: str) -> str | None:
-    """Return the repo directory name for a cwd under a repo root.
-
-    None leaves the caller free to fall back to the plain basename for paths
-    outside every repo root.
-    """
-    for root in _REPO_ROOTS:
-        prefix = root + "/"
-        if cwd.startswith(prefix):
-            repo = cwd[len(prefix):].split("/", 1)[0]
-            if repo:
-                return repo
-    return None
-
 
 # Git remote is the durable project identity: it survives a folder being moved
 # or deleted, where a path does not. Resolved lazily at parse time (only while
@@ -154,31 +108,43 @@ def _resolve_remote(cwd: str) -> str | None:
 # --- File-level cache ---
 CACHE_VERSION = 2
 
+# Freshly parsed files buffered before one write transaction. Small enough
+# that a full re-parse never holds the write lock across a long stretch of
+# parsing — a statusline waiting on that lock gives up after 10 s.
+_SAVE_BATCH = 250
+
 
 def _script_hash() -> str:
-    """SHA256 of this script plus the repo-roots config, used to invalidate cache.
+    """SHA256 of the project-naming inputs, used to invalidate the cache.
 
-    The config participates because repo_roots shapes the project names frozen
-    into cached records at parse time — editing it must trigger a re-parse
-    just like a code change does.
+    This script, project_identity.py, and the repo-roots config all shape the
+    project names frozen into cached records at parse time, so editing any of
+    them must trigger a re-parse. pricing.py deliberately does not participate:
+    a price change rewrites costs through the cost columns, not through names,
+    and hashing it would re-parse the whole corpus every time a model is added.
     """
     h = hashlib.sha256()
     try:
         h.update(Path(__file__).read_bytes())
+        h.update(Path(project_identity.__file__).read_bytes())
     except OSError:
         return ""
     try:
         h.update(_CONFIG_PATH.read_bytes())
     except OSError:
-        pass  # no config is a valid state; hash covers just the script
+        pass  # no config is a valid state; hash covers just the code
     return h.hexdigest()
 
 
-def _ensure_cache_valid() -> None:
-    """Ensure ccreport cache is valid; invalidate and reinitialize if stale."""
+def _ensure_cache_valid(live_paths: set[str]) -> None:
+    """Ensure ccreport cache is valid; invalidate and reinitialize if stale.
+
+    *live_paths* bounds the invalidation to files still on disk — records from
+    purged files can't be re-parsed, so their costs must survive.
+    """
     sh = _script_hash()
     if not check_ccreport_valid(CACHE_VERSION, sh):
-        invalidate_ccreport()
+        invalidate_ccreport(live_paths)
         init_ccreport_meta(CACHE_VERSION, sh)
 
 
@@ -254,6 +220,24 @@ class UsageRecord:
     dedup_key: str | None = None  # message_id:request_id for deduplication
     cwd: str | None = None  # original cwd from JSONL; lets future migrations re-derive project
     repo: str | None = None  # normalized git remote captured at parse time (durable identity)
+    _cost: float | None = field(default=None, repr=False, compare=False)
+    """Memo for cost(). Deliberately not cost_usd: that field means 'the log gave
+    us this' and is what _serialize_records writes to the SQLite cache, so a
+    computed value landing there would persist as if it had been logged."""
+
+    def cost(self) -> float:
+        """USD cost: the log's own costUSD when present, else computed from tokens.
+
+        Memoized — a default report aggregates the same records six times over,
+        and the pricing lookup is the most expensive thing in the run.
+        """
+        if self._cost is None:
+            self._cost = self.cost_usd if self.cost_usd is not None else calc_cost(
+                self.tokens.input, self.tokens.output,
+                self.tokens.cache_create, self.tokens.cache_read,
+                self.model, self.timestamp,
+            )
+        return self._cost
 
 
 @dataclass
@@ -262,7 +246,8 @@ class AggBucket:
     cost: float = 0.0
     cost_nok: float = 0.0
     nok_estimated: bool = False
-    models: set[str] = field(default_factory=set)
+    models: dict[str, float] = field(default_factory=dict)
+    """Model name → its USD cost within this bucket; the Models column shows both."""
     count: int = 0
 
     def __iadd__(self, other: "AggBucket") -> "AggBucket":
@@ -271,20 +256,15 @@ class AggBucket:
         self.cost += other.cost
         self.cost_nok += other.cost_nok
         self.nok_estimated = self.nok_estimated or other.nok_estimated
-        self.models |= other.models
+        for model, cost in other.models.items():
+            self.models[model] = self.models.get(model, 0.0) + cost
         self.count += other.count
         return self
 
 
 def record_cost(rec: UsageRecord) -> float:
     """Return cost for a record: use pre-calculated costUSD if available, else compute."""
-    if rec.cost_usd is not None:
-        return rec.cost_usd
-    return calc_cost(
-        rec.tokens.input, rec.tokens.output,
-        rec.tokens.cache_create, rec.tokens.cache_read,
-        rec.model, rec.timestamp,
-    )
+    return rec.cost()
 
 
 @dataclass(frozen=True)
@@ -298,6 +278,11 @@ class NokCtx:
     rates: dict[str, float] = field(default_factory=dict)
     max_rate_date: str | None = None
     mva: bool = True
+    _rate_memo: dict[date, tuple[float | None, bool]] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
+    """Oslo date → get_rate result. Half a million records span a few hundred
+    days, and get_rate walks back over weekends and holidays on every miss."""
 
     @property
     def enabled(self) -> bool:
@@ -307,6 +292,15 @@ class NokCtx:
     def label(self) -> str:
         return "NOK+MVA" if self.mva else "NOK"
 
+    def rate_for(self, oslo_date: date) -> tuple[float | None, bool]:
+        """(rate, estimated) for an Oslo date, memoized across the whole run."""
+        hit = self._rate_memo.get(oslo_date)
+        if hit is None:
+            hit = self._rate_memo[oslo_date] = get_rate(
+                self.rates, oslo_date, _max_date=self.max_rate_date,
+            )
+        return hit
+
 
 def record_cost_nok(rec: UsageRecord, cost_usd: float, nok: NokCtx) -> tuple[float | None, bool]:
     """Convert a record's USD cost to NOK using its day's exchange rate.
@@ -315,8 +309,7 @@ def record_cost_nok(rec: UsageRecord, cost_usd: float, nok: NokCtx) -> tuple[flo
     Returns (nok_amount, estimated) where estimated is True only at the
     trailing edge of rate data (the true rate is not yet known).
     """
-    d = to_oslo_date(rec.timestamp)
-    rate, estimated = get_rate(nok.rates, d, _max_date=nok.max_rate_date)
+    rate, estimated = nok.rate_for(to_oslo_date(rec.timestamp))
     if rate is None:
         return None, False
     multiplier = 1.25 if nok.mva else 1.0
@@ -351,7 +344,7 @@ def _bucket_by(
         if nok.enabled:
             _accum_nok(b, rec, cost, nok)
         if rec.model != "<synthetic>":
-            b.models.add(rec.model)
+            b.models[rec.model] = b.models.get(rec.model, 0.0) + cost
         b.count += 1
     return buckets
 
@@ -362,10 +355,9 @@ def load_rates_for_records(records: list[UsageRecord], *, mva: bool = True) -> t
     Returns (nok_context, has_full_coverage). The context is empty — and so
     reports as disabled — when no rates could be loaded.
     """
-    from datetime import date as date_type
     if not records:
         return NokCtx(mva=mva), False
-    dates: set[date_type] = {to_oslo_date(r.timestamp) for r in records}
+    dates: set[date] = {to_oslo_date(r.timestamp) for r in records}
     rates = load_rates(dates)
     if not rates:
         return NokCtx(mva=mva), False
@@ -437,57 +429,63 @@ def _derive_project(path: Path) -> str:
 
 
 def parse_jsonl_file(path: Path) -> list[UsageRecord]:
-    """Parse a single JSONL file and extract usage records."""
+    """Parse a single JSONL file and extract usage records.
+
+    A read error propagates rather than yielding the lines read so far: the
+    caller writes whatever comes back over the file's complete cache entry,
+    so a truncated return is silent, permanent data loss (macsetup-2zvx).
+    """
     records = []
     cwd_from_records: str | None = None
 
-    try:
-        with open(path, "rb") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+    with open(path, "rb") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = orjson.loads(line)
+            except orjson.JSONDecodeError:
+                continue
+
+            if cwd_from_records is None:
+                c = rec.get("cwd")
+                if isinstance(c, str) and c:
+                    cwd_from_records = c
+
+            fields = extract_assistant_fields(rec)
+            if fields is None:
+                continue
+            msg, usage, message_id, request_id, dedup_key, ts = fields
+
+            # `or` rather than a get() default: a key present with JSON null
+            # returns None, which lands in a NOT NULL column and takes down the
+            # whole file's insert on every run until the JSONL changes
+            # (macsetup-1gsc).
+            tokens = TokenCounts(
+                input=usage.get("input_tokens") or 0,
+                output=usage.get("output_tokens") or 0,
+                cache_create=usage.get("cache_creation_input_tokens") or 0,
+                cache_read=usage.get("cache_read_input_tokens") or 0,
+            )
+
+            cost_usd = rec.get("costUSD")
+            if cost_usd is not None:
                 try:
-                    rec = orjson.loads(line)
-                except orjson.JSONDecodeError:
-                    continue
+                    cost_usd = float(cost_usd)
+                except (ValueError, TypeError):
+                    cost_usd = None
 
-                if cwd_from_records is None:
-                    c = rec.get("cwd")
-                    if isinstance(c, str) and c:
-                        cwd_from_records = c
-
-                fields = extract_assistant_fields(rec)
-                if fields is None:
-                    continue
-                msg, usage, message_id, request_id, dedup_key, ts = fields
-
-                tokens = TokenCounts(
-                    input=usage.get("input_tokens", 0),
-                    output=usage.get("output_tokens", 0),
-                    cache_create=usage.get("cache_creation_input_tokens", 0),
-                    cache_read=usage.get("cache_read_input_tokens", 0),
-                )
-
-                cost_usd = rec.get("costUSD")
-                if cost_usd is not None:
-                    try:
-                        cost_usd = float(cost_usd)
-                    except (ValueError, TypeError):
-                        cost_usd = None
-
-                records.append(UsageRecord(
-                    message_id=message_id,
-                    model=msg.get("model", "unknown"),
-                    tokens=tokens,
-                    timestamp=ts,
-                    session_id=rec.get("sessionId", path.stem),
-                    project="",
-                    cost_usd=cost_usd,
-                    dedup_key=dedup_key,
-                ))
-    except (OSError, UnicodeDecodeError):
-        pass
+            records.append(UsageRecord(
+                message_id=message_id,
+                model=msg.get("model") or "unknown",
+                tokens=tokens,
+                timestamp=ts,
+                session_id=rec.get("sessionId") or path.stem,
+                project="",
+                cost_usd=cost_usd,
+                dedup_key=dedup_key,
+            ))
 
     repo = _resolve_remote(cwd_from_records) if cwd_from_records else None
     if repo:
@@ -507,32 +505,6 @@ def parse_jsonl_file(path: Path) -> list[UsageRecord]:
     return records
 
 
-def _build_override_fn():
-    """Compile the override table into a (repo, cwd, name) -> name function.
-
-    Rules apply in insertion order; first match wins. Returns None when there
-    are no rules so the hot loop pays nothing.
-    """
-    rules = get_project_overrides()
-    if not rules:
-        return None
-
-    def resolve(repo: str | None, cwd: str | None, name: str) -> str:
-        for r in rules:
-            kind, value = r["match_kind"], r["match_value"]
-            if kind == "name" and name == value:
-                return r["target"]
-            if kind == "remote" and repo == value:
-                return r["target"]
-            if kind == "cwd_prefix" and cwd and (
-                cwd == value or cwd.startswith(value.rstrip("/") + "/")
-            ):
-                return r["target"]
-        return name
-
-    return resolve
-
-
 def _keep(
     rec: UsageRecord,
     *,
@@ -548,6 +520,9 @@ def _keep(
     before the filter sees it, and a first-seen dedup key is added to
     *seen_keys*. Live and purged-file records go through this one copy, so a
     filter added here cannot silently miss the older half of the corpus.
+
+    The dedup key is pricing.dedup_identity, shared with the cost readers so
+    the two cannot drift on which records are the same message.
     """
     if override:
         rec.project = override(rec.repo, rec.cwd, rec.project)
@@ -557,10 +532,16 @@ def _keep(
         return False
     if project_filter and project_filter.lower() not in rec.project.lower():
         return False
-    if rec.dedup_key is not None:
-        if rec.dedup_key in seen_keys:
+    key = dedup_identity(
+        rec.dedup_key, rec.message_id, rec.session_id,
+        rec.timestamp.timestamp(), rec.model,
+        (rec.tokens.input, rec.tokens.output,
+         rec.tokens.cache_create, rec.tokens.cache_read),
+    )
+    if key is not None:
+        if key in seen_keys:
             return False
-        seen_keys.add(rec.dedup_key)
+        seen_keys.add(key)
     return True
 
 
@@ -576,7 +557,7 @@ def load_all_records(
     request_id (matching ccusage).  First occurrence wins.
     """
     files = discover_jsonl_files()
-    _ensure_cache_valid()
+    _ensure_cache_valid({str(p) for p in files})
     seen_keys: set[str] = set()
     filters = {
         "since": since, "until": until, "project_filter": project_filter,
@@ -587,6 +568,8 @@ def load_all_records(
 
     # Bulk-load cache (2 queries instead of N+1)
     file_meta, records_by_file = bulk_load_ccreport_cache()
+
+    pending: list[tuple[str, int, int, list[dict]]] = []
 
     for path in files:
         key = str(path)
@@ -602,14 +585,28 @@ def load_all_records(
         else:
             try:
                 records = parse_jsonl_file(path)
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # Skipping the save leaves the file's previous cache entry
+                # whole; this run under-reports it, the next readable parse
+                # restores it. Saving a partial parse would not.
                 continue
-            save_ccreport_file(key, st.st_mtime_ns, st.st_size, _serialize_records(records))
+            pending.append(
+                (key, st.st_mtime_ns, st.st_size, _serialize_records(records))
+            )
+            if len(pending) >= _SAVE_BATCH:
+                save_ccreport_files(pending)
+                pending = []
 
         all_records += [r for r in records if _keep(r, **filters)]
 
-    # Load records from files that were purged from disk but cached in SQLite
-    orphaned = _deserialize_records(get_ccreport_orphaned_records(live_paths))
+    save_ccreport_files(pending)
+
+    # Records from files purged off disk but still cached: bulk_load already
+    # returned them, so no second query — its result covers every cached file,
+    # and anything not on disk this run is by definition an orphan.
+    orphaned = _deserialize_records(
+        [r for fp, recs in records_by_file.items() if fp not in live_paths for r in recs]
+    )
     all_records += [r for r in orphaned if _keep(r, **filters)]
 
     all_records.sort(key=lambda r: r.timestamp)
@@ -705,9 +702,15 @@ def _flex_cell(text: str) -> Text:
     return Text(text, no_wrap=True, overflow="ellipsis")
 
 
-def _models_cell(models: set[str]) -> Text:
-    """Render a bucket's model set as a single-line, truncatable cell."""
-    return _flex_cell(", ".join(sorted(short_model(m) for m in models)))
+def _by_cost_desc(model: str, cost: float) -> tuple[float, str]:
+    """Sort key: priciest model first, name breaking ties so output is stable."""
+    return (-cost, short_model(model))
+
+
+def _models_cell(models: dict[str, float]) -> Text:
+    """Render a bucket's models, each with its cost, as one truncatable cell."""
+    ordered = sorted(models.items(), key=lambda kv: _by_cost_desc(*kv))
+    return _flex_cell(", ".join(f"{short_model(m)} ({fmt_cost(c)})" for m, c in ordered))
 
 
 def _column_width(column) -> int:
@@ -910,8 +913,8 @@ def report_daily(records: list[UsageRecord], breakdown: bool = False, *, nok: No
         table.add_row(*row)
         total_agg += b
 
-        for model in sorted(models_per_day[day]):
-            mb = model_buckets[day, model]
+        day_models = [(m, model_buckets[day, m]) for m in models_per_day[day]]
+        for model, mb in sorted(day_models, key=lambda pair: _by_cost_desc(pair[0], pair[1].cost)):
             brow = [f"  [dim]{short_model(model)}[/dim]", *_token_row(mb, total_cost, narrow=narrow, nok=nok)]
             if not narrow:
                 brow.append("")
@@ -1195,12 +1198,30 @@ def parse_date(s: str) -> datetime:
     return dt.replace(tzinfo=tz)
 
 
+def _warn_unreachable_history(kind: str, value: str, target: str) -> None:
+    """Warn that a remote/cwd_prefix rule reaches purged history by name only."""
+    n = count_ccreport_records_without_signals()
+    if not n:
+        return
+    implied = _implied_name(kind, value)
+    reach = f"only those stored as {implied!r}" if implied else "none of them"
+    print(
+        f"note: {n} cached record(s) from purged logs carry no {kind} to match "
+        f"on, so this rule reaches {reach}.\n"
+        f"      Any older usage still grouped elsewhere: "
+        f"ccreport merge <that-name> {target}",
+        file=sys.stderr,
+    )
+
+
 def cmd_overrides(args) -> None:
     """Manage the local project-grouping override rules."""
     if args.command == "merge":
         add_project_override(args.kind, args.source, args.target)
         label = args.source if args.kind == "name" else f"{args.kind}:{args.source}"
         print(f"Grouping {label} -> {args.target}")
+        if args.kind in ("remote", "cwd_prefix"):
+            _warn_unreachable_history(args.kind, args.source, args.target)
         return
     if args.command == "unmerge":
         n = delete_project_override(args.source, args.kind)
@@ -1238,7 +1259,8 @@ def main() -> None:
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         p.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
         if name == "daily":
-            p.add_argument("--breakdown", "-b", action="store_true", help="Show per-model breakdown")
+            p.add_argument("--breakdown", "-b", "-m", action="store_true",
+                           help="Show per-model breakdown")
         if name == "project":
             p.add_argument("--limit", "-l", type=int, default=20, help="Max projects to show (0=all)")
         if name == "session":
@@ -1262,6 +1284,8 @@ def main() -> None:
     parser.add_argument("--project", "-p", help="Filter by project name")
     parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
+    parser.add_argument("--models", "-m", action="store_true",
+                        help="Show per-model breakdown rows in the daily table")
 
     args = parser.parse_args()
 
@@ -1293,7 +1317,8 @@ def main() -> None:
     command = args.command
 
     if command == "daily":
-        report_daily(records, breakdown=args.breakdown, nok=nok)
+        # args.models covers `ccreport -m daily`, where -m lands on the top-level parser.
+        report_daily(records, breakdown=args.breakdown or args.models, nok=nok)
     elif command == "monthly":
         report_monthly(records, nok=nok)
     elif command == "project":
@@ -1304,7 +1329,7 @@ def main() -> None:
         report_session(records, limit=lim, nok=nok)
     else:
         # No subcommand: show daily + monthly summary
-        report_daily(records, nok=nok)
+        report_daily(records, breakdown=args.models, nok=nok)
         report_monthly(records, nok=nok)
         report_project(records, nok=nok)
         report_session(records, nok=nok)

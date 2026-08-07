@@ -12,12 +12,20 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NamedTuple, TypedDict
 from zoneinfo import ZoneInfo
+
+from project_identity import (
+    Resolver,
+    build_override_fn,
+    name_for_cwd,
+    record_project,
+)
 
 
 class UsageData(TypedDict, total=False):
@@ -241,10 +249,15 @@ _FREE_PRICING: Mapping[str, float] = MappingProxyType({
 })
 
 
+@lru_cache(maxsize=None)
 def _parse_effective(date_str: str) -> datetime:
     """Parse an effective date string to a timezone-aware datetime.
 
     Accepts 'YYYY-MM-DD' (midnight UTC) or 'YYYY-MM-DDTHH' (hour-level UTC).
+
+    Cached: the inputs are the handful of literals in PRICING_HISTORY, but
+    find_pricing re-reads them per record — a full report otherwise spends
+    seconds in strptime re-parsing the same dozen strings.
     """
     if "T" in date_str:
         return datetime.strptime(date_str, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
@@ -417,6 +430,59 @@ def extract_assistant_fields(
     return msg, usage, message_id, request_id, dk, ts
 
 
+def dedup_identity(
+    dk: str | None,
+    mid: str,
+    sid: str,
+    ts_epoch: float,
+    model: str,
+    tokens: Sequence[int],
+) -> str | None:
+    """The key two records must share to be one and the same logged message.
+
+    Normally the log's own message id plus request id (*dk*). A log missing
+    either one leaves dk NULL — 96 of 88,801 cached rows on a real machine —
+    and read-time dedup used to wave those through, so a row stored twice
+    counted twice everywhere it was read (macsetup-2wgm). The fallback stands
+    in for dk: same session, same timestamp to the microsecond, same message
+    id, same model, same four token counts.
+
+    Deliberately narrow. Progressive chunks of one streaming message share a
+    message id but differ in their token counts, so the fallback keeps them
+    apart — collapsing those is dk's job and they do carry one. And None,
+    meaning never a duplicate, for a record with neither a message id nor a
+    single token: that leaves only the session and the timestamp to tell two
+    rows apart, which is not enough to delete one on. No stored row is in that
+    state today; the <synthetic> rows that come closest all carry a message id.
+    """
+    if dk:
+        return dk
+    if not mid and not any(tokens):
+        return None
+    # Leading separator: no "message_id:request_id" can collide with this.
+    return "\0".join(("", mid or "", sid or "", f"{ts_epoch:.6f}",
+                      model or "", *(str(t or 0) for t in tokens)))
+
+
+def record_is_duplicate(rec: dict, seen_keys: set[str]) -> bool:
+    """Whether cached record *rec* repeats one already counted.
+
+    Marks it seen when it does not. Every reader of the cached records goes
+    through this one copy, so none of them can quietly keep a dedup rule the
+    others dropped.
+    """
+    key = dedup_identity(
+        rec.get("dk"), rec.get("mid") or "", rec.get("sid") or "",
+        rec.get("ts") or 0.0, rec.get("model") or "", rec.get("t") or (),
+    )
+    if key is None:
+        return False
+    if key in seen_keys:
+        return True
+    seen_keys.add(key)
+    return False
+
+
 def project_key(cwd: str) -> str:
     """Claude Code's projects-dir name for a working directory.
 
@@ -430,9 +496,21 @@ def project_key(cwd: str) -> str:
 
 
 def project_path_prefixes(cwd: str, projects_dirs: list[Path]) -> list[str]:
-    """Path prefixes that mark a cached file as belonging to *cwd*."""
+    """Path prefixes that mark a cached file as belonging to *cwd*.
+
+    Each ends in a separator, which is what keeps a sibling project out: the
+    directory name is the cwd with its slashes swapped, so /tmp/proj-other
+    lands as -tmp-proj-other and has -tmp-proj as a bare string prefix. The
+    same trailing separator makes cache_db.prefix_range's half-open bounds
+    select exactly this directory, so the SQL and the Python agree.
+    """
     key = project_key(cwd)
     return [str(d / key) + "/" for d in projects_dirs]
+
+
+def path_in_project(path: str, prefixes: Sequence[str]) -> bool:
+    """Whether a cached file path sits under any of *prefixes*."""
+    return any(path.startswith(p) for p in prefixes)
 
 
 def _get_projects_dirs() -> list[Path]:
@@ -442,6 +520,86 @@ def _get_projects_dirs() -> list[Path]:
         if d.is_dir():
             dirs.append(d)
     return dirs
+
+
+def _project_dir_prefix(path: str, projects_dirs: list[Path]) -> str | None:
+    """The `<projects dir>/<project>/` prefix *path* sits under, if any."""
+    for d in projects_dirs:
+        root = str(d) + "/"
+        if path.startswith(root):
+            head = path[len(root):].split("/", 1)[0]
+            if head:
+                return root + head + "/"
+    return None
+
+
+class ProjectScope(NamedTuple):
+    """How a cost computation decides whether a record is the cwd's own.
+
+    Two tests rather than one because they answer for different populations: a
+    live file is placed by its path, while an orphaned record whose directory
+    is gone has only the *name* its parse froze into it. *resolve* is carried
+    so the orphan pass applies the same override rules that produced *name*.
+    """
+
+    name: str
+    prefixes: list[str]
+    resolve: Resolver | None = None
+
+
+def project_scope(cwd: str, projects_dirs: list[Path]) -> ProjectScope:
+    """Resolve the project *cwd* belongs to, following any `ccreport merge`.
+
+    With no merge rules this is the cwd's own directory and the name a record
+    logged from it carries — one table read, and nothing else. With rules, the
+    name becomes the merge target and the prefixes grow to cover every other
+    project directory that resolves to that same target: a merge has to mean
+    "these are one project" for the statusline's cost windows as much as for
+    the reports (macsetup-2qrp).
+
+    Both the override table and the per-file identities are read once per call.
+    A cache that cannot be read degrades to the unmerged scope, which is what
+    every render did before merges existed.
+    """
+    own = project_path_prefixes(cwd, projects_dirs)
+    unmerged = ProjectScope(name_for_cwd(cwd), own)
+    try:
+        resolve = build_override_fn()
+        if resolve is None:
+            return unmerged
+        identities = _file_identities()
+    except Exception:  # noqa: BLE001
+        return unmerged
+
+    # The cwd's own cached logs carry the identity parse_jsonl_file derived for
+    # them, including the git remote this module will not shell out for.
+    signals = next(
+        ((repo, rec_cwd or cwd, project or name_for_cwd(cwd))
+         for path, repo, rec_cwd, project in identities
+         if path_in_project(path, own)),
+        (None, cwd, name_for_cwd(cwd)),
+    )
+    name = resolve(*signals)
+
+    prefixes = list(own)
+    seen = set(own)
+    for path, repo, rec_cwd, project in identities:
+        if path_in_project(path, own):
+            continue
+        if resolve(repo, rec_cwd, project) != name:
+            continue
+        merged = _project_dir_prefix(path, projects_dirs)
+        if merged and merged not in seen:
+            seen.add(merged)
+            prefixes.append(merged)
+    return ProjectScope(name, prefixes, resolve)
+
+
+def _file_identities() -> list[tuple[str, str | None, str | None, str]]:
+    """cache_db.load_ccreport_file_identities, imported at call time."""
+    from cache_db import load_ccreport_file_identities
+
+    return load_ccreport_file_identities()
 
 
 def _find_session_files(
@@ -472,8 +630,13 @@ def _iter_jsonl_costs(
 ) -> Iterator[tuple[float, datetime, str | None]]:
     """Yield (cost, timestamp, dedup_key) for each unique assistant record.
 
-    Deduplicates via *seen_keys* (modified in-place).  Records missing either
-    message_id or requestId are never considered duplicates.
+    Deduplicates via *seen_keys* (modified in-place), by dedup_identity — so a
+    record whose log carried no message id or requestId is still matched
+    against its twin, on tokens and timestamp.
+
+    Only the log's own dedup key is yielded: the fallback identity is a
+    read-time device, and the caller persists what it gets as the file's
+    durable dedup keys.
     """
     try:
         with open(path) as f:
@@ -488,21 +651,25 @@ def _iter_jsonl_costs(
                 fields = extract_assistant_fields(rec)
                 if fields is None:
                     continue
-                msg, usage, _mid, _rid, dk, ts = fields
+                msg, usage, mid, _rid, dk, ts = fields
 
-                if dk is not None:
-                    if dk in seen_keys:
-                        continue
-                    seen_keys.add(dk)
-
-                cost = calc_cost(
-                    usage.get("input_tokens", 0),
-                    usage.get("output_tokens", 0),
-                    usage.get("cache_creation_input_tokens", 0),
-                    usage.get("cache_read_input_tokens", 0),
-                    msg.get("model", ""),
-                    ts,
+                tokens = (
+                    usage.get("input_tokens") or 0,
+                    usage.get("output_tokens") or 0,
+                    usage.get("cache_creation_input_tokens") or 0,
+                    usage.get("cache_read_input_tokens") or 0,
                 )
+                model = msg.get("model") or ""
+                key = dedup_identity(
+                    dk, mid, rec.get("sessionId") or "",
+                    ts.timestamp(), model, tokens,
+                )
+                if key is not None:
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                cost = calc_cost(*tokens, model, ts)
                 yield cost, ts, dk
     except (OSError, UnicodeDecodeError):
         pass
@@ -527,22 +694,19 @@ def compute_session_cost(session_id: str, cwd: str) -> float:
         # JSONL files gone — fall back to cached ccreport records (macsetup-2wsk)
         # Scope by project path to avoid cross-project misattribution
         try:
-            from cache_db import bulk_load_ccreport_cache
-            _, ccr_records_by_file = bulk_load_ccreport_cache()
+            from cache_db import load_ccreport_records_for_session
+            # The sid predicate is the loader's, so only the project scoping is
+            # left to do here.
+            ccr_records_by_file = load_ccreport_records_for_session(session_id)
             project_prefixes = project_path_prefixes(cwd, _get_projects_dirs())
             total = 0.0
             seen: set[str] = set()
             for fp, recs in ccr_records_by_file.items():
-                if not any(fp.startswith(p) for p in project_prefixes):
+                if not path_in_project(fp, project_prefixes):
                     continue
                 for rec in recs:
-                    if rec.get("sid") != session_id:
+                    if record_is_duplicate(rec, seen):
                         continue
-                    dk = rec.get("dk")
-                    if dk:
-                        if dk in seen:
-                            continue
-                        seen.add(dk)
                     cost = _rec_cost(rec)
                     if cost:
                         total += cost
@@ -591,40 +755,37 @@ def _accumulate_orphaned_costs(
     path_prefixes: list[str] | None = None,
     extra_thresholds: dict[str, float] | None = None,
     extra_totals: dict[str, float] | None = None,
+    resolve: Resolver | None = None,
 ) -> None:
     """Accumulate costs from orphaned ccreport records (deleted JSONL files).
 
     Mutates *totals*, *proj_totals*, and *extra_totals* in place.
     *extra_thresholds*/*extra_totals* handle non-rolling windows (week, month, session).
+
+    A record counts toward the project either by the directory it was cached
+    under or by *project_name*, which is the cwd's project with any merge rule
+    already applied — *resolve* puts the record through the same rules, so both
+    sides of the comparison land on the merge target before it is made.
     """
     for fp, recs in ccr_records_by_file.items():
         if fp in live_paths:
             continue
-        if path_prefixes is not None:
-            is_ours = any(fp.startswith(p) for p in path_prefixes)
-        else:
-            is_ours = False
+        is_ours = path_prefixes is not None and path_in_project(fp, path_prefixes)
         for rec in recs:
-            dk = rec.get("dk")
-            if dk:
-                if dk in seen_keys:
-                    continue
-                seen_keys.add(dk)
+            if record_is_duplicate(rec, seen_keys):
+                continue
             cost = _rec_cost(rec)
             if not cost:
                 continue
             ts_epoch = rec.get("ts", 0)
             totals["all_time"] = totals.get("all_time", 0.0) + cost
-            is_project = False
-            if project_name and rec.get("project", "") == project_name:
-                is_project = True
-                if proj_totals is not None:
-                    proj_totals["all_time"] = proj_totals.get("all_time", 0.0) + cost
-            if is_ours and proj_totals is not None:
-                # For project-only scans, all orphaned records from project dirs count
-                if not project_name:
-                    proj_totals["all_time"] = proj_totals.get("all_time", 0.0) + cost
-                    is_project = True
+            # The path test is what places a record from a project-scoped read;
+            # the name is the only handle left on one whose directory is gone.
+            is_project = is_ours or bool(
+                project_name and record_project(rec, resolve) == project_name
+            )
+            if is_project and proj_totals is not None:
+                proj_totals["all_time"] = proj_totals.get("all_time", 0.0) + cost
             if ts_epoch:
                 _bucket_rolling_cost(cost, ts_epoch, thresholds, totals,
                                      proj_totals, is_project)
@@ -635,50 +796,54 @@ def _accumulate_orphaned_costs(
 
 
 def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
-    """Compute rolling cost totals for a single project directory.
+    """Compute rolling cost totals for one project.
 
-    Lightweight scan of only the project's JSONL files — suitable for
-    per-render use in the statusline without touching the shared cache.
+    Lightweight scan of only that project's JSONL files — suitable for
+    per-render use in the statusline without touching the shared cache. Its
+    counterpart compute_costs walks the whole corpus because it also owes a
+    global total; this one never leaves the project's own directories, which
+    is why the two keep separate live-path sets rather than one.
+
+    "The project" is the merge target when a `ccreport merge` grouped others
+    into it, so the scan covers their directories too (macsetup-2qrp).
     """
     if not cwd:
         return {}
 
-    proj_key = project_key(cwd)
     projects_dirs = _get_projects_dirs()
+    scope = project_scope(cwd, projects_dirs)
 
     now_local = datetime.now(tz=_local_tz())
     thresholds = _rolling_thresholds(now_local)
     totals: dict[str, float] = {}
     seen_keys: set[str] = set()
 
-    for d in projects_dirs:
-        proj_dir = d / proj_key
-        if not proj_dir.is_dir():
-            continue
-        for jsonl_path in sorted(proj_dir.rglob("*.jsonl")):
-            for cost, ts, _dk in _iter_jsonl_costs(jsonl_path, seen_keys):
-                totals["all_time"] = totals.get("all_time", 0.0) + cost
-                _bucket_rolling_cost(cost, ts.timestamp(), thresholds, totals)
+    # One walk of the project's directories, reused below as the live-path set
+    # that tells an orphaned cached record from a file still on disk. Walking
+    # twice cost a second full rglob of the project on every render.
+    project_files: list[Path] = []
+    for prefix in scope.prefixes:
+        proj_dir = Path(prefix)
+        if proj_dir.is_dir():
+            project_files.extend(sorted(proj_dir.rglob("*.jsonl")))
+    project_live_paths = {str(p) for p in project_files}
 
-    # Include orphaned cached records for this project (macsetup-59zg)
+    for jsonl_path in project_files:
+        for cost, ts, _dk in _iter_jsonl_costs(jsonl_path, seen_keys):
+            totals["all_time"] = totals.get("all_time", 0.0) + cost
+            _bucket_rolling_cost(cost, ts.timestamp(), thresholds, totals)
+
+    # Include orphaned cached records for this project (macsetup-59zg).
+    # Scoped to the project's path prefixes in SQL: this runs on every render,
+    # and the prefixes discard all but one project's share anyway (macsetup-45iv).
     try:
-        from cache_db import bulk_load_ccreport_cache
-        _, ccr_records_by_file = bulk_load_ccreport_cache()
-        prefixes = project_path_prefixes(cwd, projects_dirs)
-        # Filter to only orphaned records from this project's directories
-        # to avoid inflating project costs with other projects' data.
-        project_ccr = {
-            fp: recs for fp, recs in ccr_records_by_file.items()
-            if any(fp.startswith(p) for p in prefixes)
-        }
-        live_paths: set[str] = set()
-        for d in projects_dirs:
-            proj_dir = d / proj_key
-            if proj_dir.is_dir():
-                live_paths.update(str(p) for p in proj_dir.rglob("*.jsonl"))
+        from cache_db import load_ccreport_records_under
+        project_ccr: dict[str, list[dict]] = {}
+        for prefix in scope.prefixes:
+            project_ccr.update(load_ccreport_records_under(prefix))
         _accumulate_orphaned_costs(
-            project_ccr, live_paths, seen_keys, thresholds,
-            totals, path_prefixes=prefixes,
+            project_ccr, project_live_paths, seen_keys, thresholds,
+            totals, path_prefixes=scope.prefixes,
         )
     except Exception:  # noqa: BLE001
         pass
@@ -834,11 +999,8 @@ def _try_cached_file(
     sw = 0.0
 
     for rec in ccr_records_by_file.get(ctx.key, []):
-        dk = rec.get("dk")
-        if dk:
-            if dk in seen_keys:
-                continue
-            seen_keys.add(dk)
+        if record_is_duplicate(rec, seen_keys):
+            continue
         ts_e = rec.get("ts", 0)
         if not ts_e or ts_e < td_ts:
             if not (ctx.in_session_window and sw_ts and ts_e >= sw_ts):
@@ -962,12 +1124,12 @@ def compute_costs(
     if session_id and cwd:
         session_files = _find_session_files(session_id, cwd, projects_dirs)
 
-    # Per-project prefixes for identifying files belonging to current cwd
-    project_prefixes: list[str] = []
-    project_name = ""
+    # Which files and which orphaned records belong to the current cwd's
+    # project — merge rules included, so the report and the statusline group
+    # the same way (macsetup-2qrp).
+    scope = ProjectScope("", [])
     if cwd:
-        project_prefixes = project_path_prefixes(cwd, projects_dirs)
-        project_name = Path(cwd).name
+        scope = project_scope(cwd, projects_dirs)
 
     # Bulk-load ccreport cache for fast rolling cost computation
     ccr_file_meta, ccr_records_by_file = bulk_load_ccreport_cache()
@@ -980,19 +1142,25 @@ def compute_costs(
     rolling_proj: dict[str, float] = {}
     seen_keys: set[str] = set()
     new_entries: dict[str, Any] = {}
-    dirty = False
+    # Paths whose entry was rebuilt by a scan. Every other entry in
+    # new_entries is the cached dict verbatim, so the save can leave those
+    # rows — and their dedup keys — untouched.
+    changed_files: set[str] = set()
 
     sw_ts = session_window_start.timestamp() if session_window_start else None
     mw_ts = month_window_start.timestamp()
     ww_ts = week_window_start.timestamp()
     td_ts = thresholds["thirty_day"]
 
-    live_paths: set[str] = set()
+    # Every JSONL still on disk, across all projects: this function owes a
+    # global total as well as the project's, so its walk is the whole corpus.
+    # compute_project_rolling_costs keeps a project-scoped set of its own.
+    corpus_live_paths: set[str] = set()
 
     for projects_dir in projects_dirs:
         for jsonl_path in sorted(projects_dir.rglob("*.jsonl")):
             key = str(jsonl_path)
-            live_paths.add(key)
+            corpus_live_paths.add(key)
             try:
                 st = jsonl_path.stat()
             except OSError:
@@ -1004,7 +1172,7 @@ def compute_costs(
             ctx = _FileContext(
                 key=key,
                 is_session_file=key in session_files,
-                is_project_file=any(key.startswith(p) for p in project_prefixes),
+                is_project_file=path_in_project(key, scope.prefixes),
                 in_session_window=sw_ts is not None and st.st_mtime >= sw_ts,
                 in_rolling_window=st.st_mtime >= td_ts,
                 file_unchanged=bool(
@@ -1069,7 +1237,7 @@ def compute_costs(
                 if ctx.is_project_file:
                     rolling_proj["all_time"] = rolling_proj.get("all_time", 0.0) + scan.all_time_cost
                 session_total += scan.session_cost
-                dirty = True
+                changed_files.add(key)
 
             sw_total += scan.sw_cost
             for w in ROLLING_WINDOWS:
@@ -1078,9 +1246,15 @@ def compute_costs(
                 if ctx.is_project_file:
                     rolling_proj[w.name] = rolling_proj.get(w.name, 0.0) + fc
 
-    if dirty or set(new_entries) != set(file_cache):
+    if changed_files or set(new_entries) != set(file_cache):
         try:
-            bulk_save_file_costs(new_entries, week_key, month_key)
+            bulk_save_file_costs(
+                new_entries, week_key, month_key, changed=changed_files,
+                # Dedup keys only change a total inside a window that still
+                # counts the file, so the widest of the two bounded windows is
+                # where they stop being worth storing.
+                dedup_cutoff_ns=int(min(mw_ts, td_ts) * 1_000_000_000),
+            )
         except OSError:
             pass
 
@@ -1090,9 +1264,11 @@ def compute_costs(
         extra_thresholds["session_window"] = sw_ts
     extra_totals: dict[str, float] = {}
     _accumulate_orphaned_costs(
-        ccr_records_by_file, live_paths, seen_keys, thresholds,
-        rolling_totals, rolling_proj, project_name,
+        ccr_records_by_file, corpus_live_paths, seen_keys, thresholds,
+        rolling_totals, rolling_proj, scope.name,
+        path_prefixes=scope.prefixes,
         extra_thresholds=extra_thresholds, extra_totals=extra_totals,
+        resolve=scope.resolve,
     )
     month_total += extra_totals.get("month", 0.0)
     week_total += extra_totals.get("week", 0.0)

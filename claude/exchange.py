@@ -7,14 +7,26 @@ rate lookups with automatic fallback for weekends and holidays.
 from __future__ import annotations
 
 import json
+import math
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import cache_db
+
 OSLO_TZ = ZoneInfo("Europe/Oslo")
 _MAX_WALKBACK_DAYS = 10
+
+# A cached rate is permanent: _find_missing_range only asks the API for dates
+# with no row, and get_rate's walkback stops at the first date present, sound
+# or not. So one bad value (a 0.0, a misparsed field) silently skews every NOK
+# figure for that date forever. USD/NOK has stayed within roughly 5-12 for as
+# long as the series exists; this band rejects garbage while leaving room for a
+# currency move far outside anything on record.
+_MIN_PLAUSIBLE_RATE = 5.0
+_MAX_PLAUSIBLE_RATE = 20.0
 
 _API_BASE = (
     "https://data.norges-bank.no/api/data/EXR/B.USD.NOK.SP"
@@ -22,8 +34,17 @@ _API_BASE = (
 )
 
 
+def _is_plausible_rate(rate: float) -> bool:
+    """Whether *rate* is a USD/NOK figure worth caching permanently."""
+    return math.isfinite(rate) and _MIN_PLAUSIBLE_RATE <= rate <= _MAX_PLAUSIBLE_RATE
+
+
 def _parse_sdmx_rates(data: dict[str, Any]) -> dict[str, float]:
-    """Parse SDMX-JSON response into {date_str: rate} dict."""
+    """Parse SDMX-JSON response into {date_str: rate} dict.
+
+    Implausible rates are dropped rather than returned, leaving their date
+    uncached so the next run requests it again.
+    """
     rates: dict[str, float] = {}
     try:
         structure = data["data"]["structure"]
@@ -35,7 +56,9 @@ def _parse_sdmx_rates(data: dict[str, Any]) -> dict[str, float]:
             idx = int(idx_str)
             if idx < len(time_periods):
                 date_str = time_periods[idx]["id"]
-                rates[date_str] = float(values[0])
+                rate = float(values[0])
+                if _is_plausible_rate(rate):
+                    rates[date_str] = rate
     except (KeyError, IndexError, StopIteration, ValueError, TypeError):
         pass
     return rates
@@ -53,25 +76,15 @@ def _fetch_api(start: date, end: date) -> dict[str, float]:
         return {}
 
 
-def _load_cached_rates() -> dict[str, float]:
-    """Load all cached exchange rates from SQLite."""
-    from cache_db import get_connection
-    conn = get_connection()
-    rows = conn.execute("SELECT date, rate FROM exchange_rates").fetchall()
-    return {r[0]: r[1] for r in rows}
+def _load_cached_rates(dates: set[date]) -> dict[str, float]:
+    """Load the cached rates any lookup for *dates* could reach.
 
-
-def _save_rates(rates: dict[str, float]) -> None:
-    """Upsert exchange rates into SQLite cache."""
-    if not rates:
-        return
-    from cache_db import get_connection
-    conn = get_connection()
-    conn.executemany(
-        "INSERT OR REPLACE INTO exchange_rates (date, rate) VALUES (?, ?)",
-        rates.items(),
-    )
-    conn.commit()
+    get_rate walks back up to _MAX_WALKBACK_DAYS, so the earliest usable rate
+    sits that far before the earliest requested date. Everything older is dead
+    weight in a table that grows a row per calendar day forever.
+    """
+    since = min(dates) - timedelta(days=_MAX_WALKBACK_DAYS)
+    return cache_db.get_exchange_rates(since.isoformat())
 
 
 def to_oslo_date(ts: datetime) -> date:
@@ -98,12 +111,13 @@ def _find_missing_range(
 def load_rates(dates: set[date]) -> dict[str, float]:
     """Load exchange rates for a set of dates, fetching missing ones from API.
 
-    Returns a dict of {date_str: rate} covering all cached rates.
-    Dates on weekends/holidays won't have entries — use get_rate() for fallback.
+    Returns {date_str: rate} from the walkback horizon of the earliest
+    requested date onward. Dates on weekends/holidays won't have entries —
+    use get_rate() for fallback.
     """
     if not dates:
         return {}
-    cached = _load_cached_rates()
+    cached = _load_cached_rates(dates)
     missing_range = _find_missing_range(dates, cached)
     if missing_range:
         start, end = missing_range
@@ -111,7 +125,7 @@ def load_rates(dates: set[date]) -> dict[str, float]:
         start = start - timedelta(days=_MAX_WALKBACK_DAYS)
         fetched = _fetch_api(start, end)
         if fetched:
-            _save_rates(fetched)
+            cache_db.save_exchange_rates(fetched)
             cached.update(fetched)
     return cached
 

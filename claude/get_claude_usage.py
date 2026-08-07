@@ -3,6 +3,10 @@
 
 Uses GET https://api.anthropic.com/api/oauth/usage with the user's OAuth token
 sourced from macOS Keychain or ~/.claude/.credentials.json.
+
+AUDIT: All calculations are documented in claude/CLAUDE.md.
+When changing any calculation, caching, or data format here,
+update CLAUDE.md to match.
 """
 
 from __future__ import annotations
@@ -31,6 +35,24 @@ from cache_db import (
 from pricing import compute_costs
 
 CACHE_MAX_AGE = 600  # 10 minutes
+
+# Every field fetch_usage_api can produce. write_usage_cache leaves columns the
+# write dict does not mention alone, which is what keeps a failed cost
+# computation from nulling the cost columns (macsetup-29bl) — but for these an
+# omission is a statement: the API drops a quota that no longer applies (no
+# Sonnet cap on this plan, a scoped limit that lapsed), and without an explicit
+# null the old reading would outlive the quota it described.
+_API_QUOTA_FIELDS = (
+    "session_percent", "session_reset", "week_percent", "week_reset",
+    "sonnet_percent", "sonnet_reset",
+    "scoped_percent", "scoped_model", "scoped_reset",
+    "extra_percent", "extra_spent", "extra_limit",
+)
+
+# Follower poll backoff in _wait_for_leader: each miss costs a SELECT of the
+# whole usage row, so the interval doubles from the first value up to the cap.
+LEADER_POLL_MIN_DELAY = 0.1
+LEADER_POLL_MAX_DELAY = 1.0
 
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_API_TIMEOUT = 5  # seconds per attempt
@@ -344,13 +366,26 @@ def _wait_for_leader(
     session_id: str | None,
     cwd: str | None,
 ) -> None:
-    """Poll for fresh cache while another process is fetching. Exits on result."""
-    for _ in range(wait_timeout * 2):  # poll every 0.5s
-        time.sleep(0.5)
+    """Poll for fresh cache while another process is fetching. Exits on result.
+
+    The interval backs off from LEADER_POLL_MIN_DELAY to LEADER_POLL_MAX_DELAY:
+    a leader that returns quickly — the common case — is picked up sooner than a
+    flat interval would, and a slow one costs a handful of reads instead of one
+    every half second for the whole timeout. The deadline is wall-clock, so
+    wait_timeout still bounds the wait however the delays fall.
+    """
+    deadline = time.monotonic() + wait_timeout
+    delay = LEADER_POLL_MIN_DELAY
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(delay, remaining))
         cached = read_usage_cache(CACHE_MAX_AGE)
         if cached:
             _enrich_and_emit(cached, session_id, cwd)
             sys.exit(0)
+        delay = min(delay * 2, LEADER_POLL_MAX_DELAY)
     # Leader failed — emit stale data if available (macsetup-348k)
     stale = read_usage_stale()
     if stale:
@@ -414,7 +449,10 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"Warning: cost computation failed: {e}", file=sys.stderr)
 
-        write_usage_cache(data)
+        # The quota fields this response omitted are written as explicit nulls;
+        # everything else it does not mention (the cost columns, when the
+        # computation above failed) keeps the value it had.
+        write_usage_cache({**dict.fromkeys(_API_QUOTA_FIELDS), **data})
         print(json.dumps(data, indent=2))
 
     except HTTPError as e:

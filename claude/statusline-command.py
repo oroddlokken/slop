@@ -75,6 +75,7 @@ import math
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -86,12 +87,13 @@ from typing import NamedTuple
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
+    accumulate_cache_stats,
     check_fetch_backoff,
     compute_extra_window_deltas,
-    read_cache_stats,
-    read_usage_for_statusline,
+    is_fetch_blocked,
+    read_cost_summary,
     read_usage_stale,
-    write_cache_stats,
+    usage_is_fresh,
 )
 from pricing import (
     ROLLING_WINDOWS,
@@ -120,6 +122,12 @@ COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays us
 EXTRA_ACCRUAL_PCT = 90     # session % from which extra credits could start accruing
 LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
 SESSION_WINDOW_MS = 900_000  # 15 min — active sessions lookback
+
+# How long a render will wait for the SQLite write lock (cache_db reads this
+# from the environment; its own default is 10 s, for the CLI tools). A render
+# that waits prints nothing at all, where one that gives up prints the same
+# line with a slightly stale stat — so it gives up almost immediately.
+RENDER_DB_TIMEOUT_S = "0.25"
 
 def _env(name: str, default: str = "1") -> str:
     return os.environ.get(f"CLAUDE_STATUSLINE_{name}", default)
@@ -644,6 +652,25 @@ def _api_fetch_needed(usage: dict, native_rl: dict, now: float) -> bool:
     return False
 
 
+def _refresh_env() -> dict[str, str]:
+    """Environment for the detached refresh: the render's own settings removed.
+
+    That subprocess is the writer every render is waiting on, so it needs
+    cache_db's patient default — inheriting the render's quarter-second would
+    make it abandon the refresh whenever another writer got there first.
+
+    It is also the process the day's snapshot is deferred *to*: off the render
+    path and already the one doing the slow work, so the copy costs nobody a
+    frame. Dropped unconditionally — a user who wants no snapshots at all says
+    so with CLAUDE_CACHE_SNAPSHOT_DISABLE, which is passed through untouched.
+    """
+    env = dict(os.environ)
+    if env.get("CLAUDE_CACHE_DB_TIMEOUT") == RENDER_DB_TIMEOUT_S:
+        del env["CLAUDE_CACHE_DB_TIMEOUT"]
+    env.pop("CLAUDE_CACHE_SNAPSHOT_DEFER", None)
+    return env
+
+
 def _spawn_usage_refresh(session_id: str, cwd: str, usage: dict, *, costs_only: bool) -> None:
     """Spawn the detached refresh subprocess (survives parent kill)."""
     script = Path(__file__).resolve().parent / "get_claude_usage.py"
@@ -666,12 +693,15 @@ def _spawn_usage_refresh(session_id: str, cwd: str, usage: dict, *, costs_only: 
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=_refresh_env(),
         )
     except OSError:
         pass
 
 
-def _fetch_usage(session_id: str, cwd: str, native_rl: dict) -> dict:
+def _fetch_usage(
+    session_id: str, cwd: str, native_rl: dict, cost_summary: dict | None,
+) -> dict:
     """Get usage data: env var → cache bypass → detached get_claude_usage.py.
 
     The refresh subprocess is detached (start_new_session=True) so it survives
@@ -680,6 +710,11 @@ def _fetch_usage(session_id: str, cwd: str, native_rl: dict) -> dict:
 
     When the API cannot affect the render the spawn becomes --costs-only, which
     skips the network entirely but keeps the cost windows current.
+
+    The singleton usage row is read exactly once here, and every decision below
+    is a predicate over that one dict: freshness, whether the API could still
+    change the render, what to hand the refresh. *cost_summary* is None when
+    the render's cached summary has expired.
     """
     now = time.time()
     pre = os.environ.get("CLAUDE_STATUSLINE_USAGE_JSON", "")
@@ -688,22 +723,31 @@ def _fetch_usage(session_id: str, cwd: str, native_rl: dict) -> dict:
             return _adjust_passed_resets(json.loads(pre), now)
         except json.JSONDecodeError:
             return {}
-    stale = read_usage_stale() or {}
-    want_api = _api_fetch_needed(stale, native_rl, now)
-    cached = read_usage_for_statusline()
-    if cached is not None:
-        return _adjust_passed_resets(cached, now)
-    if not want_api:
+    try:
+        row = read_usage_stale() or {}
+        fresh = usage_is_fresh(row, USAGE_FETCH_INTERVAL_S)
+        blocked = not fresh and is_fetch_blocked()
+    except sqlite3.OperationalError:
+        # Only the first-touch schema bootstrap takes a write lock on this
+        # path — WAL readers do not block — but a render with no usage data
+        # still beats a render that raised.
+        return {}
+    if fresh:
+        return _adjust_passed_resets(row, now)
+    if blocked:
+        # A lock is held or the API is in error backoff: spawning anything
+        # would be pointless, so flag the age and let the render say so.
+        if row:
+            row["_stale"] = True
+        return _adjust_passed_resets(row, now)
+    if _api_fetch_needed(row, native_rl, now):
+        _spawn_usage_refresh(session_id, cwd, row, costs_only=False)
+    elif cost_summary is None:
         # API data is deliberately left to age; only refresh costs, and only
         # when the summary the render reads has actually expired.
-        from cache_db import read_cost_summary
-
-        if read_cost_summary(max_age=COST_SUMMARY_MAX_AGE, cwd=cwd) is None:
-            _spawn_usage_refresh(session_id, cwd, stale, costs_only=True)
-        return _adjust_passed_resets(stale, now)
-    _spawn_usage_refresh(session_id, cwd, stale, costs_only=False)
+        _spawn_usage_refresh(session_id, cwd, row, costs_only=True)
     # Return stale data for this render; fresh data will be in cache next call
-    return _adjust_passed_resets(stale, now)
+    return _adjust_passed_resets(row, now)
 
 
 # --- Dcat status ---
@@ -758,26 +802,21 @@ def _accumulate_cache_stats(
 
     total_in_tokens is the change key, not a running total: since v2.1.132 it is
     the current context input, which equals the sum of the three current_usage
-    input fields. Compared with != rather than >, so a context that shrinks
-    after /compact still accumulates. Equality means the same API response we
-    already counted — the guard that keeps repeat renders (refreshInterval, mode
-    changes) from double-counting. Two consecutive responses with an identical
-    input total undercount by one; the payload carries no per-message id to key
-    on instead.
+    input fields. A changed value means a new API response; equality means the
+    same one we already counted, and the DAL suppresses the write — the guard
+    that keeps repeat renders (refreshInterval, mode changes) from
+    double-counting. A context that shrinks after /compact still accumulates.
+    Two consecutive responses with an identical input total undercount by one;
+    the payload carries no per-message id to key on instead.
+
+    The addition itself happens in SQL, so two renders of the same session
+    cannot both read the old totals and both write old+delta.
     """
     if not session_id:
         return 0, 0, 0
-    cached = read_cache_stats(session_id)
-    if cached is not None:
-        pt, pf, pc, pr = cached
-        if total_in_tokens != pt:
-            cf, cc, cr = pf + input_fresh, pc + cache_create, pr + cache_read
-        else:
-            return pf, pc, pr
-    else:
-        cf, cc, cr = input_fresh, cache_create, cache_read
-    write_cache_stats(session_id, total_in_tokens, cf, cc, cr)
-    return cf, cc, cr
+    return accumulate_cache_stats(
+        session_id, total_in_tokens, input_fresh, cache_create, cache_read,
+    )
 
 
 # --- Section renderers ---
@@ -1214,7 +1253,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]
     s_pct = _pct_str(usage, "session_percent")
     w_pct = _pct_str(usage, "week_percent")
     if not (s_pct or w_pct):
-        return [], False
+        return [], False, False
 
     rl_inners: list[str] = []
 
@@ -1504,8 +1543,13 @@ def _render_session(
 
 def _merge_cost_data(
     usage_data: dict, session_id: str, cwd: str, native_rl: dict | None = None,
+    cost_summary: dict | None = None,
 ) -> None:
-    """Enrich usage_data with cost data from JSONL and cost summary cache."""
+    """Enrich usage_data with cost data from JSONL and the cost summary cache.
+
+    *cost_summary* is the render's single read of that cache — _fetch_usage
+    needs the same answer, so main reads it once and passes it to both.
+    """
     if not usage_data and _on("HISTORIC_COST"):
         # Cold start: no cached row, so the window bounds can only come from
         # stdin. Without them compute_costs has no session window to total.
@@ -1518,20 +1562,14 @@ def _merge_cost_data(
             ))
         except Exception:  # noqa: BLE001
             pass
-    if usage_data and _on("HISTORIC_COST"):
-        try:
-            from cache_db import read_cost_summary
-            cost_summary = read_cost_summary(max_age=COST_SUMMARY_MAX_AGE, cwd=cwd)
-            if cost_summary:
-                for k in (
-                    # The S/W window costs come from here too, not just the usage
-                    # row, so they stay current when the API fetch is skipped.
-                    "session_window_cost", "week_cost", *rolling_cost_keys(),
-                ):
-                    if k in cost_summary:
-                        usage_data[k] = cost_summary[k]
-        except Exception:  # noqa: BLE001
-            pass
+    if usage_data and cost_summary and _on("HISTORIC_COST"):
+        for k in (
+            # The S/W window costs come from here too, not just the usage
+            # row, so they stay current when the API fetch is skipped.
+            "session_window_cost", "week_cost", *rolling_cost_keys(),
+        ):
+            if k in cost_summary:
+                usage_data[k] = cost_summary[k]
     if cwd and _on("HISTORIC_COST") and usage_data:
         usage_data.update(compute_project_rolling_costs(cwd))
 
@@ -1627,20 +1665,21 @@ def _layout_and_print(
     if sessions:
         top.append(sessions)
     top_str = " ".join(top)
-    usage_parts = [s for s in [usage_session_rl, usage_rl, usage_cost] if s]
-    usage_str = DOT.join(usage_parts) if usage_parts else ""
 
     # Adaptive layout based on terminal width
     term_cols = _get_terminal_cols()
     if term_cols >= LAYOUT_WIDE_COLS:
         line1_parts = [s for s in [top_str, session] if s]
-        line2_parts = [s for s in [usage_str] if s]
         # A badge opens the session segment with its own background, which
         # separates it from git on its own — the dot there reads as clutter.
         sep = " " if _BADGE_RE.match(session) else DOT
         lines = [sep.join(line1_parts)]
-        if line2_parts:
-            lines.append(" ".join(line2_parts))
+        # Rate limits and cost windows always get their own lines
+        rl_parts = [s for s in [usage_session_rl, usage_rl] if s]
+        if rl_parts:
+            lines.append(DOT.join(rl_parts))
+        if usage_cost:
+            lines.append(usage_cost)
     else:
         lines = [top_str]
         if session:
@@ -1669,6 +1708,13 @@ def _layout_and_print(
 
 def main() -> None:
     _t_start = time.monotonic()
+    # Before the first cache_db call: get_connection reads both when it opens
+    # the singleton connection. An explicit setting from the environment wins.
+    os.environ.setdefault("CLAUDE_CACHE_DB_TIMEOUT", RENDER_DB_TIMEOUT_S)
+    # A render is the likeliest process to be first through the door after UTC
+    # midnight, and the daily snapshot is a full copy of the DB. _refresh_env
+    # drops this, so the detached refresh takes it instead (macsetup-3xzh).
+    os.environ.setdefault("CLAUDE_CACHE_SNAPSHOT_DEFER", "1")
     now_epoch = time.time()
     test_null = "-t0" in sys.argv  # pre-first-API-call / post-compact null state
     test_mode = "-t" in sys.argv or test_null
@@ -1732,15 +1778,21 @@ def main() -> None:
         # Computed before the fetch decision (it gates whether the API is worth
         # calling) but applied after the cost merge — see below.
         native_rl = _native_rate_limits(data)
+        # One read for the whole render: _fetch_usage decides from it whether a
+        # costs-only refresh is due, _merge_cost_data merges what it holds.
+        try:
+            cost_summary = read_cost_summary(max_age=COST_SUMMARY_MAX_AGE, cwd=inp.cwd)
+        except Exception:  # noqa: BLE001
+            cost_summary = None
         # In-process: usage cache + .dogcats log (no subprocess)
-        usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl)
+        usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl, cost_summary)
         # Strip project-scoped costs from usage cache — they belong to
         # whichever project last wrote the singleton row (macsetup-1zeq)
         if usage_data:
             for k in list(usage_data):
                 if "project_cost" in k:
                     del usage_data[k]
-        _merge_cost_data(usage_data, inp.session_id, inp.cwd, native_rl)
+        _merge_cost_data(usage_data, inp.session_id, inp.cwd, native_rl, cost_summary)
         # S and W come from stdin when Claude Code sends them — always current,
         # so they win over the cache. Applied after the cost merge, which keys
         # its compute-vs-read choice on usage_data being empty. Sonnet, Extra
@@ -1759,10 +1811,14 @@ def main() -> None:
         for p in (*git_procs.values(), macmon_proc, battery_proc, dsp_proc):
             _kill(p)
 
-    # Cache stats
-    cum_fresh, cum_create, cum_read = _accumulate_cache_stats(
-        inp.session_id, inp.cache_read, inp.cache_create, inp.input_fresh, inp.total_in
-    )
+    # Cache stats. Both writes below are guarded: with one WAL writer allowed,
+    # a busy database must cost the render a stale statistic, not the line.
+    try:
+        cum_fresh, cum_create, cum_read = _accumulate_cache_stats(
+            inp.session_id, inp.cache_read, inp.cache_create, inp.input_fresh, inp.total_in
+        )
+    except sqlite3.OperationalError:
+        cum_fresh = cum_create = cum_read = 0
 
     # Render all sections
     top = [
@@ -1776,7 +1832,10 @@ def main() -> None:
         _render_dogcat(dcat_data),
         _render_changes(inp.lines_added, inp.lines_removed),
     ]
-    chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
+    try:
+        chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
+    except sqlite3.OperationalError:
+        chat_cost_val = 0.0
     chat_cost = str(chat_cost_val) if chat_cost_val > 0 else ""
     used_tokens = _used_tokens(inp.used, inp.ctx_size, inp.total_in)
     session = _render_session(
