@@ -1,0 +1,31 @@
+#!/usr/bin/env zsh
+# Dispatch c<model>[<effort>] symlinks to claudem: cfl → claudem f low,
+# cf → claudem f (effort defaults to high). Add a wrapper by symlinking
+# another matching name to this file.
+#
+# cf — exactly that name — also injects the orchestrator instruction: fable
+# delegates programming work to the cfcoder agent (claude/agents/cfcoder.md,
+# Opus at high effort). cfh is the escape hatch, fable at high effort with no
+# injection, and neither the other wrappers nor claudem run directly ever
+# inject. macsetup-5t4y.
+
+set -euo pipefail
+
+local name="${0:t}"
+
+if [[ "$name" != c[hsof](|[lmxh]) ]]; then
+  echo "claudem-shorthand: invoked as '$name'; expected c<h|s|o|f>[l|m|x|h]" >&2
+  exit 1
+fi
+
+local -A effort_words=(l low m medium x xhigh h high)
+
+local -a args=("${name[2]}")
+[[ -n "${name[3]:-}" ]] && args+=("${effort_words[${name[3]}]}")
+
+if [[ "$name" == cf ]]; then
+  export CF_BADGE=1
+  args+=(--append-system-prompt "For programming work — writing or modifying code — delegate the implementation to the 'cfcoder' agent (Agent tool, subagent_type: cfcoder) rather than editing files yourself. You are the orchestrator: you scope the task, brief the agent with the relevant files and constraints, review the returned changes, and report to the user. This split exists because this session's model is reserved for judgment and planning; the cfcoder agent (Opus, high effort) does the implementation. Make trivial mechanical edits (single-line fixes, renames) yourself — an agent round-trip costs more than it saves there. Red flags — if you're thinking 'I've already read the files, faster to just do it myself' or 'this change is only medium-sized', stop and delegate.")
+fi
+
+exec claudem "${args[@]}" "$@"

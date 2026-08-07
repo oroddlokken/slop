@@ -15,13 +15,15 @@ the manual version of that, and works from a clone in any directory.
 | `ccreport.py` | `ccreport` — token and cost report over the local JSONL logs, by day, month, project or session. Costs in USD and NOK (Norges Bank spot rate, 25 % MVA added unless `--no-mva`). |
 | `claudemem` | TUI for browsing the Claude Code memories belonging to the current git repo — navigate, edit, delete with undo. `--json` prints them instead. |
 | `claudem` | Launcher: `claudem <haiku\|sonnet\|opus\|fable> [low\|medium\|high\|xhigh\|max]` starts Claude Code with an explicit model and reasoning effort (default high). Single-letter shorthands, arguments in any order, everything else passed through to `claude`. |
+| `cf` | Fable-as-orchestrator: starts `claudem f` with an injected system prompt telling the session to delegate implementation work to the `cfcoder` agent and keep Fable for judgment and planning. The script dispatches on its invoked name (`c<model>[<effort>]`), so symlinks like `cfl` or `com` give other model/effort combos — only the name `cf` injects. |
+| `cfcoder.md` | The agent definition `cf` delegates to: Opus at high effort doing the implementation. Only takes effect from an agents dir Claude Code reads — see below. |
 | `pricing.py`, `exchange.py`, `cache_db.py` | Model price table, USD/NOK rates, and the shared SQLite cache all of the above read. |
 | `hooks/` | `block-git-stash-worktree.sh`, a `PreToolUse` hook that blocks stash and worktree commands. Test suite in the sibling `block-git-stash-tests/` (payloads built inline — no fixture files). |
 | `stop-phrase-guard/` | A `Stop` hook that catches ownership-dodging and session-quitting phrases. Non-blocking — the assistant still stops, but the matched rule surfaces as a `systemMessage`. Fixtures alongside it. |
 
 Requirements: `uv` (the status line, `ccreport` and `claudemem` resolve their
 own dependencies through PEP 723 shebangs), a system Python 3.12+ for
-`get_claude_usage.py`, `zsh` for `ccu` and `claudem`, and `jq` for both hooks. The git-stash
+`get_claude_usage.py`, `zsh` for `ccu`, `claudem` and `cf`, and `jq` for both hooks. The git-stash
 hook also wants `perl` — without it, it falls back to substring matching and
 over-blocks. Some pieces are macOS-only: the Keychain token lookup
 (`security`), and the battery (`pmset`) and Apple Silicon power (`macmon`)
@@ -64,6 +66,19 @@ alias ccu='SETUP_DIR=/path/to/slop /path/to/slop/claude/ccu.zsh'
 ```bash
 alias ccreport=/path/to/slop/claude/ccreport.py
 ```
+
+## cf
+
+`cf` needs `claudem` (and `claude`) on `PATH`, and `cfcoder.md` in an agents
+directory Claude Code actually loads — `~/.claude/agents/` for all projects, or
+`.claude/agents/` in the repo you run it from:
+
+```bash
+cp /path/to/slop/claude/cfcoder.md ~/.claude/agents/
+```
+
+Without the agent installed, the injected prompt tells the session to delegate
+to an agent that doesn't exist.
 
 ## Hooks
 
