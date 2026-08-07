@@ -1,0 +1,50 @@
+#!/usr/bin/env zsh
+# Launch Claude Code with an explicit model and reasoning effort.
+#
+# Usage: claudem <haiku|sonnet|opus|fable> [low|medium|high|xhigh|max] [claude args...]
+#
+# The model is required; effort defaults to high. Either may be given in any
+# order, and anything else is passed straight through to `claude`.
+# Shorthands: h=haiku s=sonnet o=opus f=fable l=low m=medium x=xhigh
+
+set -euo pipefail
+
+local -a models=(haiku sonnet opus fable)
+local -a efforts=(low medium high xhigh max)
+local -A shorthands=(h haiku s sonnet o opus f fable l low m medium x xhigh)
+
+local usage="Usage: claudem <${(j:|:)models}> [${(j:|:)efforts}] [claude args...]"
+
+local model="" effort=""
+local -a passthrough
+
+for arg in "$@"; do
+  arg="${shorthands[$arg]:-$arg}"
+  if (( ${models[(Ie)$arg]} )); then
+    if [[ -n "$model" ]]; then
+      echo "claudem: model already set to '$model', got '$arg'" >&2
+      exit 1
+    fi
+    model="$arg"
+  elif (( ${efforts[(Ie)$arg]} )); then
+    if [[ -n "$effort" ]]; then
+      echo "claudem: effort already set to '$effort', got '$arg'" >&2
+      exit 1
+    fi
+    effort="$arg"
+  else
+    passthrough+=("$arg")
+  fi
+done
+
+if [[ -z "$model" ]]; then
+  echo "claudem: a model is required" >&2
+  echo "$usage" >&2
+  exit 1
+fi
+
+: "${effort:=high}"
+
+export CLAUDE_STATUSLINE_MODEL_BANNER=1
+
+exec claude --model "$model" --effort "$effort" "${passthrough[@]}"

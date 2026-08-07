@@ -27,6 +27,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_SANDBOX                 — sbx/!sbx badge from merged Claude settings
   CLAUDE_STATUSLINE_DSP                     — orange DSP marker when started with --dangerously-skip-permissions
   CLAUDE_STATUSLINE_GIT                     — branch + indicators
+    CLAUDE_STATUSLINE_GIT_DIFFSTAT          — working-tree +N-N inside the git indicators
   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
   CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation) (default 0)
   CLAUDE_STATUSLINE_RENDER_TIME             — how long this render took (0.235s) (default 0)
@@ -45,6 +46,9 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_SONNET_THRESHOLD      — hide Sonnet below this % (default 25)
     CLAUDE_STATUSLINE_SCOPED                — per-model weekly limit (label from the model)
     CLAUDE_STATUSLINE_SCOPED_THRESHOLD      — hide scoped limit below this % (default 25)
+    CLAUDE_STATUSLINE_SCOPED_MODE           — always / off / current: show the scoped
+                                              segment regardless, never, or only when the
+                                              session runs the capped model (default current)
     CLAUDE_STATUSLINE_EXTRA                 — Extra usage spent/limit + per-window deltas (S/W)
     CLAUDE_STATUSLINE_EXTRA_SESSION_THRESHOLD — show Extra when S% >= this (default 60)
     CLAUDE_STATUSLINE_TTL                   — time until next usage fetch (default 0;
@@ -61,6 +65,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
 
 Other environment variables:
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
+  CF_BADGE                                  — cyan CF badge after the model name (set by the cf wrapper)
 """
 
 from __future__ import annotations
@@ -164,6 +169,11 @@ RST = "\033[0m"
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 # A model badge: bold white on a background, opened and closed in one run.
 _BADGE_RE = re.compile(r"\033\[1;97;[0-9;]+m[^\033]*\033\[0m")
+
+
+def _vis_len(text: str) -> int:
+    """Visible character count — what the terminal renders, ANSI stripped."""
+    return len(_ANSI_RE.sub("", text))
 
 
 def _c(code: str, text: str) -> str:
@@ -877,7 +887,7 @@ def _render_git(
         ind += _c("0;31", "!")
     if any(f.startswith("??") for f in files):
         ind += _c("0;37", "?")
-    if insertions or deletions:
+    if (insertions or deletions) and _on("GIT_DIFFSTAT"):
         ind += f'{_c("0;32", f"+{insertions}")}{_c("0;31", f"-{deletions}")}'
     if ind:
         return f"{_c('0;33', branch)}[{ind}]"
@@ -982,11 +992,16 @@ def _pace_days() -> int:
         return 7
 
 
-def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
+def _weekly_pace(
+    w_pct_s: str, reset_iso: str, now: float, *, countdown: bool = True,
+) -> str:
     """Weekly pace indicator: compare actual usage % to expected % based on elapsed time.
 
     Expected = how far through the PACE_DAYS window we are (time-based, not day-based).
     Display: "{el_d}d{el_h}h/{N}d {sign}{delta}%"
+
+    countdown=False drops the "(4d2h)" parenthetical, for a second segment sharing
+    a reset with one already on screen.
     """
     if not _on("WEEKLY_PACE"):
         return ""
@@ -1017,7 +1032,7 @@ def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
         elapsed_str = f"{el_d}d"
     # Remaining time until reset
     remain_s = int(reset_epoch - now)
-    if remain_s > 0:
+    if remain_s > 0 and countdown:
         cd = _usage_countdown(reset_iso, now)
         time_part = f"{elapsed_str}/7d({cd})"
     else:
@@ -1029,11 +1044,12 @@ def _weekly_pace(w_pct_s: str, reset_iso: str, now: float) -> str:
 
 def _usage_combined(
     label: str, pct_s: str, reset_iso: str, cost_s: str, now: float,
-    *, pace: str = "", clock: bool = False,
+    *, pace: str = "", clock: bool = False, countdown: bool = True,
 ) -> str:
     """Render compact usage: W:26% $293 1d6h/7d 5d17h
 
     clock appends the wall-clock reset time to the countdown: "1h20m(16:30)".
+    countdown=False drops it, for a segment whose reset is already on screen.
     """
     if not pct_s:
         return ""
@@ -1052,7 +1068,7 @@ def _usage_combined(
             pass
     if pace:
         parts.append(pace)
-    else:
+    elif countdown:
         cd = _usage_countdown(reset_iso, now)
         if cd:
             at = _usage_reset_clock(reset_iso, now) if clock else ""
@@ -1178,11 +1194,22 @@ def _extra_is_material(usage: dict) -> bool:
     return _extra_threshold_met(usage.get("session_percent"))
 
 
-def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
+def _fetch_ttl(usage: dict, now: float) -> str:
+    """Countdown to the next usage-API fetch, empty when overdue or unknown."""
+    upd_epoch = _parse_iso_epoch(_ustr(usage, "last_updated"))
+    if upd_epoch is None:
+        return ""
+    ttl_s = int(USAGE_FETCH_INTERVAL_S - (now - upd_epoch))
+    if ttl_s <= 0:
+        return ""
+    return f"{SUBDUED}TTL:{ttl_s // 60}m{ttl_s % 60}s{RST}"
+
+
+def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]:
     """Build rate-limit inner sections (S/W/So + TTL).
 
-    Returns (rl_inners, have_rate_limits). *have_rate_limits* may be set to
-    False if data is too stale, even when it was True on entry.
+    Returns (rl_inners, have_rate_limits, sc_shown). *have_rate_limits* may be
+    set to False if data is too stale, even when it was True on entry.
     """
     s_pct = _pct_str(usage, "session_percent")
     w_pct = _pct_str(usage, "week_percent")
@@ -1227,13 +1254,31 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
     sc_pct = _pct_str(usage, "scoped_percent")
     sc_model = _ustr(usage, "scoped_model")
     sc_shown = False
-    if _on("SCOPED") and sc_pct and sc_model:
+    sc_mode = _env("SCOPED_MODE", "current").lower()
+    sc_wanted = sc_mode == "always" or (
+        sc_mode == "current"
+        and sc_model.lower() in _ustr(usage, "_current_model").lower()
+    )
+    if _on("SCOPED") and sc_wanted and sc_pct and sc_model:
         if not (so_shown and sc_model.lower().startswith("sonnet")):
             try:
                 if int(sc_pct) >= _env_int("SCOPED_THRESHOLD", 25):
+                    sc_reset = usage.get("scoped_reset", "")
+                    # The scoped quota usually resets with the weekly one, and then
+                    # both segments print the same countdown. Compare the rendered
+                    # strings, not the epochs: identical characters is the actual
+                    # redundancy, and it survives the sub-minute drift between a
+                    # reset that arrives on stdin and one that comes from a fetch.
+                    dup_cd = bool(week_line) and _usage_countdown(
+                        sc_reset, now,
+                    ) == _usage_countdown(usage.get("week_reset", ""), now)
+                    sc_pace = _weekly_pace(
+                        sc_pct, sc_reset, now, countdown=not dup_cd,
+                    )
                     scoped_line = _usage_combined(
                         sc_model[:2].title(), sc_pct,
-                        usage.get("scoped_reset", ""), "", now,
+                        sc_reset, "", now,
+                        pace=sc_pace, countdown=not dup_cd,
                     )
                     if scoped_line:
                         rl_inners.append(scoped_line)
@@ -1266,7 +1311,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool]:
         elif age_s >= STALE_THRESHOLD_S and (so_shown or sc_shown or _extra_is_material(usage)):
             rl_inners.insert(0, f"\033[0;31mstale:{age_s // 60}m\033[0m")
 
-    return rl_inners, have_rate_limits
+    return rl_inners, have_rate_limits, sc_shown
 
 
 def _render_extra_usage(usage: dict, now: float) -> str:
@@ -1351,7 +1396,7 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
 
     SEP = f"{SUBDUED} · {RST}"
 
-    rl_inners, have_rate_limits = _render_rate_limits(usage, now)
+    rl_inners, have_rate_limits, sc_shown = _render_rate_limits(usage, now)
     session_rl = SEP.join(rl_inners) if rl_inners else ""
 
     rl_line = ""
@@ -1361,6 +1406,12 @@ def _render_usage(usage: dict, now: float) -> tuple[str, str, str]:
             rl_line = extra
 
     cost_line = _render_cost_windows(usage) if _on("HISTORIC_COST") else ""
+    # The scoped segment's numbers come from the fetch, so while it is on
+    # screen the cost line carries the countdown to the next fetch.
+    if cost_line and sc_shown:
+        ttl = _fetch_ttl(usage, now)
+        if ttl:
+            cost_line = f"{cost_line}{SEP}{ttl}"
 
     return session_rl, rl_line, cost_line
 
@@ -1401,6 +1452,16 @@ def _render_session(
         # name reads the same across models.
         base = re.sub(r"\s*\(\d+\w+\s+context\)", "", model)
         parts.append(banner or f"{SUBDUED}{base}{RST}")
+
+    # cf orchestrator sessions (claudem-shorthand exports CF_BADGE=1). Cyan —
+    # no model banner uses it, and the 1;97 run lets _BADGE_RE stash it whole.
+    # Glued to the model part so the two badges sit flush.
+    if os.environ.get("CF_BADGE") == "1":
+        badge = "\033[1;97;46m CF \033[0m"
+        if parts:
+            parts[-1] += badge
+        else:
+            parts.append(badge)
 
     # Reasoning config sits with the model it configures. The banner already
     # carries the effort, so only the plain-name fallback repeats it here.
@@ -1583,7 +1644,15 @@ def _layout_and_print(
     else:
         lines = [top_str]
         if session:
-            lines.append(session)
+            # Same badge rule as the wide layout; join onto the top line
+            # whenever the pair fits the terminal, else fall back to its
+            # own line.
+            sep = " " if _BADGE_RE.match(session) else DOT
+            joined = sep.join(s for s in (top_str, session) if s)
+            if _vis_len(joined) <= term_cols:
+                lines = [joined]
+            else:
+                lines.append(session)
         if usage_session_rl:
             lines.append(usage_session_rl)
         rest = [s for s in [usage_rl, usage_cost] if s]
@@ -1719,6 +1788,8 @@ def main() -> None:
     sessions = _render_sessions(inp.cwd, now_epoch)
     macmon_str = _render_macmon(macmon_data)
     battery_str = _render_battery(battery_data)
+    # The scoped segment's "current" mode compares against the session model.
+    usage_data["_current_model"] = inp.model
     usage_session_rl, usage_rl, usage_cost = _render_usage(usage_data, now_epoch)
 
     _layout_and_print(

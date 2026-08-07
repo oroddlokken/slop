@@ -3,10 +3,6 @@
 
 Uses GET https://api.anthropic.com/api/oauth/usage with the user's OAuth token
 sourced from macOS Keychain or ~/.claude/.credentials.json.
-
-AUDIT: All calculations are documented in claude/CLAUDE.md.
-When changing any calculation, caching, or data format here,
-update CLAUDE.md to match.
 """
 
 from __future__ import annotations

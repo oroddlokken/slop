@@ -9,16 +9,23 @@ the manual version of that, and works from a clone in any directory.
 
 | Path | What it is |
 |---|---|
-| `statusline-command.py` | The status line. Every segment is toggled by a `CLAUDE_STATUSLINE_*` env var; the script's module docstring is the full list, with defaults. Layout switches between 2 and 4 lines at 150 columns. |
-| `statusline-command_x.sh` | The wrapper `settings.json` points at. It execs the script from its own directory, so the clone can live anywhere. |
+| `statusline-command.py` | The status line. Every segment is toggled by a `CLAUDE_STATUSLINE_*` env var; the script's module docstring lists them with defaults. Layout adapts to terminal width at 150 columns: one or two lines wide, up to five narrow or with the battery/macmon segments on. |
+| `statusline-command_x.sh` | The wrapper `settings.json` points at. It execs the script from its own directory, so the clone can live anywhere. The exports in it are my per-machine overrides — edit them to taste; segment defaults live in the script itself. |
 | `ccu.zsh` + `get_claude_usage.py` | `ccu` — terminal dashboard for the numbers `/usage` shows, with reset countdowns. Reads the OAuth token from the macOS Keychain or `~/.claude/.credentials.json`, cached 10 minutes. |
 | `ccreport.py` | `ccreport` — token and cost report over the local JSONL logs, by day, month, project or session. Costs in USD and NOK (Norges Bank spot rate, 25 % MVA added unless `--no-mva`). |
+| `claudemem` | TUI for browsing the Claude Code memories belonging to the current git repo — navigate, edit, delete with undo. `--json` prints them instead. |
+| `claudem` | Launcher: `claudem <haiku\|sonnet\|opus\|fable> [low\|medium\|high\|xhigh\|max]` starts Claude Code with an explicit model and reasoning effort (default high). Single-letter shorthands, arguments in any order, everything else passed through to `claude`. |
 | `pricing.py`, `exchange.py`, `cache_db.py` | Model price table, USD/NOK rates, and the shared SQLite cache all of the above read. |
-| `hooks/` | `block-git-stash-worktree.sh`, a `PreToolUse` hook that blocks stash and worktree commands. Fixtures in `block-git-stash-tests/`. |
+| `hooks/` | `block-git-stash-worktree.sh`, a `PreToolUse` hook that blocks stash and worktree commands. Test suite in the sibling `block-git-stash-tests/` (payloads built inline — no fixture files). |
 | `stop-phrase-guard/` | A `Stop` hook that catches ownership-dodging and session-quitting phrases. Non-blocking — the assistant still stops, but the matched rule surfaces as a `systemMessage`. Fixtures alongside it. |
 
-Requirements: Python 3.12+, `zsh` for `ccu`, `jq` for `stop-phrase-guard`. The
-status line resolves its own dependencies through `uv` via a PEP 723 shebang.
+Requirements: `uv` (the status line, `ccreport` and `claudemem` resolve their
+own dependencies through PEP 723 shebangs), a system Python 3.12+ for
+`get_claude_usage.py`, `zsh` for `ccu` and `claudem`, and `jq` for both hooks. The git-stash
+hook also wants `perl` — without it, it falls back to substring matching and
+over-blocks. Some pieces are macOS-only: the Keychain token lookup
+(`security`), and the battery (`pmset`) and Apple Silicon power (`macmon`)
+status line segments.
 
 ## Status line
 
@@ -35,8 +42,9 @@ In `~/.claude/settings.json`:
 }
 ```
 
-Every segment default lives in the script, so the wrapper carries no exports —
-it stays as the seam where a per-machine `CLAUDE_STATUSLINE_*` override goes.
+Segment defaults live in the script; the wrapper is the seam where per-machine
+`CLAUDE_STATUSLINE_*` overrides go. The exports it ships with are mine — start
+by deleting them and add back what you want off or on.
 
 ## ccu
 
@@ -88,7 +96,7 @@ alias ccreport=/path/to/slop/claude/ccreport.py
 }
 ```
 
-Both fixture suites take a `HOOK_PATH` override and exit with the failure count:
+Both test suites take a `HOOK_PATH` override and exit with the failure count:
 
 ```bash
 claude/block-git-stash-tests/run-tests.sh
