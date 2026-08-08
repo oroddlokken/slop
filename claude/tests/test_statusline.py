@@ -113,6 +113,33 @@ class TestWindowSize:
         assert out.endswith(f"/{expected}\033[0m")
 
 
+class TestCfBadge:
+    """The wrapper's own name is the label, so cf and co sessions read apart."""
+
+    @pytest.mark.parametrize(("value", "label"), [
+        ("CF", "CF"), ("CO", "CO"),
+        # cf exported a bare 1 before the value carried a label; sessions
+        # launched under that wrapper keep it until they are restarted.
+        ("1", "CF"),
+    ])
+    def test_value_is_the_label(self, monkeypatch, value, label):
+        monkeypatch.setenv("CF_BADGE", value)
+        out = sl._render_session("Opus 5", "", False, 0, 200_000, 0, 0, 0, "")
+        assert f"\033[1;97;46m {label} \033[0m" in out
+
+    def test_badge_stays_stashable_by_force_red(self, monkeypatch):
+        monkeypatch.setenv("CF_BADGE", "CO")
+        out = sl._render_session("Opus 5", "", False, 0, 200_000, 0, 0, 0, "")
+        assert " CO " in sl._BADGE_RE.search(out).group(0)
+
+    @pytest.mark.parametrize("value", ["", None])
+    def test_no_value_renders_no_badge(self, monkeypatch, value):
+        if value is not None:
+            monkeypatch.setenv("CF_BADGE", value)
+        out = sl._render_session("Opus 5", "", False, 0, 200_000, 0, 0, 0, "")
+        assert "1;97;46m" not in out
+
+
 class TestKill:
     def test_none_is_a_no_op(self):
         assert sl._kill(None) is None
@@ -452,3 +479,91 @@ class TestRenderSurvivesContention:
         assert re.search(r"S:\d+%", out)
         assert re.search(r"W:\d+%", out)
         assert "427k/967k" in out  # the session segment survived too
+
+
+class TestCaptureAccount:
+    """The render is the only capture point, so it must never cost the line."""
+
+    ACC = {
+        "accountUuid": "uuid-work",
+        "emailAddress": "me@work.example",
+        "organizationUuid": "org-work",
+        "organizationName": "Work AS",
+    }
+
+    @pytest.fixture()
+    def config(self, tmp_path, monkeypatch):
+        """A stand-in ~/.claude.json the test writes; returns its path."""
+        path = tmp_path / "claude.json"
+        monkeypatch.setattr(sl, "CLAUDE_CONFIG_JSON", path)
+        return path
+
+    def _log(self):
+        import cache_db
+
+        return cache_db.load_account_events()
+
+    def test_the_account_is_recorded_from_the_config(self, config):
+        import json
+
+        config.write_text(json.dumps({"numStartups": 3, "oauthAccount": self.ACC}))
+        sl._capture_account()
+        (event,) = self._log()
+        assert event["account_uuid"] == "uuid-work"
+        assert event["email"] == "me@work.example"
+        assert event["organization_name"] == "Work AS"
+
+    def test_repeat_renders_do_not_grow_the_log(self, config):
+        import json
+
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        for _ in range(5):
+            sl._capture_account()
+        assert len(self._log()) == 1
+
+    def test_a_switch_between_renders_is_captured(self, config):
+        import json
+
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        sl._capture_account()
+        config.write_text(json.dumps({"oauthAccount": {
+            "accountUuid": "uuid-home", "emailAddress": "me@home.example",
+        }}))
+        sl._capture_account()
+        assert [e["email"] for e in self._log()] == [
+            "me@work.example", "me@home.example",
+        ]
+
+    @pytest.mark.parametrize("body", [
+        None,                       # file absent entirely
+        "",                         # zero bytes
+        "{not json",                # half-written
+        "{}",                       # no oauthAccount
+        '{"oauthAccount": null}',   # present but null
+        '{"oauthAccount": "nope"}',  # present but not an object
+        '{"oauthAccount": {}}',     # no accountUuid to key on
+    ])
+    def test_an_unusable_config_records_nothing_and_does_not_raise(self, config, body):
+        if body is not None:
+            config.write_text(body)
+        sl._capture_account()
+        assert self._log() == []
+
+    def test_a_held_database_costs_the_log_a_sample_not_the_render(self, config, monkeypatch):
+        import json
+        import sqlite3
+
+        import cache_db
+
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        monkeypatch.setenv("CLAUDE_CACHE_DB_TIMEOUT", "0.1")
+        cache_db.get_connection()
+        cache_db.close_connection()  # reopen under the short timeout
+        other = sqlite3.connect(str(cache_db.DB_PATH), timeout=5)
+        other.execute("BEGIN IMMEDIATE")
+        try:
+            sl._capture_account()  # must not raise
+        finally:
+            other.rollback()
+            other.close()
+        assert self._log() == []

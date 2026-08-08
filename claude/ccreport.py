@@ -12,6 +12,7 @@ update CLAUDE.md to match.
 """
 
 import argparse
+import bisect
 import calendar
 import hashlib
 import json
@@ -34,15 +35,21 @@ from rich.text import Text
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
+    ADOPTED_TS,
     add_project_override,
     bulk_load_ccreport_cache,
     check_ccreport_valid,
+    clear_adopted_account,
     count_ccreport_records_without_signals,
     delete_project_override,
     get_project_overrides,
     init_ccreport_meta,
     invalidate_ccreport,
+    load_account_events,
+    read_adopted_account,
+    read_latest_account,
     save_ccreport_files,
+    set_adopted_account,
 )
 import project_identity
 from exchange import get_rate, load_rates, to_oslo_date
@@ -189,6 +196,83 @@ def _deserialize_records(raw: list[dict]) -> list:
     ]
 
 
+# --- Account attribution ---
+
+UNKNOWN_ACCOUNT = "unknown"
+
+
+def _account_labels(events: list[dict]) -> list[str]:
+    """The display label for each event, in the order given.
+
+    An email is the label, because that is what the person recognizes. The same
+    address can bill through more than one organization — a work login and a
+    personal one — and those are separate accounts that must not share a
+    bucket, so an email seen under more than one organization carries the
+    organization name too. An event with no email falls back to its uuid, which
+    is the only field guaranteed to be there.
+    """
+    orgs: dict[str, set[str]] = defaultdict(set)
+    for e in events:
+        if e["email"]:
+            orgs[e["email"]].add(e["organization_name"] or "")
+    labels = []
+    for e in events:
+        email = e["email"]
+        if not email:
+            labels.append(e["account_uuid"])
+        elif len(orgs[email]) > 1 and e["organization_name"]:
+            labels.append(f"{email} ({e['organization_name']})")
+        else:
+            labels.append(email)
+    return labels
+
+
+def _account_description(identity: dict) -> str:
+    """One account identity on a line, for a prompt rather than a table cell.
+
+    Deliberately not _account_labels: that decides between bare and
+    org-qualified by looking at the whole log, and a confirmation prompt should
+    name the organization every time — it is half of what the user is being
+    asked to confirm.
+    """
+    who = identity["email"] or identity["account_uuid"]
+    org = identity["organization_name"]
+    return f"{who} ({org})" if org else who
+
+
+def _same_account(a: dict, b: dict) -> bool:
+    """Whether two account rows name the same account, ignoring when each was
+    written. Compared on the stored identity rather than on the rendered
+    description, which collapses two uuids that happen to share an address."""
+    return {k: v for k, v in a.items() if k != "ts"} == {
+        k: v for k, v in b.items() if k != "ts"
+    }
+
+
+class AccountTimeline:
+    """Which Claude account was signed in at a given moment.
+
+    Built from the append-only account_events log the statusline writes. The
+    log holds wall-clock capture times as epoch seconds, and a record's
+    timestamp is timezone-aware, so both sides of the lookup compare as epochs
+    and neither depends on the local zone.
+    """
+
+    def __init__(self, events: list[dict]) -> None:
+        self._ts = [e["ts"] for e in events]
+        self._labels = _account_labels(events)
+
+    def label_at(self, when: datetime) -> str:
+        """The account in force at *when*: the newest event at or before it.
+
+        A record older than the first captured event is "unknown" rather than
+        the oldest known account — the log starts when capture was switched on,
+        and what ran before it is genuinely not recorded anywhere.
+        """
+        i = bisect.bisect_right(self._ts, when.timestamp())
+        return self._labels[i - 1] if i else UNKNOWN_ACCOUNT
+
+
 @dataclass
 class TokenCounts:
     input: int = 0
@@ -220,6 +304,12 @@ class UsageRecord:
     dedup_key: str | None = None  # message_id:request_id for deduplication
     cwd: str | None = None  # original cwd from JSONL; lets future migrations re-derive project
     repo: str | None = None  # normalized git remote captured at parse time (durable identity)
+    account: str = UNKNOWN_ACCOUNT
+    """Which Claude account this was billed to, assigned by _keep from the
+    account_events timeline. Attribution is read-time on purpose: it is not
+    parsed from the log (which never names an account) and not written to the
+    record cache, so a change log that grows a missing event fixes every past
+    report on the next run instead of needing a re-parse."""
     _cost: float | None = field(default=None, repr=False, compare=False)
     """Memo for cost(). Deliberately not cost_usd: that field means 'the log gave
     us this' and is what _serialize_records writes to the SQLite cache, so a
@@ -511,26 +601,33 @@ def _keep(
     since: datetime | None,
     until: datetime | None,
     project_filter: str | None,
+    account_filter: str | None,
     seen_keys: set[str],
     override: "Callable[[str | None, str | None, str], str] | None",
+    accounts: "AccountTimeline | None",
 ) -> bool:
     """Whether this record belongs in the report.
 
-    Two side effects, both deliberate: the override renames *rec*'s project
-    before the filter sees it, and a first-seen dedup key is added to
-    *seen_keys*. Live and purged-file records go through this one copy, so a
-    filter added here cannot silently miss the older half of the corpus.
+    Three side effects, all deliberate: the override renames *rec*'s project
+    and the timeline stamps its account, both before the matching filter sees
+    them, and a first-seen dedup key is added to *seen_keys*. Live and
+    purged-file records go through this one copy, so a filter added here cannot
+    silently miss the older half of the corpus.
 
     The dedup key is pricing.dedup_identity, shared with the cost readers so
     the two cannot drift on which records are the same message.
     """
     if override:
         rec.project = override(rec.repo, rec.cwd, rec.project)
+    if accounts is not None:
+        rec.account = accounts.label_at(rec.timestamp)
     if since and rec.timestamp < since:
         return False
     if until and rec.timestamp > until:
         return False
     if project_filter and project_filter.lower() not in rec.project.lower():
+        return False
+    if account_filter and account_filter.lower() not in rec.account.lower():
         return False
     key = dedup_identity(
         rec.dedup_key, rec.message_id, rec.session_id,
@@ -549,6 +646,7 @@ def load_all_records(
     since: datetime | None = None,
     until: datetime | None = None,
     project_filter: str | None = None,
+    account_filter: str | None = None,
 ) -> list[UsageRecord]:
     """Load and deduplicate all usage records.
 
@@ -561,7 +659,11 @@ def load_all_records(
     seen_keys: set[str] = set()
     filters = {
         "since": since, "until": until, "project_filter": project_filter,
+        "account_filter": account_filter,
         "seen_keys": seen_keys, "override": _build_override_fn(),
+        # One read of the change log for the run; every record is stamped from
+        # it, cached and freshly parsed alike.
+        "accounts": AccountTimeline(load_account_events()),
     }
     all_records: list[UsageRecord] = []
     live_paths: set[str] = set()
@@ -1030,6 +1132,52 @@ def report_project(records: list[UsageRecord], limit: int | None = 20, *, nok: N
     _print_report(table)
 
 
+def report_account(records: list[UsageRecord], *, nok: NokCtx) -> None:
+    """Print per-account usage report.
+
+    No --limit knob, unlike the project report: an account is a login, so a
+    machine has two or three and there is nothing to cut off.
+    """
+    narrow = _is_narrow()
+    buckets = _bucket_by(records, lambda r: r.account, nok)
+    sorted_accounts = sorted(buckets, key=lambda a: buckets[a].cost, reverse=True)
+
+    table = _make_report_table(
+        f"Accounts ({len(sorted_accounts)})", "Account",
+        narrow=narrow, compact=True, label_style="green", nok=nok,
+    )
+
+    total_cost = sum(buckets[a].cost for a in sorted_accounts)
+    total_agg = AggBucket()
+    for account in sorted_accounts:
+        b = buckets[account]
+        row = [account, *_token_row(b, total_cost, compact=True, narrow=narrow, nok=nok)]
+        if not narrow:
+            row.append(_models_cell(b.models))
+        table.add_row(*row)
+        total_agg += b
+
+    _add_summary_rows(table, total_agg, len(sorted_accounts), narrow=narrow,
+                      compact=True, avg_label="per account", nok=nok)
+
+    _print_report(table)
+
+
+def _accounts_worth_showing(records: list[UsageRecord]) -> bool:
+    """Whether the default run should append the per-account table.
+
+    Two or more real accounts means the split says something no other table
+    does. One says only what the TOTAL row of every other table already said,
+    and none says less than that. UNKNOWN_ACCOUNT does not count towards the
+    two: a single account beside its own pre-capture history is one account's
+    costs drawn twice, and `ccreport adopt` exists to merge exactly that pair.
+
+    Only about what an unasked-for run volunteers — `ccreport account` prints
+    regardless, which is where someone goes to see the unknown split.
+    """
+    return len({r.account for r in records if r.account != UNKNOWN_ACCOUNT}) > 1
+
+
 def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: NokCtx) -> None:
     """Print per-session usage report."""
     narrow = _is_narrow()
@@ -1167,6 +1315,7 @@ def report_json(records: list[UsageRecord], *, nok: NokCtx) -> None:
             "timestamp": rec.timestamp.isoformat(),
             "session_id": rec.session_id,
             "project": rec.project,
+            "account": rec.account,
             "input_tokens": rec.tokens.input,
             "output_tokens": rec.tokens.output,
             "cache_creation_tokens": rec.tokens.cache_create,
@@ -1238,6 +1387,91 @@ def cmd_overrides(args) -> None:
         print(f"  {kind}{r['match_value']:<{width}}  ->  {r['target']}")
 
 
+def _confirm(question: str) -> bool:
+    """Ask *question* on stdin. Anything but an explicit yes is a no.
+
+    A closed or non-interactive stdin answers no rather than raising: a run
+    that meant to go through unattended has --yes to say so.
+    """
+    try:
+        answer = input(f"{question} [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _pre_capture_records(
+    records: list[UsageRecord], events: list[dict],
+) -> list[UsageRecord]:
+    """The records an adoption row covers: those older than the first capture.
+
+    Not "the records currently reporting as unknown", which is the same set
+    only until the first adoption and reads as empty afterwards — so a preview
+    built on it would tell a user re-adopting that there is nothing to adopt.
+    """
+    captures = [e["ts"] for e in events if e["ts"] > ADOPTED_TS]
+    if not captures:
+        return []
+    first = min(captures)
+    return [r for r in records if r.timestamp.timestamp() < first]
+
+
+def cmd_adopt(args) -> None:
+    """Attribute the history that predates account capture, or undo that.
+
+    One backdated row does the whole job, because attribution takes the newest
+    event at or before each record: an event older than every record is the one
+    every otherwise-unattributed record lands on. Nothing is rewritten, no
+    record cache is invalidated, and undoing it is a single DELETE.
+    """
+    if args.remove:
+        if clear_adopted_account():
+            print(f"Removed. Pre-capture history reads as {UNKNOWN_ACCOUNT!r} again.")
+        else:
+            print("Nothing to remove: pre-capture history is not adopted.")
+        return
+
+    identity = read_latest_account()
+    if identity is None:
+        print(
+            "No account has been captured yet, so there is nothing to adopt "
+            "history under.\n"
+            "The status line records the signed-in account on its next render; "
+            "try again after that.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    existing = read_adopted_account()
+    if existing is not None and _same_account(existing, identity):
+        print(f"Pre-capture history is already adopted under "
+              f"{_account_description(existing)}.")
+        return
+
+    records = load_all_records()
+    covered = _pre_capture_records(records, load_account_events())
+    cost = sum(record_cost(r) for r in covered)
+
+    if not covered:
+        print("No records predate the first captured account; nothing to adopt.")
+        return
+
+    if existing is not None:
+        print(f"Currently adopted under {_account_description(existing)}.")
+    print(
+        f"Adopt {len(covered)} record(s) ({fmt_cost(cost)}) predating account "
+        f"capture\n  under {_account_description(identity)}"
+    )
+    if not args.yes and not _confirm("Proceed?"):
+        print("Aborted.")
+        return
+
+    set_adopted_account(identity)
+    print(f"Adopted. Those records now report as {_account_description(identity)}.")
+    print("Undo with: ccreport adopt --remove")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Analyze Claude Code token usage and costs from local JSONL logs.",
@@ -1246,16 +1480,20 @@ def main() -> None:
                "  ccusage.py daily --since 20260201\n"
                "  ccusage.py monthly\n"
                "  ccusage.py session --limit 10\n"
-               "  ccusage.py daily --breakdown --project myapp\n",
+               "  ccusage.py daily --breakdown --project myapp\n"
+               "  ccusage.py account\n"
+               "  ccusage.py monthly --account personal@example.com\n"
+               "  ccusage.py adopt            # claim pre-capture history\n",
     )
     sub = parser.add_subparsers(dest="command", help="Report type")
 
     # Common args
-    for name in ["daily", "monthly", "project", "session"]:
+    for name in ["daily", "monthly", "project", "session", "account"]:
         p = sub.add_parser(name)
         p.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--project", "-p", help="Filter by project name (substring match)")
+        p.add_argument("--account", "-a", help="Filter by account email (substring match)")
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         p.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
         if name == "daily":
@@ -1278,10 +1516,20 @@ def main() -> None:
     pu.add_argument("--kind", choices=["name", "remote", "cwd_prefix"],
                     help="Restrict removal to this match kind")
 
-    # Default: show all three reports
+    # Claim the history that predates account capture (stored locally, like the
+    # override rules above).
+    pad = sub.add_parser(
+        "adopt", help="Attribute pre-capture history to the signed-in account")
+    pad.add_argument("--remove", action="store_true",
+                     help=f"Undo it; that history reads as {UNKNOWN_ACCOUNT!r} again")
+    pad.add_argument("--yes", "-y", action="store_true",
+                     help="Skip the confirmation prompt")
+
+    # Default (no subcommand): every report, the account table conditionally.
     parser.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--project", "-p", help="Filter by project name")
+    parser.add_argument("--account", "-a", help="Filter by account email")
     parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
     parser.add_argument("--models", "-m", action="store_true",
@@ -1292,14 +1540,24 @@ def main() -> None:
     if args.command in ("overrides", "merge", "unmerge"):
         cmd_overrides(args)
         return
+    # Unlike the three above, this one loads records — its preview counts what
+    # the adoption would cover — so it runs itself rather than falling through
+    # to the report path, which would want a report to print.
+    if args.command == "adopt":
+        cmd_adopt(args)
+        return
 
     mva = not args.no_mva
 
     since = parse_date(args.since) if args.since else None
     until = parse_date(args.until) if args.until else None
     project_filter = args.project if hasattr(args, "project") else None
+    account_filter = args.account if hasattr(args, "account") else None
 
-    records = load_all_records(since=since, until=until, project_filter=project_filter)
+    records = load_all_records(
+        since=since, until=until,
+        project_filter=project_filter, account_filter=account_filter,
+    )
 
     if not records:
         print("No usage records found.", file=sys.stderr)
@@ -1327,12 +1585,19 @@ def main() -> None:
     elif command == "session":
         lim = args.limit if args.limit != 0 else None
         report_session(records, limit=lim, nok=nok)
+    elif command == "account":
+        report_account(records, nok=nok)
     else:
         # No subcommand: show daily + monthly summary
         report_daily(records, breakdown=args.models, nok=nok)
         report_monthly(records, nok=nok)
         report_project(records, nok=nok)
         report_session(records, nok=nok)
+        # Trails the rest, and only once there is a split to show. Decided from
+        # the records already in hand, so a single-account machine — which is
+        # most of them — pays nothing for the check.
+        if _accounts_worth_showing(records):
+            report_account(records, nok=nok)
 
 
 if __name__ == "__main__":

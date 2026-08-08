@@ -44,9 +44,20 @@ def _rec(**kw):
 
 
 def _filters(**kw):
-    base = dict(since=None, until=None, project_filter=None,
-                seen_keys=set(), override=None)
+    base = dict(since=None, until=None, project_filter=None, account_filter=None,
+                seen_keys=set(), override=None, accounts=None)
     return {**base, **kw}
+
+
+def _timeline(*events):
+    """An AccountTimeline from (epoch, email, org) triples, uuid derived."""
+    return ccr.AccountTimeline([
+        {
+            "ts": ts, "account_uuid": f"uuid-{email or 'none'}", "email": email,
+            "organization_uuid": None, "organization_name": org,
+        }
+        for ts, email, org in events
+    ])
 
 
 class TestKeep:
@@ -514,3 +525,512 @@ class TestAggregationAndRows:
         assert len(table.rows) == 1
         for column in table.columns:
             assert len(column._cells) == 1, f"{column.header} has no cell in the row"
+
+
+class TestAccountTimeline:
+    """Attribution is a lookup back from a record's time into the change log."""
+
+    def test_a_record_before_the_first_event_is_unknown(self):
+        tl = _timeline((1000.0, "me@work.example", "Work AS"))
+        before = dt.datetime.fromtimestamp(999.0, UTC)
+        assert tl.label_at(before) == ccr.UNKNOWN_ACCOUNT
+
+    def test_an_empty_log_makes_everything_unknown(self):
+        assert _timeline().label_at(_rec().timestamp) == ccr.UNKNOWN_ACCOUNT
+
+    def test_a_record_at_the_event_itself_belongs_to_it(self):
+        tl = _timeline((1000.0, "me@work.example", "Work AS"))
+        assert tl.label_at(dt.datetime.fromtimestamp(1000.0, UTC)) == "me@work.example"
+
+    def test_records_land_on_the_account_in_force_when_written(self):
+        tl = _timeline(
+            (1000.0, "me@work.example", "Work AS"),
+            (2000.0, "me@home.example", "Personal"),
+        )
+        at = lambda ts: tl.label_at(dt.datetime.fromtimestamp(ts, UTC))  # noqa: E731
+        assert at(1500.0) == "me@work.example"
+        assert at(2500.0) == "me@home.example"
+
+    def test_the_lookup_is_zone_independent(self):
+        """The log holds epochs; a record's timestamp is aware, so both agree."""
+        tl = _timeline((1000.0, "me@work.example", "Work AS"))
+        oslo = dt.timezone(dt.timedelta(hours=2))
+        assert tl.label_at(dt.datetime.fromtimestamp(1500.0, oslo)) == "me@work.example"
+        assert tl.label_at(dt.datetime.fromtimestamp(500.0, oslo)) == ccr.UNKNOWN_ACCOUNT
+
+    def test_one_email_under_two_orgs_is_two_labels(self):
+        tl = _timeline(
+            (1000.0, "me@example.com", "Work AS"),
+            (2000.0, "me@example.com", "Personal"),
+        )
+        at = lambda ts: tl.label_at(dt.datetime.fromtimestamp(ts, UTC))  # noqa: E731
+        assert at(1500.0) == "me@example.com (Work AS)"
+        assert at(2500.0) == "me@example.com (Personal)"
+
+    def test_one_email_under_one_org_stays_bare(self):
+        tl = _timeline(
+            (1000.0, "me@example.com", "Work AS"),
+            (2000.0, "you@example.com", "Work AS"),
+        )
+        assert tl.label_at(dt.datetime.fromtimestamp(1500.0, UTC)) == "me@example.com"
+
+    def test_an_event_with_no_email_falls_back_to_its_uuid(self):
+        tl = _timeline((1000.0, None, None))
+        assert tl.label_at(dt.datetime.fromtimestamp(1500.0, UTC)) == "uuid-none"
+
+
+class TestKeepAttributesAccounts:
+    """The stamp and the --account filter share _keep with every other filter."""
+
+    def _tl(self):
+        return _timeline(
+            (1000.0, "me@work.example", "Work AS"),
+            (2000.0, "me@home.example", "Personal"),
+        )
+
+    def _at(self, ts):
+        return _rec(timestamp=dt.datetime.fromtimestamp(ts, UTC))
+
+    def test_no_timeline_leaves_the_default_alone(self):
+        rec = self._at(1500.0)
+        assert ccr._keep(rec, **_filters()) is True
+        assert rec.account == ccr.UNKNOWN_ACCOUNT
+
+    def test_the_record_is_stamped_before_it_is_returned(self):
+        rec = self._at(1500.0)
+        assert ccr._keep(rec, **_filters(accounts=self._tl())) is True
+        assert rec.account == "me@work.example"
+
+    def test_the_filter_is_a_case_insensitive_substring(self):
+        f = dict(accounts=self._tl(), account_filter="WORK")
+        assert ccr._keep(self._at(1500.0), **_filters(**f)) is True
+        assert ccr._keep(self._at(2500.0), **_filters(**f)) is False
+
+    def test_records_predating_the_log_match_the_unknown_bucket(self):
+        f = _filters(accounts=self._tl(), account_filter="unknown")
+        assert ccr._keep(self._at(500.0), **f) is True
+
+    def test_the_stamp_lands_before_the_filter_runs(self):
+        """Same ordering rule as the project override: rename, then match."""
+        rec = self._at(2500.0)
+        assert ccr._keep(rec, **_filters(accounts=self._tl(),
+                                         account_filter="home")) is True
+        assert rec.account == "me@home.example"
+
+
+class TestAccountAttributionEndToEnd:
+    """Attribution is read-time: no re-parse, and the cached half is stamped too."""
+
+    def _log(self, *events):
+        for ts, uuid, email in events:
+            cache_db.record_account_event(
+                {"accountUuid": uuid, "emailAddress": email,
+                 "organizationName": "Org"},
+                now=ts,
+            )
+
+    def _epoch(self, iso: str) -> float:
+        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    def test_a_mid_session_switch_splits_one_session_file(self, loader):
+        """/login mid-session is the case the change log exists for."""
+        _write_jsonl(loader / "a.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-1"])
+        _write_jsonl(loader / "b.jsonl", when="2026-06-15T14:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-2"])
+        self._log(
+            (self._epoch("2026-06-15T09:00:00Z"), "u-work", "me@work.example"),
+            (self._epoch("2026-06-15T12:00:00Z"), "u-home", "me@home.example"),
+        )
+        by_id = {r.message_id: r.account for r in ccr.load_all_records()}
+        assert by_id == {"msg-1": "me@work.example", "msg-2": "me@home.example"}
+
+    def test_records_older_than_the_log_report_as_unknown(self, loader):
+        _write_jsonl(loader / "a.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-1"])
+        self._log((self._epoch("2026-06-16T00:00:00Z"), "u-work", "me@work.example"))
+        assert [r.account for r in ccr.load_all_records()] == [ccr.UNKNOWN_ACCOUNT]
+
+    def test_a_later_event_re_attributes_without_a_re_parse(self, loader):
+        """Nothing is frozen at parse time, so the cached second run agrees."""
+        _write_jsonl(loader / "a.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-1"])
+        assert [r.account for r in ccr.load_all_records()] == [ccr.UNKNOWN_ACCOUNT]
+        self._log((self._epoch("2026-06-15T09:00:00Z"), "u-work", "me@work.example"))
+        assert [r.account for r in ccr.load_all_records()] == ["me@work.example"]
+
+    def test_the_account_filter_drops_the_other_account(self, loader):
+        _write_jsonl(loader / "a.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-1"])
+        _write_jsonl(loader / "b.jsonl", when="2026-06-15T14:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-2"])
+        self._log(
+            (self._epoch("2026-06-15T09:00:00Z"), "u-work", "me@work.example"),
+            (self._epoch("2026-06-15T12:00:00Z"), "u-home", "me@home.example"),
+        )
+        kept = ccr.load_all_records(account_filter="home")
+        assert [r.message_id for r in kept] == ["msg-2"]
+
+    def test_the_serialized_cache_carries_no_account(self, loader):
+        """Adding one would mean a CACHE_VERSION bump and a corpus re-parse."""
+        _write_jsonl(loader / "a.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-1"])
+        self._log((self._epoch("2026-06-15T09:00:00Z"), "u-work", "me@work.example"))
+        records = ccr.load_all_records()
+        assert records[0].account == "me@work.example"
+        assert "account" not in ccr._serialize_records(records)[0]
+
+
+class TestReportAccount:
+    """The table is report_project's shape, bucketed by account."""
+
+    def _render(self, records, width=200):
+        buf = io.StringIO()
+        ccr.console = Console(file=buf, width=width, no_color=True)
+        ccr.report_account(records, nok=ccr.NokCtx())
+        return buf.getvalue()
+
+    def test_each_account_gets_a_row_and_a_total(self):
+        out = self._render([
+            _rec(account="me@work.example", cost_usd=3.0, message_id="m1"),
+            _rec(account="me@home.example", cost_usd=1.0, message_id="m2"),
+        ])
+        assert "Accounts (2)" in out
+        assert "me@work.example" in out
+        assert "me@home.example" in out
+        assert "TOTAL" in out
+        # Priciest first, same as the project report.
+        assert out.index("me@work.example") < out.index("me@home.example")
+
+    def test_unattributed_records_get_their_own_bucket(self):
+        out = self._render([_rec(), _rec(account="me@work.example", message_id="m2")])
+        assert ccr.UNKNOWN_ACCOUNT in out
+
+    @pytest.mark.parametrize("width", [200, 90])
+    @pytest.mark.parametrize("rates", [{}, {"2026-06-15": 10.0}])
+    def test_every_column_gets_a_cell_in_every_row(self, monkeypatch, width, rates):
+        """Same derived-padding contract the other reports are held to."""
+        buf = io.StringIO()
+        ccr.console = Console(file=buf, width=width, no_color=True)
+        tables = []
+        monkeypatch.setattr(ccr, "_print_report", tables.append)
+        ccr.report_account(
+            [_rec(account="me@work.example", message_id="m1"),
+             _rec(account="me@home.example", message_id="m2")],
+            nok=ccr.NokCtx(rates, "2026-06-15", True),
+        )
+        (table,) = tables
+        # Two account rows, TOTAL, AVERAGE.
+        assert len(table.rows) == 4
+        for column in table.columns:
+            assert len(column._cells) == 4, f"{column.header} is short a cell"
+
+
+class TestConfirm:
+    """Anything but an explicit yes is a no."""
+
+    @pytest.mark.parametrize(("answer", "expected"), [
+        ("y", True), ("Y", True), ("yes", True), ("  YES  ", True),
+        ("", False), ("n", False), ("no", False), ("sure", False), ("yy", False),
+    ])
+    def test_only_yes_is_yes(self, monkeypatch, answer, expected):
+        monkeypatch.setattr("builtins.input", lambda _p: answer)
+        assert ccr._confirm("Proceed?") is expected
+
+    @pytest.mark.parametrize("err", [EOFError, KeyboardInterrupt])
+    def test_a_closed_stdin_answers_no(self, monkeypatch, err):
+        def _raise(_p):
+            raise err
+
+        monkeypatch.setattr("builtins.input", _raise)
+        assert ccr._confirm("Proceed?") is False
+
+
+class TestAdopt:
+    """One backdated row claims every record older than the first capture."""
+
+    @pytest.fixture(autouse=True)
+    def _never_prompts_by_accident(self, monkeypatch):
+        """A test that reaches the prompt is a test that would hang in CI."""
+        def _boom(_p):
+            raise AssertionError("cmd_adopt asked for confirmation unexpectedly")
+
+        monkeypatch.setattr("builtins.input", _boom)
+
+    def _args(self, **kw):
+        return types.SimpleNamespace(**{"remove": False, "yes": True, **kw})
+
+    def _epoch(self, iso: str) -> float:
+        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    def _capture(self, ts: float, uuid: str, email: str, org: str = "Org"):
+        cache_db.record_account_event(
+            {"accountUuid": uuid, "emailAddress": email, "organizationName": org},
+            now=ts,
+        )
+
+    def _corpus(self, loader):
+        """One record before the first capture and one after it."""
+        _write_jsonl(loader / "old.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-old"])
+        _write_jsonl(loader / "new.jsonl", when="2026-06-15T14:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-new"])
+        self._capture(self._epoch("2026-06-15T12:00:00Z"), "u-work", "me@work.example")
+
+    def _accounts(self):
+        return {r.message_id: r.account for r in ccr.load_all_records()}
+
+    def test_pre_capture_records_are_claimed_and_later_ones_are_not(self, loader, capsys):
+        self._corpus(loader)
+        assert self._accounts() == {
+            "msg-old": ccr.UNKNOWN_ACCOUNT, "msg-new": "me@work.example",
+        }
+        ccr.cmd_adopt(self._args())
+        capsys.readouterr()
+        assert self._accounts() == {
+            "msg-old": "me@work.example", "msg-new": "me@work.example",
+        }
+
+    def test_the_claim_only_reaches_back_and_never_overrides_an_event(self, loader, capsys):
+        """Every capture keeps its own span; the adoption gets what is left."""
+        self._corpus(loader)  # msg-old 10:00, msg-new 14:00, u-work captured 12:00
+        _write_jsonl(loader / "later.jsonl", when="2026-06-15T18:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-later"])
+        self._capture(self._epoch("2026-06-15T16:00:00Z"), "u-home", "me@home.example")
+        ccr.cmd_adopt(self._args())  # copies u-home, the newest capture
+        capsys.readouterr()
+        assert self._accounts() == {
+            "msg-old": "me@home.example",    # pre-capture: the adoption
+            "msg-new": "me@work.example",    # between the two captures
+            "msg-later": "me@home.example",  # after the switch
+        }
+
+    def test_remove_restores_unknown(self, loader, capsys):
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args())
+        ccr.cmd_adopt(self._args(remove=True))
+        assert "Removed" in capsys.readouterr().out
+        assert self._accounts()["msg-old"] == ccr.UNKNOWN_ACCOUNT
+
+    def test_remove_is_idempotent_and_exits_zero(self, loader, capsys):
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args(remove=True))  # must not raise SystemExit
+        assert "Nothing to remove" in capsys.readouterr().out
+
+    def test_an_empty_capture_log_is_refused(self, loader, capsys):
+        _write_jsonl(loader / "old.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-old"])
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_adopt(self._args())
+        assert exc.value.code == 1
+        assert "No account has been captured yet" in capsys.readouterr().err
+
+    def test_an_adoption_alone_does_not_count_as_a_capture(self, loader, capsys):
+        """Otherwise an adoption could re-adopt itself out of thin air."""
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args())
+        capsys.readouterr()
+        cache_db.get_connection().execute("DELETE FROM account_events WHERE ts > 0")
+        with pytest.raises(SystemExit):
+            ccr.cmd_adopt(self._args())
+
+    def test_re_adopting_the_same_account_is_a_no_op(self, loader, capsys):
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args())
+        capsys.readouterr()
+        ccr.cmd_adopt(self._args())
+        assert "already adopted" in capsys.readouterr().out
+
+    def test_a_new_capture_replaces_the_existing_adoption(self, loader, capsys):
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args())
+        capsys.readouterr()
+        self._capture(self._epoch("2026-06-15T16:00:00Z"), "u-home", "me@home.example")
+        ccr.cmd_adopt(self._args())
+        out = capsys.readouterr().out
+        assert "Currently adopted under me@work.example (Org)" in out
+        assert cache_db.read_adopted_account()["email"] == "me@home.example"
+        assert self._accounts()["msg-old"] == "me@home.example"
+
+    def test_the_preview_still_counts_the_covered_records_when_replacing(
+        self, loader, capsys,
+    ):
+        """A count of the current 'unknown' bucket would read as zero here."""
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args())
+        capsys.readouterr()
+        self._capture(self._epoch("2026-06-15T16:00:00Z"), "u-home", "me@home.example")
+        ccr.cmd_adopt(self._args())
+        assert "Adopt 1 record(s)" in capsys.readouterr().out
+
+    def test_nothing_older_than_the_first_capture_means_nothing_to_adopt(
+        self, loader, capsys,
+    ):
+        _write_jsonl(loader / "new.jsonl", when="2026-06-15T14:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-new"])
+        self._capture(self._epoch("2026-06-15T12:00:00Z"), "u-work", "me@work.example")
+        ccr.cmd_adopt(self._args())
+        assert "nothing to adopt" in capsys.readouterr().out
+        assert cache_db.read_adopted_account() is None
+
+    def test_the_preview_names_the_account_and_the_cost(self, loader, capsys):
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args())
+        out = capsys.readouterr().out
+        assert "Adopt 1 record(s) ($1.00) predating account capture" in out
+        assert "under me@work.example (Org)" in out
+
+    def test_declining_the_prompt_writes_nothing(self, loader, monkeypatch, capsys):
+        self._corpus(loader)
+        monkeypatch.setattr("builtins.input", lambda _p: "n")
+        ccr.cmd_adopt(self._args(yes=False))
+        assert "Aborted." in capsys.readouterr().out
+        assert cache_db.read_adopted_account() is None
+
+    def test_accepting_the_prompt_writes(self, loader, monkeypatch, capsys):
+        self._corpus(loader)
+        monkeypatch.setattr("builtins.input", lambda _p: "y")
+        ccr.cmd_adopt(self._args(yes=False))
+        capsys.readouterr()
+        assert cache_db.read_adopted_account()["email"] == "me@work.example"
+
+    def test_remove_never_prompts(self, loader, capsys):
+        """The autouse fixture makes a stray prompt an error, not a hang."""
+        self._corpus(loader)
+        ccr.cmd_adopt(self._args())
+        capsys.readouterr()
+        ccr.cmd_adopt(self._args(remove=True, yes=False))
+        assert "Removed" in capsys.readouterr().out
+
+
+class TestPreCaptureRecords:
+    """The preview's record set, independent of whether an adoption exists."""
+
+    def _events(self, *ts):
+        return [{"ts": t, "account_uuid": "u", "email": "e",
+                 "organization_uuid": None, "organization_name": None} for t in ts]
+
+    def _at(self, ts):
+        return _rec(timestamp=dt.datetime.fromtimestamp(ts, UTC))
+
+    def test_no_capture_covers_nothing(self):
+        """With only an adoption row there is no boundary to be older than."""
+        recs = [self._at(500.0)]
+        assert ccr._pre_capture_records(recs, self._events(ccr.ADOPTED_TS)) == []
+        assert ccr._pre_capture_records(recs, []) == []
+
+    def test_the_boundary_is_the_first_capture_not_the_adoption(self):
+        recs = [self._at(500.0), self._at(1500.0)]
+        events = self._events(ccr.ADOPTED_TS, 1000.0, 2000.0)
+        covered = ccr._pre_capture_records(recs, events)
+        assert [r.timestamp.timestamp() for r in covered] == [500.0]
+
+    def test_a_record_at_the_capture_belongs_to_the_capture(self):
+        recs = [self._at(1000.0)]
+        assert ccr._pre_capture_records(recs, self._events(1000.0)) == []
+
+
+class TestSameAccount:
+    """Identity, not the rendered description, decides whether to replace."""
+
+    def _row(self, **kw):
+        base = {"ts": 0.0, "account_uuid": "u1", "email": "me@example.com",
+                "organization_uuid": "o1", "organization_name": "Org"}
+        return {**base, **kw}
+
+    def test_the_capture_time_is_not_part_of_the_identity(self):
+        assert ccr._same_account(self._row(ts=0.0), self._row(ts=500.0)) is True
+
+    def test_a_different_uuid_behind_the_same_address_is_a_different_account(self):
+        """Both render as 'me@example.com (Org)'; only the identity separates them."""
+        other = self._row(account_uuid="u2")
+        assert ccr._account_description(other) == ccr._account_description(self._row())
+        assert ccr._same_account(self._row(), other) is False
+
+    @pytest.mark.parametrize("field", [
+        "account_uuid", "email", "organization_uuid", "organization_name",
+    ])
+    def test_every_stored_field_counts(self, field):
+        assert ccr._same_account(self._row(), self._row(**{field: "changed"})) is False
+
+
+class TestAccountsWorthShowing:
+    """The default run volunteers the account table only when it says something."""
+
+    def _recs(self, *accounts):
+        return [_rec(account=a, message_id=f"m{i}") for i, a in enumerate(accounts)]
+
+    def test_no_records_show_nothing(self):
+        assert ccr._accounts_worth_showing([]) is False
+
+    def test_one_account_is_the_total_row_again(self):
+        assert ccr._accounts_worth_showing(self._recs("me@work.example")) is False
+
+    def test_two_accounts_are_worth_a_table(self):
+        recs = self._recs("me@work.example", "me@home.example")
+        assert ccr._accounts_worth_showing(recs) is True
+
+    def test_only_unknown_is_not_an_account(self):
+        recs = self._recs(ccr.UNKNOWN_ACCOUNT, ccr.UNKNOWN_ACCOUNT)
+        assert ccr._accounts_worth_showing(recs) is False
+
+    def test_one_account_beside_its_own_unknown_history_stays_hidden(self):
+        """That pair is one account drawn twice; adopt is what merges it."""
+        recs = self._recs(ccr.UNKNOWN_ACCOUNT, "me@work.example")
+        assert ccr._accounts_worth_showing(recs) is False
+
+    def test_unknown_never_makes_up_the_second_account(self):
+        recs = self._recs(ccr.UNKNOWN_ACCOUNT, "me@work.example", "me@home.example")
+        assert ccr._accounts_worth_showing(recs) is True
+
+    def test_repeats_of_one_account_are_still_one_account(self):
+        recs = self._recs(*["me@work.example"] * 20)
+        assert ccr._accounts_worth_showing(recs) is False
+
+
+class TestDefaultReportDispatch:
+    """What a bare `ccreport` prints, and in what order."""
+
+    @pytest.fixture()
+    def run(self, monkeypatch):
+        """Run main() over *accounts*, returning the reports it called."""
+        def _run(*accounts, argv=("ccreport.py",)):
+            records = [
+                _rec(account=a, message_id=f"m{i}") for i, a in enumerate(accounts)
+            ]
+            called: list[str] = []
+            monkeypatch.setattr(ccr, "load_all_records", lambda **_kw: records)
+            monkeypatch.setattr(
+                ccr, "load_rates_for_records", lambda _r, **_kw: (ccr.NokCtx(), True))
+            for name in ("daily", "monthly", "project", "session", "account"):
+                monkeypatch.setattr(
+                    ccr, f"report_{name}",
+                    lambda *_a, _n=name, **_kw: called.append(_n),
+                )
+            monkeypatch.setattr(ccr.sys, "argv", list(argv))
+            ccr.main()
+            return called
+
+        return _run
+
+    def test_one_account_prints_the_original_four(self, run):
+        assert run("me@work.example") == ["daily", "monthly", "project", "session"]
+
+    def test_two_accounts_append_the_table_last(self, run):
+        assert run("me@work.example", "me@home.example") == [
+            "daily", "monthly", "project", "session", "account",
+        ]
+
+    def test_unknown_beside_one_account_still_prints_four(self, run):
+        assert run(ccr.UNKNOWN_ACCOUNT, "me@work.example") == [
+            "daily", "monthly", "project", "session",
+        ]
+
+    def test_the_subcommand_is_unconditional(self, run):
+        """One account, explicitly asked for: still printed."""
+        assert run("me@work.example", argv=("ccreport.py", "account")) == ["account"]
+
+    def test_the_subcommand_prints_only_itself(self, run):
+        called = run("me@work.example", "me@home.example",
+                     argv=("ccreport.py", "account"))
+        assert called == ["account"]

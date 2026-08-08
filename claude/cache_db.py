@@ -42,7 +42,7 @@ _conn: sqlite3.Connection | None = None
 # BUMP THIS on any change to _SCHEMA_SQL, _ADDED_COLUMNS, or the migration list
 # in _run_migrations — an existing DB is otherwise never reopened on the slow
 # path and never sees the new DDL. A needless bump costs one slow open per DB.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -171,6 +171,20 @@ CREATE TABLE IF NOT EXISTS extra_usage_snapshots (
 CREATE TABLE IF NOT EXISTS exchange_rates (
     date  TEXT PRIMARY KEY,
     rate  REAL NOT NULL
+) WITHOUT ROWID;
+
+-- Append-only log of which Claude account was signed in, and from when. A
+-- session JSONL carries no account field and ~/.claude.json holds only the
+-- current login, so this timeline is the only thing that can attribute a
+-- historic record to an account. A row is written when the account changes
+-- and never otherwise, so this stays a handful of rows for a machine's life.
+-- ts leads as the primary key: both readers want it ordered.
+CREATE TABLE IF NOT EXISTS account_events (
+    ts                REAL PRIMARY KEY,
+    account_uuid      TEXT NOT NULL,
+    email             TEXT,
+    organization_uuid TEXT,
+    organization_name TEXT
 ) WITHOUT ROWID;
 """
 
@@ -1780,6 +1794,163 @@ def delete_project_override(match_value: str, match_kind: str | None = None) -> 
         )
     conn.commit()
     return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Account change log
+# ---------------------------------------------------------------------------
+#
+# Four fields survive out of ~/.claude.json's oauthAccount blob: accountUuid is
+# the stable key, emailAddress the label a report shows, and the organization
+# pair is what separates the same address billing through work from the same
+# address billing personally. Nothing else there is kept — seatTier,
+# billingType, the role fields and displayName are either volatile or say more
+# about the person than a cost report needs.
+
+_ACCOUNT_COLS = ("account_uuid", "email", "organization_uuid", "organization_name")
+_ACCOUNT_SELECT = ", ".join(_ACCOUNT_COLS)
+
+# Timestamp of the one row `ccreport adopt` writes, which claims the history
+# that predates capture for an account. Zero because attribution takes the
+# newest event at or before a record: an event older than every record on the
+# machine is the one every otherwise-unattributed record lands on. It is a
+# claim, not a capture, and the readers below keep the two apart.
+ADOPTED_TS = 0.0
+
+# The oauthAccount keys behind _ACCOUNT_COLS, in the same order.
+_ACCOUNT_SOURCE_KEYS = (
+    "accountUuid", "emailAddress", "organizationUuid", "organizationName",
+)
+
+
+def _account_identity(oauth: dict[str, Any]) -> tuple[str | None, ...]:
+    """The persisted fields of an oauthAccount blob, in _ACCOUNT_COLS order.
+
+    Anything that is not a non-empty string reads as absent, so a JSON null or
+    a nested object in the config cannot reach the table as a value — and two
+    renders that disagree only in how a field was spelled as empty do not read
+    as an account change.
+    """
+    values: list[str | None] = []
+    for key in _ACCOUNT_SOURCE_KEYS:
+        val = oauth.get(key)
+        values.append(val if isinstance(val, str) and val else None)
+    return tuple(values)
+
+
+def _account_row_to_dict(row: tuple) -> dict[str, Any]:
+    """One account_events row as a dict: ts plus the four identity fields."""
+    return {"ts": row[0], **dict(zip(_ACCOUNT_COLS, row[1:], strict=True))}
+
+
+def record_account_event(
+    oauth: dict[str, Any], now: float | None = None,
+) -> bool:
+    """Append *oauth* to the change log if it differs from the newest row.
+
+    Returns whether a row was written. The caller is the statusline, on every
+    render, so the unchanged case — which is every render but the handful that
+    follow a /login — has to cost one SELECT and no write: ts is the primary
+    key of a WITHOUT ROWID table, making "newest" the first step of a reverse
+    key scan.
+
+    An oauthAccount with no accountUuid is dropped rather than stored under a
+    NULL key. Without it there is nothing stable to tell two accounts apart by,
+    and a row here is permanent history that no later render can correct.
+    """
+    identity = _account_identity(oauth)
+    if identity[0] is None:
+        return False
+    conn = get_connection()
+    row = conn.execute(
+        f"SELECT {_ACCOUNT_SELECT} FROM account_events "  # noqa: S608
+        "ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    if row is not None and tuple(row) == identity:
+        return False
+    # OR REPLACE covers only two changes landing inside one tick of time.time():
+    # that is the same instant, so the later reading is the one to keep.
+    conn.execute(
+        f"INSERT OR REPLACE INTO account_events (ts, {_ACCOUNT_SELECT}) "  # noqa: S608
+        "VALUES (?, ?, ?, ?, ?)",
+        (time.time() if now is None else now, *identity),
+    )
+    conn.commit()
+    return True
+
+
+def load_account_events() -> list[dict[str, Any]]:
+    """The whole account change log, oldest first.
+
+    ccreport reads this once per run and walks it to attribute each record to
+    the account in force when the record was written. The adoption row, when
+    there is one, is simply the oldest entry — attribution treats it like any
+    other event, which is the whole trick.
+    """
+    conn = get_connection()
+    return [
+        _account_row_to_dict(row)
+        for row in conn.execute(
+            f"SELECT ts, {_ACCOUNT_SELECT} FROM account_events ORDER BY ts"  # noqa: S608
+        )
+    ]
+
+
+def read_latest_account() -> dict[str, Any] | None:
+    """The most recently captured account, or None if none was ever captured.
+
+    Skips the adoption row. That row is a claim about history rather than a
+    reading of who is signed in, and this is what `ccreport adopt` copies to
+    build it — reading it back would let an adoption re-adopt itself and would
+    report an empty capture log as if a real account had been seen.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        f"SELECT ts, {_ACCOUNT_SELECT} FROM account_events "  # noqa: S608
+        "WHERE ts > ? ORDER BY ts DESC LIMIT 1",
+        (ADOPTED_TS,),
+    ).fetchone()
+    return _account_row_to_dict(row) if row else None
+
+
+def read_adopted_account() -> dict[str, Any] | None:
+    """The adoption row, or None when pre-capture history is left unattributed."""
+    conn = get_connection()
+    row = conn.execute(
+        f"SELECT ts, {_ACCOUNT_SELECT} FROM account_events WHERE ts = ?",  # noqa: S608
+        (ADOPTED_TS,),
+    ).fetchone()
+    return _account_row_to_dict(row) if row else None
+
+
+def set_adopted_account(account: dict[str, Any]) -> None:
+    """Point the adoption row at *account*, replacing any row already there.
+
+    *account* is keyed by _ACCOUNT_COLS — a row dict as the readers here hand
+    one back, not the camelCase oauthAccount blob record_account_event takes.
+    Unlike a capture this is meant to be overwritten: there is only ever one
+    such row, and re-adopting is how a user corrects it.
+    """
+    conn = get_connection()
+    conn.execute(
+        f"INSERT OR REPLACE INTO account_events (ts, {_ACCOUNT_SELECT}) "  # noqa: S608
+        "VALUES (?, ?, ?, ?, ?)",
+        (ADOPTED_TS, *(account[col] for col in _ACCOUNT_COLS)),
+    )
+    conn.commit()
+
+
+def clear_adopted_account() -> bool:
+    """Delete the adoption row. Returns whether there was one to delete.
+
+    The only DELETE this table has, and it can only reach the adoption row —
+    captures are permanent history, and losing one silently mis-attributes
+    every record after it.
+    """
+    conn = get_connection()
+    cur = conn.execute("DELETE FROM account_events WHERE ts = ?", (ADOPTED_TS,))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

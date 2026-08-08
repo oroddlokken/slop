@@ -12,18 +12,18 @@ the manual version of that, and works from a clone in any directory.
 | `statusline-command.py` | The status line. Every segment is toggled by a `CLAUDE_STATUSLINE_*` env var; the script's module docstring lists them with defaults. Layout adapts to terminal width at 150 columns: one or two lines wide, up to five narrow or with the battery/macmon segments on. |
 | `statusline-command_x.sh` | The wrapper `settings.json` points at. It execs the script from its own directory, so the clone can live anywhere. The exports in it are my per-machine overrides — edit them to taste; segment defaults live in the script itself. |
 | `ccu.zsh` + `get_claude_usage.py` | `ccu` — terminal dashboard for the numbers `/usage` shows, with reset countdowns. Reads the OAuth token from the macOS Keychain or `~/.claude/.credentials.json`, cached 10 minutes. |
-| `ccreport.py` | `ccreport` — token and cost report over the local JSONL logs, by day, month, project or session. Costs in USD and NOK (Norges Bank spot rate, 25 % MVA added unless `--no-mva`). |
+| `ccreport.py` | `ccreport` — token and cost report over the local JSONL logs, by day, month, project, session or account. Costs in USD and NOK (Norges Bank spot rate, 25 % MVA added unless `--no-mva`). |
 | `claudemem` | TUI for browsing the Claude Code memories belonging to the current git repo — navigate, edit, delete with undo. `--json` prints them instead. |
 | `claudem` | Launcher: `claudem <haiku\|sonnet\|opus\|fable> [low\|medium\|high\|xhigh\|max]` starts Claude Code with an explicit model and reasoning effort (default high). Single-letter shorthands, arguments in any order, everything else passed through to `claude`. |
-| `cf` | Fable-as-orchestrator: starts `claudem f` with an injected system prompt telling the session to delegate implementation work to the `cfcoder` agent and keep Fable for judgment and planning. The script dispatches on its invoked name (`c<model>[<effort>]`), so symlinks like `cfl` or `com` give other model/effort combos — only the name `cf` injects. |
-| `cfcoder.md` | The agent definition `cf` delegates to: Opus at high effort doing the implementation. Only takes effect from an agents dir Claude Code reads — see below. |
+| `cf`, `co` | Orchestrator wrappers, one script under two names: `cf` starts `claudem f` and `co` starts `claudem o`, each with an injected system prompt telling the session to delegate implementation work to the `cfcoder` agent. The two prompts differ only in the reason for the split — `cf` reserves a cheaper session model for judgment, `co` is already Opus and splits for context isolation. The script dispatches on its invoked name (`c<model>[<effort>]`), so symlinks like `cfl` or `com` give other model/effort combos — only the bare names `cf` and `co` inject. |
+| `cfcoder.md` | The agent definition `cf` and `co` delegate to: Opus at high effort doing the implementation. Only takes effect from an agents dir Claude Code reads — see below. |
 | `pricing.py`, `exchange.py`, `cache_db.py` | Model price table, USD/NOK rates, and the shared SQLite cache all of the above read. |
 | `hooks/` | `block-git-stash-worktree.sh`, a `PreToolUse` hook that blocks stash and worktree commands. Test suite in the sibling `block-git-stash-tests/` (payloads built inline — no fixture files). |
 | `stop-phrase-guard/` | A `Stop` hook that catches ownership-dodging and session-quitting phrases. Non-blocking — the assistant still stops, but the matched rule surfaces as a `systemMessage`. Fixtures alongside it. |
 
 Requirements: `uv` (the status line, `ccreport` and `claudemem` resolve their
 own dependencies through PEP 723 shebangs), a system Python 3.12+ for
-`get_claude_usage.py`, `zsh` for `ccu`, `claudem` and `cf`, and `jq` for both hooks. The git-stash
+`get_claude_usage.py`, `zsh` for `ccu`, `claudem` and `cf`/`co`, and `jq` for both hooks. The git-stash
 hook also wants `perl` — without it, it falls back to substring matching and
 over-blocks. Some pieces are macOS-only: the Keychain token lookup
 (`security`), and the battery (`pmset`) and Apple Silicon power (`macmon`)
@@ -67,7 +67,7 @@ alias ccu='SETUP_DIR=/path/to/slop /path/to/slop/claude/ccu.zsh'
 alias ccreport=/path/to/slop/claude/ccreport.py
 ```
 
-## cf
+## cf and co
 
 `cf` needs `claudem` (and `claude`) on `PATH`, and `cfcoder.md` in an agents
 directory Claude Code actually loads — `~/.claude/agents/` for all projects, or
@@ -79,6 +79,15 @@ cp /path/to/slop/claude/cfcoder.md ~/.claude/agents/
 
 Without the agent installed, the injected prompt tells the session to delegate
 to an agent that doesn't exist.
+
+`cf` and `co` are the same script under two names — it reads its own invoked
+name to pick model and effort, so the name is the whole configuration. Any
+other combination is a symlink away:
+
+```bash
+ln -s /path/to/slop/claude/cf ~/bin/cfl   # fable, low effort, no injection
+ln -s /path/to/slop/claude/cf ~/bin/com   # opus, medium effort, no injection
+```
 
 ## Hooks
 
@@ -163,6 +172,31 @@ ccreport unmerge <value>                    # remove a rule
 
 A repo rename is one `ccreport merge <new-name> <old-name>` away. Rules apply at
 report time, so the change shows up on the next run with no re-parse.
+
+## Accounts (ccreport)
+
+A session JSONL never names the account that paid for it, and `~/.claude.json`
+only knows who is signed in *now*. So the status line is the capture point: on
+every render it reads `oauthAccount` and appends to an `account_events` change
+log when it differs from the newest row. Attribution only works if you run the
+status line — that is the only thing that fires often enough to catch a
+mid-session `/login`.
+
+```bash
+ccreport account              # per-account table, sorted by cost
+ccreport -a work@example.com  # substring filter, works on every report
+ccreport -a unknown           # everything from before capture started
+```
+
+`ccreport` stamps each record at read time from the newest event at or before
+its timestamp, so a switch you record today re-attributes past reports with no
+re-parse. The email is the bucket label, plus the organization name when one
+address fronts two accounts (`me@example.com (Work AS)`).
+
+Everything logged before you installed the status line reports as `unknown`.
+`ccreport adopt` claims it for the account signed in now, by writing a single
+backdated event; `ccreport adopt --remove` deletes that one row and nothing
+else.
 
 ## Cache DB safety
 

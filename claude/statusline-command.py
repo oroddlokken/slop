@@ -65,7 +65,7 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
 
 Other environment variables:
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
-  CF_BADGE                                  — cyan CF badge after the model name (set by the cf wrapper)
+  CF_BADGE                                  — badge text after the model name, rendered cyan (set to CF/CO by the cf/co wrappers; legacy "1" reads as CF)
 """
 
 from __future__ import annotations
@@ -93,6 +93,7 @@ from cache_db import (
     is_fetch_blocked,
     read_cost_summary,
     read_usage_stale,
+    record_account_event,
     usage_is_fresh,
 )
 from pricing import (
@@ -819,6 +820,35 @@ def _accumulate_cache_stats(
     )
 
 
+# --- Account capture ---
+
+# Where Claude Code keeps the signed-in account. There is no configurable
+# location for it — unlike the settings files, which merge across three roots.
+CLAUDE_CONFIG_JSON = Path.home() / ".claude.json"
+
+
+def _capture_account() -> None:
+    """Note the signed-in account when it differs from the last one recorded.
+
+    The render is the capture point because it is the only thing that runs
+    often enough to catch a mid-session /login: nothing else reads this file,
+    and the session JSONL never names an account, so a switch that goes
+    unrecorded here is a switch ccreport can never attribute. cache_db only
+    writes on an actual change, so the usual render pays a read and a SELECT.
+
+    Best-effort throughout, like every other bookkeeping write in the render: a
+    config that is missing, unreadable, half-written or carrying no
+    oauthAccount, and a database held by another writer, all cost the change
+    log one sample rather than costing the user their status line.
+    """
+    try:
+        oauth = json.loads(CLAUDE_CONFIG_JSON.read_bytes()).get("oauthAccount")
+        if isinstance(oauth, dict):
+            record_account_event(oauth)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # --- Section renderers ---
 
 
@@ -1492,11 +1522,15 @@ def _render_session(
         base = re.sub(r"\s*\(\d+\w+\s+context\)", "", model)
         parts.append(banner or f"{SUBDUED}{base}{RST}")
 
-    # cf orchestrator sessions (claudem-shorthand exports CF_BADGE=1). Cyan —
-    # no model banner uses it, and the 1;97 run lets _BADGE_RE stash it whole.
+    # Orchestrator sessions (claudem-shorthand exports CF_BADGE=CF or CO). Cyan
+    # — no model banner uses it, and the 1;97 run lets _BADGE_RE stash it whole.
     # Glued to the model part so the two badges sit flush.
-    if os.environ.get("CF_BADGE") == "1":
-        badge = "\033[1;97;46m CF \033[0m"
+    cf_badge = os.environ.get("CF_BADGE", "")
+    if cf_badge:
+        # The wrapper exported a bare 1 before the label carried the name;
+        # sessions started under it keep that value until they are restarted.
+        label = "CF" if cf_badge == "1" else cf_badge
+        badge = f"\033[1;97;46m {label} \033[0m"
         if parts:
             parts[-1] += badge
         else:
@@ -1801,6 +1835,9 @@ def main() -> None:
             usage_data.update(native_rl)
             usage_data["_native_rl"] = True
         dcat_data = _fetch_dcat(inp.cwd)
+        # Nothing on the line depends on this; it sits here to overlap the git
+        # and macmon subprocesses started above rather than trail them.
+        _capture_account()
 
         # Collect git results and macmon data
         git = _collect_git(git_procs)

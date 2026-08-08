@@ -21,6 +21,7 @@ from cache_db import (
     clear_fetch_failures,
     invalidate_ccreport,
     load_cost_cache,
+    record_account_event,
     record_fetch_failure,
     release_costs_lock,
     release_fetch_lock,
@@ -159,6 +160,9 @@ class TestSchemaColumns:
             assert {"scoped_percent", "scoped_model", "scoped_reset"} <= _columns(
                 conn, "usage")
             assert {"cwd", "repo"} <= _columns(conn, "ccreport_records")
+            # Tables added after a DB was created arrive through the schema
+            # script, which only runs because SCHEMA_VERSION moved.
+            assert "account_events" in _tables(conn)
         finally:
             conn.close()
             cache_db._conn = None
@@ -1291,3 +1295,184 @@ class TestDailySnapshot:
         path, fresh = cache_db._maybe_snapshot(recorder)
         assert (path, fresh) == (self._today(snaps), False)
         assert recorder.calls == []
+
+
+class TestAccountEvents:
+    """The change log is append-on-change, not append-per-render."""
+
+    ACC = {
+        "accountUuid": "uuid-work",
+        "emailAddress": "me@work.example",
+        "organizationUuid": "org-work",
+        "organizationName": "Work AS",
+        # Fields the table deliberately does not keep.
+        "seatTier": "team_tier_1",
+        "billingType": "stripe_subscription",
+        "displayName": "Me",
+        "organizationRole": "owner",
+    }
+
+    def _rows(self, db):
+        return db.execute(
+            "SELECT ts, account_uuid, email, organization_uuid, organization_name "
+            "FROM account_events ORDER BY ts"
+        ).fetchall()
+
+    def test_only_the_four_identity_fields_are_stored(self, db):
+        assert record_account_event(self.ACC, now=100.0) is True
+        assert self._rows(db) == [
+            (100.0, "uuid-work", "me@work.example", "org-work", "Work AS"),
+        ]
+        assert _columns(db, "account_events") == {
+            "ts", "account_uuid", "email", "organization_uuid", "organization_name",
+        }
+
+    def test_an_unchanged_account_writes_nothing(self, db):
+        record_account_event(self.ACC, now=100.0)
+        assert record_account_event(self.ACC, now=200.0) is False
+        assert record_account_event(dict(self.ACC, seatTier="other"), now=300.0) is False
+        assert len(self._rows(db)) == 1
+
+    def test_a_switch_appends_without_touching_the_old_row(self, db):
+        record_account_event(self.ACC, now=100.0)
+        other = {
+            "accountUuid": "uuid-personal",
+            "emailAddress": "me@home.example",
+            "organizationUuid": "org-personal",
+            "organizationName": "Personal",
+        }
+        assert record_account_event(other, now=200.0) is True
+        assert self._rows(db) == [
+            (100.0, "uuid-work", "me@work.example", "org-work", "Work AS"),
+            (200.0, "uuid-personal", "me@home.example", "org-personal", "Personal"),
+        ]
+
+    def test_switching_back_records_a_third_event(self, db):
+        record_account_event(self.ACC, now=100.0)
+        record_account_event({"accountUuid": "uuid-personal"}, now=200.0)
+        assert record_account_event(self.ACC, now=300.0) is True
+        assert [r[1] for r in self._rows(db)] == [
+            "uuid-work", "uuid-personal", "uuid-work",
+        ]
+
+    def test_the_same_email_under_a_new_org_is_a_change(self, db):
+        """Work and personal billing can share an address; the org splits them."""
+        record_account_event(self.ACC, now=100.0)
+        moved = dict(self.ACC, organizationUuid="org-2", organizationName="Other AS")
+        assert record_account_event(moved, now=200.0) is True
+        assert [r[4] for r in self._rows(db)] == ["Work AS", "Other AS"]
+
+    @pytest.mark.parametrize("oauth", [
+        {},
+        {"emailAddress": "me@work.example"},
+        {"accountUuid": None, "emailAddress": "me@work.example"},
+        {"accountUuid": "", "emailAddress": "me@work.example"},
+        {"accountUuid": {"nested": 1}},
+    ])
+    def test_no_usable_uuid_is_never_stored(self, db, oauth):
+        """A row here is permanent history; a NULL key would be uncorrectable."""
+        assert record_account_event(oauth, now=100.0) is False
+        assert self._rows(db) == []
+
+    def test_a_non_string_field_reads_as_absent(self, db):
+        record_account_event(
+            {"accountUuid": "uuid-work", "emailAddress": None,
+             "organizationName": {"x": 1}},
+            now=100.0,
+        )
+        assert self._rows(db) == [(100.0, "uuid-work", None, None, None)]
+
+    def test_load_account_events_returns_the_log_oldest_first(self, db):
+        record_account_event(self.ACC, now=300.0)
+        record_account_event({"accountUuid": "uuid-personal"}, now=100.0)
+        events = cache_db.load_account_events()
+        assert [e["ts"] for e in events] == [100.0, 300.0]
+        assert events[1] == {
+            "ts": 300.0, "account_uuid": "uuid-work", "email": "me@work.example",
+            "organization_uuid": "org-work", "organization_name": "Work AS",
+        }
+
+    def test_an_empty_log_loads_as_an_empty_list(self, db):
+        assert cache_db.load_account_events() == []
+
+
+class TestAdoptedAccount:
+    """The one backdated row, and the readers that keep it apart from captures."""
+
+    ACC = {
+        "accountUuid": "uuid-work",
+        "emailAddress": "me@work.example",
+        "organizationUuid": "org-work",
+        "organizationName": "Work AS",
+    }
+    ROW = {
+        "account_uuid": "uuid-adopted", "email": "me@adopted.example",
+        "organization_uuid": "org-a", "organization_name": "Adopted AS",
+    }
+
+    def _identities(self, events):
+        return [(e["ts"], e["account_uuid"]) for e in events]
+
+    def test_an_empty_log_has_neither_a_capture_nor_an_adoption(self, db):
+        assert cache_db.read_latest_account() is None
+        assert cache_db.read_adopted_account() is None
+
+    def test_the_adoption_row_lands_at_ts_zero(self, db):
+        cache_db.set_adopted_account(self.ROW)
+        adopted = cache_db.read_adopted_account()
+        assert adopted == {"ts": cache_db.ADOPTED_TS, **self.ROW}
+
+    def test_an_adoption_is_not_read_back_as_a_capture(self, db):
+        """It is a claim about history, not a reading of who is signed in."""
+        cache_db.set_adopted_account(self.ROW)
+        assert cache_db.read_latest_account() is None
+
+    def test_the_newest_capture_wins_over_an_older_one(self, db):
+        record_account_event(self.ACC, now=100.0)
+        record_account_event({"accountUuid": "uuid-home"}, now=200.0)
+        assert cache_db.read_latest_account()["account_uuid"] == "uuid-home"
+
+    def test_an_adoption_never_shadows_a_capture(self, db):
+        record_account_event(self.ACC, now=100.0)
+        cache_db.set_adopted_account(self.ROW)
+        assert cache_db.read_latest_account()["account_uuid"] == "uuid-work"
+
+    def test_re_adopting_replaces_rather_than_appends(self, db):
+        cache_db.set_adopted_account(self.ROW)
+        cache_db.set_adopted_account(dict(self.ROW, account_uuid="uuid-other"))
+        events = cache_db.load_account_events()
+        assert self._identities(events) == [(cache_db.ADOPTED_TS, "uuid-other")]
+
+    def test_the_adoption_sorts_ahead_of_every_capture(self, db):
+        """Attribution reads the log in order; the claim has to come first."""
+        record_account_event(self.ACC, now=100.0)
+        cache_db.set_adopted_account(self.ROW)
+        assert self._identities(cache_db.load_account_events()) == [
+            (cache_db.ADOPTED_TS, "uuid-adopted"), (100.0, "uuid-work"),
+        ]
+
+    def test_clearing_reports_whether_there_was_anything_to_clear(self, db):
+        assert cache_db.clear_adopted_account() is False
+        cache_db.set_adopted_account(self.ROW)
+        assert cache_db.clear_adopted_account() is True
+        assert cache_db.clear_adopted_account() is False
+        assert cache_db.read_adopted_account() is None
+
+    def test_clearing_leaves_every_capture_alone(self, db):
+        record_account_event(self.ACC, now=100.0)
+        cache_db.set_adopted_account(self.ROW)
+        cache_db.clear_adopted_account()
+        assert self._identities(cache_db.load_account_events()) == [(100.0, "uuid-work")]
+
+    def test_an_adoption_does_not_disturb_the_capture_comparison(self, db):
+        """record_account_event compares against the newest row, and ts=0 is oldest."""
+        record_account_event(self.ACC, now=100.0)
+        cache_db.set_adopted_account(dict(self.ROW, account_uuid="uuid-home"))
+        # Same account still signed in: still nothing new to record.
+        assert record_account_event(self.ACC, now=200.0) is False
+        # A real switch still appends.
+        assert record_account_event({"accountUuid": "uuid-home"}, now=300.0) is True
+        assert self._identities(cache_db.load_account_events()) == [
+            (cache_db.ADOPTED_TS, "uuid-home"), (100.0, "uuid-work"),
+            (300.0, "uuid-home"),
+        ]
