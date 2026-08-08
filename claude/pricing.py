@@ -557,8 +557,12 @@ def project_scope(cwd: str, projects_dirs: list[Path]) -> ProjectScope:
     "these are one project" for the statusline's cost windows as much as for
     the reports (macsetup-2qrp).
 
-    Both the override table and the per-file identities are read once per call.
-    A cache that cannot be read degrades to the unmerged scope, which is what
+    The override table is read once per call; the per-file identities only on a
+    miss in the per-cwd scope cache, since scanning them is a quarter of a
+    render (macsetup-6cov). A cached scope is only used while it still covers
+    the cwd's own directories — a projects dir that appeared after the row was
+    written is otherwise invisible until something invalidates the table. A
+    cache that cannot be read degrades to the unmerged scope, which is what
     every render did before merges existed.
     """
     own = project_path_prefixes(cwd, projects_dirs)
@@ -567,6 +571,9 @@ def project_scope(cwd: str, projects_dirs: list[Path]) -> ProjectScope:
         resolve = build_override_fn()
         if resolve is None:
             return unmerged
+        cached = _load_cached_scope(cwd)
+        if cached is not None and set(own) <= set(cached[1]):
+            return ProjectScope(cached[0], cached[1], resolve)
         identities = _file_identities()
     except Exception:  # noqa: BLE001
         return unmerged
@@ -592,6 +599,7 @@ def project_scope(cwd: str, projects_dirs: list[Path]) -> ProjectScope:
         if merged and merged not in seen:
             seen.add(merged)
             prefixes.append(merged)
+    _cache_scope(cwd, name, prefixes)
     return ProjectScope(name, prefixes, resolve)
 
 
@@ -600,6 +608,27 @@ def _file_identities() -> list[tuple[str, str | None, str | None, str]]:
     from cache_db import load_ccreport_file_identities
 
     return load_ccreport_file_identities()
+
+
+def _load_cached_scope(cwd: str) -> tuple[str, list[str]] | None:
+    """cache_db.load_project_scope, imported at call time."""
+    from cache_db import load_project_scope
+
+    return load_project_scope(cwd)
+
+
+def _cache_scope(cwd: str, name: str, prefixes: list[str]) -> None:
+    """Store the derived scope, best-effort.
+
+    A render is a reader that happens to have computed something worth keeping;
+    a DB busy on the write leaves it with the answer it already has.
+    """
+    try:
+        from cache_db import save_project_scope
+
+        save_project_scope(cwd, name, prefixes)
+    except Exception:  # noqa: BLE001, S110
+        pass
 
 
 def _find_session_files(
@@ -798,14 +827,26 @@ def _accumulate_orphaned_costs(
 def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
     """Compute rolling cost totals for one project.
 
-    Lightweight scan of only that project's JSONL files — suitable for
-    per-render use in the statusline without touching the shared cache. Its
-    counterpart compute_costs walks the whole corpus because it also owes a
-    global total; this one never leaves the project's own directories, which
-    is why the two keep separate live-path sets rather than one.
+    Scans only that project's JSONL files — its counterpart compute_costs walks
+    the whole corpus because it also owes a global total; this one never leaves
+    the project's own directories, which is why the two keep separate live-path
+    sets rather than one.
 
     "The project" is the merge target when a `ccreport merge` grouped others
     into it, so the scan covers their directories too (macsetup-2qrp).
+
+    A file whose (mtime_ns, size) still matches what ccreport cached is summed
+    from those cached records instead of re-read: this runs on every render,
+    and re-parsing the project's whole corpus each time was 90 MB and ~93% of
+    the render (macsetup-rn21). What is cached is per-record and
+    time-independent — a file's share of each window moves with `now`, so the
+    windows themselves can never be cached, only the (ts, cost, identity) they
+    are computed from.
+
+    Records are read-only by design: files written since the last `ccreport`
+    run miss and raw-parse. Making a render write those back would put a second
+    writer on the WAL for a latency win it does not need. The one row a render
+    does write is the resolved scope, once per rule or record change.
     """
     if not cwd:
         return {}
@@ -828,19 +869,52 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
             project_files.extend(sorted(proj_dir.rglob("*.jsonl")))
     project_live_paths = {str(p) for p in project_files}
 
-    for jsonl_path in project_files:
-        for cost, ts, _dk in _iter_jsonl_costs(jsonl_path, seen_keys):
-            totals["all_time"] = totals.get("all_time", 0.0) + cost
-            _bucket_rolling_cost(cost, ts.timestamp(), thresholds, totals)
-
-    # Include orphaned cached records for this project (macsetup-59zg).
-    # Scoped to the project's path prefixes in SQL: this runs on every render,
-    # and the prefixes discard all but one project's share anyway (macsetup-45iv).
+    # One scoped load, read twice: as the per-file record cache the walk below
+    # hits, and as the orphan source after it. Scoped to the project's path
+    # prefixes in SQL — this runs on every render, and the prefixes discard all
+    # but one project's share anyway (macsetup-45iv). Empty on any failure,
+    # including a cache the salt says this build cannot read, which degrades to
+    # the full raw parse this used to do unconditionally.
+    project_ccr: dict[str, list[dict]] = {}
+    cached_meta: dict[str, tuple[int, int]] = {}
     try:
-        from cache_db import load_ccreport_records_under
-        project_ccr: dict[str, list[dict]] = {}
+        from cache_db import (
+            load_ccreport_file_meta_under,
+            load_ccreport_records_under,
+        )
         for prefix in scope.prefixes:
             project_ccr.update(load_ccreport_records_under(prefix))
+            cached_meta.update(load_ccreport_file_meta_under(prefix))
+    except Exception:  # noqa: BLE001
+        project_ccr, cached_meta = {}, {}
+
+    for jsonl_path in project_files:
+        try:
+            st = jsonl_path.stat()
+        except OSError:
+            continue
+        if cached_meta.get(str(jsonl_path)) != (st.st_mtime_ns, st.st_size):
+            for cost, ts, _dk in _iter_jsonl_costs(jsonl_path, seen_keys):
+                totals["all_time"] = totals.get("all_time", 0.0) + cost
+                _bucket_rolling_cost(cost, ts.timestamp(), thresholds, totals)
+            continue
+        for rec in project_ccr.get(str(jsonl_path), ()):
+            if record_is_duplicate(rec, seen_keys):
+                continue
+            # Recomputed from the record's own tokens, never its stored cost:
+            # the raw path recomputes too, and a file still on disk has nothing
+            # to lose by it. The orphan pass below keeps the stored cost, which
+            # for a purged file is the only surviving truth.
+            cost = _rec_cost_from_tokens(rec)
+            if not cost:
+                continue
+            totals["all_time"] = totals.get("all_time", 0.0) + cost
+            ts_epoch = rec.get("ts") or 0.0
+            if ts_epoch:
+                _bucket_rolling_cost(cost, ts_epoch, thresholds, totals)
+
+    # Include orphaned cached records for this project (macsetup-59zg).
+    try:
         _accumulate_orphaned_costs(
             project_ccr, project_live_paths, seen_keys, thresholds,
             totals, path_prefixes=scope.prefixes,
@@ -904,11 +978,14 @@ def _parse_window_starts(
     return session_window_start, week_window_start
 
 
-def _rec_cost(rec: dict) -> float:
-    """Compute cost for a ccreport record dict, recomputing from tokens if needed."""
-    cost = rec.get("cost")
-    if cost is not None and cost != 0:
-        return cost
+def _rec_cost_from_tokens(rec: dict) -> float:
+    """Cost of a ccreport record priced from its own tokens, stored cost ignored.
+
+    What a reader wants when the JSONL is still on disk: the raw parse prices
+    every record this way, so a cached record whose stored cost came from the
+    log's costUSD would otherwise total differently depending on which path
+    read it (macsetup-rn21).
+    """
     t = rec.get("t")
     if not t or len(t) < 4:
         return 0.0
@@ -920,6 +997,14 @@ def _rec_cost(rec: dict) -> float:
         except (ValueError, OSError):
             pass
     return calc_cost(t[0], t[1], t[2], t[3], rec.get("model", ""), ts_dt)
+
+
+def _rec_cost(rec: dict) -> float:
+    """Compute cost for a ccreport record dict, recomputing from tokens if needed."""
+    cost = rec.get("cost")
+    if cost is not None and cost != 0:
+        return cost
+    return _rec_cost_from_tokens(rec)
 
 
 class _FileContext(NamedTuple):

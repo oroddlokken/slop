@@ -1107,6 +1107,130 @@ class TestMergedProjectsShareTheirCostWindows:
         assert reads == [1], "one read per compute, not one per record"
 
 
+class TestTheResolvedScopeIsCachedPerCwd:
+    """Resolving a merged scope reads every cached file's identity.
+
+    That GROUP BY was 0.020s of an 0.085s statusline call, repeated on every
+    render for an answer that only moves when a rule or a record does
+    (macsetup-6cov). These tests pin both halves: the second render skips the
+    scan, and a change to either input still reaches it.
+    """
+
+    CWD = "/tmp/proj"
+
+    @pytest.fixture()
+    def merged(self, monkeypatch, tmp_path):
+        """One record in a second project, merged into the cwd's by name."""
+        import cache_db
+        import pricing
+
+        d = tmp_path / "projects"
+        (d / "-tmp-proj").mkdir(parents=True)
+        (d / "-tmp-other").mkdir(parents=True)
+        monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
+        cache_db.init_ccreport_meta(1, "test-hash")
+        cache_db.save_ccreport_file(str(d / "-tmp-other" / "gone.jsonl"), 1, 1, [{
+            "mid": "m", "model": "claude-opus-5", "ts": 1.5, "sid": "s1",
+            "project": "other", "cwd": "/tmp/other", "repo": None,
+            "dk": "dk1", "cost": 1.0, "t": [1, 1, 0, 0],
+        }])
+        cache_db.add_project_override("name", "other", "proj")
+        return d
+
+    @staticmethod
+    def _merged_prefix(projects_dir) -> str:
+        return str(projects_dir / "-tmp-other") + "/"
+
+    @staticmethod
+    def _scope_rows() -> int:
+        import cache_db
+
+        return cache_db.get_connection().execute(
+            "SELECT COUNT(*) FROM project_scopes").fetchone()[0]
+
+    def test_a_second_call_answers_without_rescanning_the_identities(
+        self, merged, monkeypatch,
+    ):
+        import pricing
+
+        scans = []
+        real = pricing._file_identities
+        monkeypatch.setattr(
+            pricing, "_file_identities",
+            lambda: (scans.append(1), real())[1],
+        )
+        first = pricing.project_scope(self.CWD, [merged])
+        second = pricing.project_scope(self.CWD, [merged])
+        assert scans == [1], "the identities are scanned once, not once per call"
+        assert (second.name, second.prefixes) == (first.name, first.prefixes)
+        # The merged directory is the part only the scan could have found, so
+        # its survival is what says the cached answer is the real one.
+        assert self._merged_prefix(merged) in second.prefixes
+
+    def test_a_rule_change_rederives_the_scope(self, merged):
+        import cache_db
+        import pricing
+
+        assert pricing.project_scope(self.CWD, [merged]).name == "proj"
+        cache_db.delete_project_override("other")
+        cache_db.add_project_override("name", "proj", "archive")
+        again = pricing.project_scope(self.CWD, [merged])
+        assert again.name == "archive"
+        assert self._merged_prefix(merged) not in again.prefixes
+
+    def test_a_newly_cached_record_rederives_the_scope(self, merged, tmp_path):
+        import cache_db
+        import pricing
+
+        (tmp_path / "projects" / "-tmp-third").mkdir()
+        assert self._merged_prefix(merged) in pricing.project_scope(
+            self.CWD, [merged]).prefixes
+        cache_db.add_project_override("name", "third", "proj")
+        cache_db.save_ccreport_file(
+            str(merged / "-tmp-third" / "gone.jsonl"), 1, 1, [{
+                "mid": "m2", "model": "claude-opus-5", "ts": 1.5, "sid": "s2",
+                "project": "third", "cwd": "/tmp/third", "repo": None,
+                "dk": "dk2", "cost": 1.0, "t": [1, 1, 0, 0],
+            }])
+        assert str(merged / "-tmp-third") + "/" in pricing.project_scope(
+            self.CWD, [merged]).prefixes
+
+    def test_with_no_rules_nothing_is_cached(self, merged):
+        import cache_db
+        import pricing
+
+        cache_db.delete_project_override("other")
+        assert pricing.project_scope(self.CWD, [merged]).name == "proj"
+        # Without rules the scope is the cwd's own directory and costs one
+        # table read; a row here would be an invalidation liability for nothing.
+        assert self._scope_rows() == 0
+
+    def test_a_scope_that_predates_a_projects_dir_is_rederived(
+        self, merged, tmp_path,
+    ):
+        import pricing
+
+        pricing.project_scope(self.CWD, [merged])
+        second = tmp_path / "projects2"
+        (second / "-tmp-proj").mkdir(parents=True)
+        scope = pricing.project_scope(self.CWD, [merged, second])
+        assert str(second / "-tmp-proj") + "/" in scope.prefixes
+
+    def test_a_failing_cache_write_still_yields_the_scope(self, merged, monkeypatch):
+        import sqlite3
+
+        import cache_db
+        import pricing
+
+        def locked(*_args, **_kw):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(cache_db, "save_project_scope", locked)
+        scope = pricing.project_scope(self.CWD, [merged])
+        assert scope.name == "proj"
+        assert self._merged_prefix(merged) in scope.prefixes
+
+
 # ---------------------------------------------------------------------------
 # dk-NULL records still have to dedupe (macsetup-2wgm)
 # ---------------------------------------------------------------------------
@@ -1203,3 +1327,231 @@ class TestFallbackDedupIdentity:
         once = 1000 * 5e-06
         assert compute_project_rolling_costs(
             self.CWD)["all_time_project_cost"] == round(once, 4)
+
+
+# ---------------------------------------------------------------------------
+# A render prices an unchanged live file from the cache (macsetup-rn21)
+# ---------------------------------------------------------------------------
+
+class TestLiveFilesPricedFromTheCcreportCache:
+    """Re-parsing the project's whole corpus per render was ~93% of it.
+
+    The cached records already hold every time-independent fact the windows
+    need, so a file whose (mtime_ns, size) still matches is summed from them.
+    Every test here pins the property that makes that substitution legal: the
+    two paths have to produce the same number, and a cache that cannot be
+    trusted has to fall back rather than answer.
+    """
+
+    CWD = "/tmp/proj"
+
+    @pytest.fixture()
+    def projects_dir(self, monkeypatch, tmp_path):
+        import cache_db
+        import pricing
+
+        d = tmp_path / "projects"
+        (d / "-tmp-proj").mkdir(parents=True)
+        monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
+        monkeypatch.setattr(cache_db, "get_project_overrides", lambda: [])
+        cache_db.init_ccreport_meta(1, "test-hash")
+        return d
+
+    @staticmethod
+    def _record(mid: str, **kw) -> dict:
+        """One cached record, in the shape cache_db stores and pricing reads."""
+        return {
+            "mid": mid, "model": "claude-opus-5",
+            "ts": datetime.now(tz=timezone.utc).timestamp(), "sid": "s1",
+            "project": "proj", "cwd": "/tmp/proj", "repo": None,
+            "dk": f"{mid}:req-1", "cost": 0.5, "t": [1000, 500, 0, 0], **kw,
+        }
+
+    @staticmethod
+    def _line(rec: dict) -> str:
+        """The JSONL line a raw parse must read *rec* back out of."""
+        import json
+
+        line: dict = {
+            "type": "assistant",
+            "timestamp": datetime.fromtimestamp(
+                rec["ts"], tz=timezone.utc).isoformat(),
+            "sessionId": rec["sid"], "cwd": rec["cwd"],
+            "message": {
+                "id": rec["mid"], "model": rec["model"],
+                "usage": {
+                    "input_tokens": rec["t"][0], "output_tokens": rec["t"][1],
+                    "cache_creation_input_tokens": rec["t"][2],
+                    "cache_read_input_tokens": rec["t"][3],
+                },
+            },
+        }
+        if rec["dk"]:
+            line["requestId"] = rec["dk"].split(":", 1)[1]
+        return json.dumps(line)
+
+    def _file(self, projects_dir, name: str, records: list[dict], *,
+              cached: bool = True, fresh: bool = True):
+        """Write *records* as a JSONL file, optionally caching them for it."""
+        import cache_db
+
+        path = projects_dir / "-tmp-proj" / name
+        path.write_text("".join(self._line(r) + "\n" for r in records))
+        if cached:
+            st = path.stat()
+            fp = (st.st_mtime_ns, st.st_size) if fresh else (1, 1)
+            cache_db.save_ccreport_file(str(path), *fp, records)
+        return path
+
+    @staticmethod
+    def _expected(*records: dict) -> float:
+        """What both paths owe: every record priced from its own tokens."""
+        from pricing import _rec_cost_from_tokens
+
+        return round(sum(_rec_cost_from_tokens(r) for r in records), 4)
+
+    @staticmethod
+    def _clear_fingerprints() -> None:
+        """Force the raw parse without touching the records or the salt.
+
+        Not invalidate_ccreport: that also drops the salt and NULLs the costs,
+        so it could not tell a fingerprint miss from a cache the reader refused.
+        """
+        import cache_db
+
+        conn = cache_db.get_connection()
+        conn.execute("UPDATE ccreport_files SET mtime_ns = 0, size = 0")
+        conn.commit()
+
+    def _mixed_project(self, projects_dir) -> list[dict]:
+        """Three files: cached and fresh, uncached, cached but stale."""
+        fresh = [self._record("msg-a"), self._record("msg-b")]
+        uncached = [self._record("msg-c")]
+        stale = [self._record("msg-d")]
+        self._file(projects_dir, "a.jsonl", fresh)
+        self._file(projects_dir, "b.jsonl", uncached, cached=False)
+        self._file(projects_dir, "c.jsonl", stale, fresh=False)
+        return [*fresh, *uncached, *stale]
+
+    def test_the_cached_path_totals_what_a_full_reparse_totals(self, projects_dir):
+        from pricing import compute_project_rolling_costs
+
+        records = self._mixed_project(projects_dir)
+        cached = compute_project_rolling_costs(self.CWD)
+        self._clear_fingerprints()
+        assert cached == compute_project_rolling_costs(self.CWD)
+        assert cached["all_time_project_cost"] == self._expected(*records)
+
+    def test_every_window_agrees_not_just_the_total(self, projects_dir):
+        """The windows are the reason bucket sums could not be cached."""
+        from pricing import ROLLING_COST_NAMES, compute_project_rolling_costs
+
+        self._mixed_project(projects_dir)
+        cached = compute_project_rolling_costs(self.CWD)
+        self._clear_fingerprints()
+        raw = compute_project_rolling_costs(self.CWD)
+        assert [cached[f"{n}_project_cost"] for n in ROLLING_COST_NAMES] == \
+            [raw[f"{n}_project_cost"] for n in ROLLING_COST_NAMES]
+        assert cached["six_hour_project_cost"] == cached["all_time_project_cost"]
+
+    @pytest.mark.parametrize("cached_first", [True, False])
+    def test_one_message_in_two_files_counts_once_across_the_two_paths(
+        self, projects_dir, cached_first,
+    ):
+        """seen_keys is shared, so which path reads the twin cannot matter."""
+        from pricing import compute_project_rolling_costs
+
+        rec = self._record("msg-a")
+        first, second = ("a.jsonl", "b.jsonl") if cached_first else ("b.jsonl", "a.jsonl")
+        self._file(projects_dir, first, [rec])
+        self._file(projects_dir, second, [rec], cached=False)
+        assert compute_project_rolling_costs(
+            self.CWD)["all_time_project_cost"] == self._expected(rec)
+
+    def test_a_live_files_stored_cost_loses_to_the_recomputed_one(self, projects_dir):
+        """ccreport may have stored the log's costUSD; the raw path never did.
+
+        Serving the stored value would make a file's cost depend on whether
+        the render happened to hit the cache, which is the one thing the
+        substitution may not change.
+        """
+        from pricing import compute_project_rolling_costs
+
+        rec = self._record("msg-a", cost=99.0)
+        self._file(projects_dir, "a.jsonl", [rec])
+        total = compute_project_rolling_costs(self.CWD)["all_time_project_cost"]
+        assert total == self._expected(rec)
+        assert total < 1.0
+
+    def test_an_orphans_stored_cost_still_wins(self, projects_dir):
+        """No JSONL left to re-price from, so the stored cost is the only truth."""
+        import cache_db
+        from pricing import compute_project_rolling_costs
+
+        rec = self._record("msg-a", cost=99.0)
+        cache_db.save_ccreport_file(
+            str(projects_dir / "-tmp-proj" / "gone.jsonl"), 1, 1, [rec])
+        assert compute_project_rolling_costs(
+            self.CWD)["all_time_project_cost"] == 99.0
+
+    def test_a_file_modified_after_caching_is_reparsed(self, projects_dir):
+        from pricing import compute_project_rolling_costs
+
+        rec = self._record("msg-a")
+        path = self._file(projects_dir, "a.jsonl", [rec])
+        # Same path, different content: the cached records now describe a file
+        # that no longer exists, and their fingerprint is what says so.
+        rewritten = [self._record("msg-b"), self._record("msg-c")]
+        path.write_text("".join(self._line(r) + "\n" for r in rewritten))
+        assert compute_project_rolling_costs(
+            self.CWD)["all_time_project_cost"] == self._expected(*rewritten)
+
+    def test_a_mismatched_salt_falls_back_to_the_raw_parse(self, projects_dir):
+        import cache_db
+        from pricing import compute_project_rolling_costs
+
+        records = self._mixed_project(projects_dir)
+        conn = cache_db.get_connection()
+        cache_db._set_meta(conn, "ccreport_schema_salt", "not-the-salt")
+        conn.commit()
+        assert compute_project_rolling_costs(
+            self.CWD)["all_time_project_cost"] == self._expected(*records)
+
+    def test_an_invalidated_cache_falls_back_to_the_raw_parse(self, projects_dir):
+        import cache_db
+        from pricing import compute_project_rolling_costs
+
+        records = self._mixed_project(projects_dir)
+        live = {str(p) for p in (projects_dir / "-tmp-proj").glob("*.jsonl")}
+        cache_db.invalidate_ccreport(live)
+        assert compute_project_rolling_costs(
+            self.CWD)["all_time_project_cost"] == self._expected(*records)
+
+    def test_a_render_writes_nothing_back(self, projects_dir):
+        """One WAL writer only — a cache miss costs a parse, not a write."""
+        import cache_db
+        from pricing import compute_project_rolling_costs
+
+        self._mixed_project(projects_dir)
+        conn = cache_db.get_connection()
+        before = conn.execute(
+            "SELECT path, mtime_ns, size FROM ccreport_files").fetchall()
+        compute_project_rolling_costs(self.CWD)
+        assert conn.execute(
+            "SELECT path, mtime_ns, size FROM ccreport_files").fetchall() == before
+
+    def test_only_the_files_the_cache_cannot_vouch_for_are_read(
+        self, projects_dir, monkeypatch,
+    ):
+        """The point of the change: a fresh fingerprint means no file read."""
+        from pathlib import Path
+
+        import pricing
+
+        self._mixed_project(projects_dir)
+        parsed: list[str] = []
+        real = pricing._iter_jsonl_costs
+        monkeypatch.setattr(pricing, "_iter_jsonl_costs", lambda p, seen: (
+            parsed.append(Path(p).name) or real(p, seen)))
+        pricing.compute_project_rolling_costs(self.CWD)
+        assert parsed == ["b.jsonl", "c.jsonl"]

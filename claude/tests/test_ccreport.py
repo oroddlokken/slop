@@ -10,6 +10,7 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import os
 import types
 from pathlib import Path
 
@@ -1034,3 +1035,412 @@ class TestDefaultReportDispatch:
         called = run("me@work.example", "me@home.example",
                      argv=("ccreport.py", "account"))
         assert called == ["account"]
+
+
+class TestReportDefersTheDailySnapshot:
+    """A report is often the day's first DB toucher, and pays for the copy.
+
+    get_connection reads the deferral once, when it opens the singleton
+    connection, so setting it anywhere below the top of main() would be
+    setting it after the copy (macsetup-2huo).
+    """
+
+    @pytest.fixture()
+    def seen(self, monkeypatch):
+        """The deferral as get_connection saw it, per open, over `ccreport overrides`."""
+        values: list[str | None] = []
+        real = cache_db.get_connection
+
+        def spy():
+            values.append(os.environ.get("CLAUDE_CACHE_SNAPSHOT_DEFER"))
+            return real()
+
+        monkeypatch.setattr(cache_db, "get_connection", spy)
+        monkeypatch.setattr(ccr.sys, "argv", ["ccreport.py", "overrides"])
+        return values
+
+    def test_it_is_set_before_the_first_connection(self, seen, monkeypatch, capsys):
+        monkeypatch.delenv("CLAUDE_CACHE_SNAPSHOT_DEFER", raising=False)
+        ccr.main()
+        capsys.readouterr()
+        assert seen, "the report never opened the DB; the spy proves nothing"
+        assert all(v == "1" for v in seen)
+        assert os.environ["CLAUDE_CACHE_SNAPSHOT_DEFER"] == "1"
+
+    def test_an_explicit_setting_from_the_shell_wins(self, seen, monkeypatch, capsys):
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DEFER", "0")
+        ccr.main()
+        capsys.readouterr()
+        assert seen == ["0"] * len(seen)
+        assert os.environ["CLAUDE_CACHE_SNAPSHOT_DEFER"] == "0"
+
+
+# --- Rollups: precomputed aggregates for the days past the cutoff ---
+#
+# (macsetup-4rte) The corpus below is built so that everything a rollup row
+# collapses is present on both sides of the cutoff: two sessions that span it,
+# a duplicated message on each side, three accounts, four models, an override
+# rule, orphaned records whose file is gone, and records with and without a
+# logged costUSD.
+
+
+def _entry(when, sid, cwd, mid, rid, model="claude-sonnet-5",
+           tokens=(1000, 500, 200, 100), cost=None) -> dict:
+    """One assistant line of a session JSONL, at an absolute instant."""
+    line = {
+        "type": "assistant",
+        "timestamp": when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sessionId": sid, "cwd": cwd, "requestId": rid,
+        "message": {"id": mid, "model": model, "usage": {
+            "input_tokens": tokens[0], "output_tokens": tokens[1],
+            "cache_creation_input_tokens": tokens[2],
+            "cache_read_input_tokens": tokens[3],
+        }},
+    }
+    if cost is not None:
+        line["costUSD"] = cost
+    return line
+
+
+def _write_entries(path: Path, entries: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+
+def _rates_for(records) -> "ccr.NokCtx":
+    """A different rate for every Oslo date the corpus touches.
+
+    Different on purpose: a record converted under the wrong date then lands on
+    a visibly wrong number, which is what a rollup row carrying its own Oslo
+    date exists to prevent.
+    """
+    dates = sorted({ccr.record_oslo_date(r) for r in records})
+    rates = {d.isoformat(): 8.0 + i for i, d in enumerate(dates)}
+    return ccr.NokCtx(rates, max(rates), True)
+
+
+def _render_reports(records, nok) -> str:
+    """Every table a bare `ccreport` prints, at a fixed width."""
+    buf = io.StringIO()
+    previous = ccr.console
+    ccr.console = Console(file=buf, width=200, no_color=True)
+    try:
+        ccr.report_daily(records, breakdown=True, nok=nok)
+        ccr.report_monthly(records, nok=nok)
+        ccr.report_project(records, limit=None, nok=nok)
+        ccr.report_session(records, limit=None, nok=nok)
+        ccr.report_account(records, nok=nok)
+    finally:
+        ccr.console = previous
+    return buf.getvalue()
+
+
+@pytest.fixture
+def rollup_corpus(loader, monkeypatch):
+    """A corpus straddling the rollup cutoff, plus the read-time state it needs.
+
+    The cwds are paths that cannot exist, so project names are derived without
+    shelling out to git and without depending on the machine's checkouts.
+    """
+    now = dt.datetime.now().astimezone()
+
+    def day(n: int, hour: int) -> dt.datetime:
+        return (now - dt.timedelta(days=n)).replace(
+            hour=hour, minute=0, second=0, microsecond=0)
+
+    a, b, c, d = ("/tmp/ccr-projA", "/tmp/ccr-projB",
+                  "/tmp/ccr-projC", "/tmp/ccr-projD")
+    _write_entries(loader / "a-old.jsonl", [
+        # Three calls that share a rollup key (day, session, project, model,
+        # account) and one that differs only in model — so the table both
+        # aggregates and keeps the model split the Models column needs.
+        _entry(day(40, 7), "sess-a", a, "old-1c", "r1c", tokens=(20, 30, 40, 50)),
+        _entry(day(40, 9), "sess-a", a, "old-1", "r1"),
+        _entry(day(40, 9), "sess-a", a, "old-1b", "r1b", cost=0.25),
+        _entry(day(40, 10), "sess-a", a, "old-2", "r2",
+               model="claude-haiku-4-5", cost=0.5),
+        _entry(day(30, 11), "sess-a", a, "old-3", "r3", cost=1.25),
+    ])
+    _write_entries(loader / "b-old.jsonl", [
+        # The same message as a-old's, in another project: whichever copy dedup
+        # keeps decides which project the cost lands in.
+        _entry(day(40, 9), "sess-b", b, "old-1", "r1"),
+        # sess-a again, between that session's first and last call of the day.
+        # Its group starts later than a-old's but ends earlier, so the session
+        # table's project depends on the rollup rows being ordered by when each
+        # group started rather than by the timestamp they report.
+        _entry(day(40, 8), "sess-a", b, "old-1d", "r1d"),
+        _entry(day(30, 12), "sess-b", b, "old-4", "r4"),
+        _entry(day(20, 13), "sess-b", b, "old-5", "r5",
+               model="<synthetic>", tokens=(0, 0, 0, 0)),
+    ])
+    _write_entries(loader / "c-recent.jsonl", [
+        _entry(day(5, 8), "sess-c", a, "new-1", "r6"),
+        _entry(day(2, 9), "sess-c", a, "new-2", "r7",
+               model="claude-haiku-4-5", cost=2.0),
+    ])
+    # sess-a again, weeks later and under a name an override rule renames.
+    _write_entries(loader / "d-recent.jsonl", [
+        _entry(day(2, 10), "sess-a", c, "new-3", "r8", model="claude-sonnet-4-5"),
+    ])
+    _write_entries(loader / "e-recent.jsonl", [
+        _entry(day(2, 9), "sess-e", b, "new-2", "r7",
+               model="claude-haiku-4-5", cost=2.0),
+        _entry(day(1, 11), "sess-e", b, "new-4", "r9"),
+    ])
+    # Cached, then purged off disk: orphan records on both sides of the cutoff.
+    purged = loader / "z-old.jsonl"
+    _write_entries(purged, [
+        _entry(day(35, 7), "sess-z", d, "old-6", "r10",
+               model="claude-haiku-4-5", cost=0.75),
+        _entry(day(3, 8), "sess-z", d, "new-5", "r11"),
+    ])
+
+    for ts, uuid, email in (
+        (day(25, 0).timestamp(), "u-work", "me@work.example"),
+        (day(3, 0).timestamp(), "u-home", "me@home.example"),
+    ):
+        cache_db.record_account_event(
+            {"accountUuid": uuid, "emailAddress": email,
+             "organizationName": "Org"}, now=ts,
+        )
+
+    rules = [{"id": 1, "match_kind": "name",
+              "match_value": "ccr-projC", "target": "ccr-projA"}]
+    # list() per call so appending a rule changes what the fingerprint sees.
+    monkeypatch.setattr(cache_db, "get_project_overrides", lambda: list(rules))
+
+    ccr.load_all_records()  # caches the file about to be purged
+    purged.unlink()
+    return types.SimpleNamespace(dir=loader, rules=rules, day=day)
+
+
+class TestRollupParity:
+    """The rollup path must render what the record path renders, to the byte."""
+
+    def test_every_report_is_identical_through_both_paths(self, rollup_corpus):
+        full = ccr.load_all_records()
+        nok = _rates_for(full)
+        expected = _render_reports(full, nok)
+
+        built = ccr.load_all_records(use_rollups=True)
+        assert _render_reports(built, nok) == expected, "the building run diverged"
+
+        served = ccr.load_all_records(use_rollups=True)
+        assert len(served) < len(full), "nothing came from a rollup"
+        assert _render_reports(served, nok) == expected
+
+    def test_the_call_count_survives_the_aggregation(self, rollup_corpus):
+        """The Calls column adds rec.count, which is why it still adds up."""
+        full = ccr.load_all_records()
+        ccr.load_all_records(use_rollups=True)
+        served = ccr.load_all_records(use_rollups=True)
+        assert sum(r.count for r in served) == len(full)
+
+    def test_every_rollup_record_carries_the_date_it_was_rolled_up_under(
+        self, rollup_corpus,
+    ):
+        ccr.load_all_records(use_rollups=True)
+        served = ccr.load_all_records(use_rollups=True)
+        stored = {row[1] for row in cache_db.load_ccreport_rollups()}
+        assert {r.oslo_date.isoformat() for r in served if r.oslo_date} == stored
+        # Live records derive theirs; carrying one would be the wrong answer
+        # the moment the record cache was written in another zone.
+        assert all(r.count == 1 for r in served if r.oslo_date is None)
+
+
+class TestRollupFingerprint:
+    """Every read-time input a rollup row froze has to force a rebuild."""
+
+    @pytest.fixture()
+    def builds(self, monkeypatch):
+        """The fingerprint of each rebuild, in order."""
+        written: list[str] = []
+        real = ccr.save_ccreport_rollups
+
+        def spy(rows, fingerprint):
+            written.append(fingerprint)
+            real(rows, fingerprint)
+
+        monkeypatch.setattr(ccr, "save_ccreport_rollups", spy)
+        return written
+
+    def _warm(self, builds) -> None:
+        ccr.load_all_records(use_rollups=True)
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 1, "the second run rebuilt for no reason"
+
+    def test_an_unchanged_corpus_never_rebuilds(self, rollup_corpus, builds):
+        self._warm(builds)
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 1
+
+    def test_a_pricing_change_rebuilds(self, rollup_corpus, builds, monkeypatch, tmp_path):
+        """Rollups freeze computed costs; nothing recomputes a frozen sum."""
+        stand_in = tmp_path / "pricing_stand_in.py"
+        stand_in.write_text("RATES = 1\n")
+        monkeypatch.setattr(ccr.pricing, "__file__", str(stand_in))
+        self._warm(builds)
+        stand_in.write_text("RATES = 2\n")
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_a_new_override_rule_rebuilds(self, rollup_corpus, builds):
+        self._warm(builds)
+        rollup_corpus.rules.append({"id": 2, "match_kind": "name",
+                                    "match_value": "ccr-projB",
+                                    "target": "ccr-projA"})
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_a_new_account_event_rebuilds(self, rollup_corpus, builds):
+        """Attribution is read-time everywhere else; a rollup would freeze it."""
+        self._warm(builds)
+        cache_db.record_account_event(
+            {"accountUuid": "u-third", "emailAddress": "third@example.com",
+             "organizationName": "Org"},
+            now=rollup_corpus.day(1, 0).timestamp(),
+        )
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_adopting_pre_capture_history_rebuilds(self, rollup_corpus, builds):
+        """The ts=0 row re-attributes the oldest days, which are all rolled up."""
+        self._warm(builds)
+        cache_db.set_adopted_account(cache_db.read_latest_account())
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_touching_a_file_with_old_records_rebuilds(self, rollup_corpus, builds):
+        self._warm(builds)
+        path = rollup_corpus.dir / "a-old.jsonl"
+        appended = _entry(rollup_corpus.day(40, 15), "sess-a",
+                          "/tmp/ccr-projA", "old-7", "r12")
+        path.write_text(path.read_text() + json.dumps(appended) + "\n")
+        records = ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+        # The appended call is older than the cutoff, so only a rebuild counts it.
+        expected = len([r for r in ccr.load_all_records() if r.session_id == "sess-a"])
+        assert sum(r.count for r in records if r.session_id == "sess-a") == expected
+
+    def test_purging_a_file_rebuilds(self, rollup_corpus, builds):
+        """It moves to the back of the dedup order, which can move a project."""
+        self._warm(builds)
+        (rollup_corpus.dir / "b-old.jsonl").unlink()
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_a_local_timezone_change_rebuilds(self, rollup_corpus, builds, monkeypatch):
+        """Days are bucketed in local time, so every one of them moves."""
+        self._warm(builds)
+        monkeypatch.setenv("TZ", "Pacific/Kiritimati")
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_the_day_rolling_over_rebuilds(self, rollup_corpus, builds, monkeypatch):
+        """The cutoff moves forward at local midnight: one rebuild a day."""
+        self._warm(builds)
+        real = ccr._rollup_cutoff
+        monkeypatch.setattr(ccr, "_rollup_cutoff",
+                            lambda: real() + dt.timedelta(days=1))
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_a_naming_change_rebuilds(self, rollup_corpus, builds, monkeypatch):
+        """_script_hash covers how a project name is derived, and rollups key on it."""
+        self._warm(builds)
+        monkeypatch.setattr(ccr, "_script_hash", lambda: "a-different-hash")
+        ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 2
+
+    def test_a_new_recent_file_alone_does_not_rebuild(self, rollup_corpus, builds):
+        """Only the frozen half of the corpus is fingerprinted."""
+        self._warm(builds)
+        _write_entries(rollup_corpus.dir / "g-recent.jsonl", [
+            _entry(rollup_corpus.day(1, 12), "sess-g",
+                   "/tmp/ccr-projA", "new-9", "r13"),
+        ])
+        records = ccr.load_all_records(use_rollups=True)
+        assert len(builds) == 1
+        assert any(r.message_id == "new-9" for r in records)
+
+
+class TestRollupsServeOnlyTheUnfilteredReport:
+    """A rollup row is a day of one session; anything finer needs the records."""
+
+    @pytest.fixture()
+    def reads(self, rollup_corpus, monkeypatch):
+        """Rollup reads, counted, with a valid rollup table already in place."""
+        ccr.load_all_records(use_rollups=True)  # builds
+        assert len(ccr.load_all_records(use_rollups=True)) < len(
+            ccr.load_all_records()), "the rollups are not serving yet"
+        counted: list[str] = []
+        real = ccr.load_ccreport_rollups
+
+        def spy():
+            counted.append("read")
+            return real()
+
+        monkeypatch.setattr(ccr, "load_ccreport_rollups", spy)
+        monkeypatch.setattr(
+            ccr, "load_rates_for_records", lambda _r, **_kw: (ccr.NokCtx(), True))
+        return counted
+
+    @pytest.mark.parametrize(("name", "value"), [
+        ("since", dt.datetime(2020, 1, 1, tzinfo=UTC)),
+        ("until", dt.datetime(2099, 1, 1, tzinfo=UTC)),
+        ("project_filter", "ccr-projA"),
+        ("account_filter", "work"),
+    ])
+    def test_a_filtered_load_never_reads_them(self, reads, name, value):
+        assert ccr.load_all_records(**{name: value})
+        assert reads == []
+
+    def test_adopt_never_reads_them(self, reads, capsys):
+        ccr.cmd_adopt(types.SimpleNamespace(remove=False, yes=True))
+        assert "Adopt" in capsys.readouterr().out
+        assert reads == []
+
+    def test_a_json_run_never_reads_them(self, reads, monkeypatch, capsys):
+        monkeypatch.setattr(ccr.sys, "argv", ["ccreport.py", "--json"])
+        ccr.main()
+        assert capsys.readouterr().out.startswith("[")
+        assert reads == []
+
+    def test_a_bare_report_reads_them(self, reads, monkeypatch, capsys):
+        """The control: without this, the four above prove nothing."""
+        monkeypatch.setattr(ccr.sys, "argv", ["ccreport.py"])
+        ccr.main()
+        capsys.readouterr()
+        assert reads == ["read"]
+
+    def test_asking_for_rollups_with_a_filter_is_refused(self, rollup_corpus):
+        with pytest.raises(ValueError, match="aggregate"):
+            ccr.load_all_records(project_filter="ccr-projA", use_rollups=True)
+
+
+class TestRecordOsloDate:
+    """Which FX date a record's cost converts under."""
+
+    def test_a_plain_record_derives_it_from_its_timestamp(self):
+        """Late enough in UTC that Oslo is already on the next date."""
+        rec = _rec(timestamp=dt.datetime(2026, 6, 15, 23, 30, tzinfo=UTC))
+        assert ccr.record_oslo_date(rec) == dt.date(2026, 6, 16)
+
+    def test_a_carried_date_wins_over_the_timestamp(self):
+        rec = _rec(timestamp=dt.datetime(2026, 6, 15, 23, 30, tzinfo=UTC),
+                   oslo_date=dt.date(2026, 1, 1))
+        assert ccr.record_oslo_date(rec) == dt.date(2026, 1, 1)
+
+    def test_the_conversion_uses_the_carried_date(self):
+        """A rollup record's timestamp is its group's newest call, not its FX date."""
+        nok = ccr.NokCtx({"2026-01-01": 8.0, "2026-06-16": 12.0}, "2026-06-16", False)
+        rec = _rec(timestamp=dt.datetime(2026, 6, 15, 23, 30, tzinfo=UTC),
+                   oslo_date=dt.date(2026, 1, 1))
+        assert ccr.record_cost_nok(rec, 1.0, nok) == (8.0, False)
+
+    def test_the_bulk_rate_load_asks_for_the_carried_dates(self, monkeypatch):
+        """Else the rate a rollup record needs is the one date never fetched."""
+        asked: list[set] = []
+        monkeypatch.setattr(ccr, "load_rates", lambda dates: asked.append(dates) or {})
+        ccr.load_rates_for_records([_rec(oslo_date=dt.date(2026, 1, 1))])
+        assert asked == [{dt.date(2026, 1, 1)}]

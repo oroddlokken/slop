@@ -15,6 +15,7 @@ import pytest
 import cache_db
 from cache_db import (
     _CCR_COLS,
+    RateLimitSample,
     bulk_load_ccreport_cache,
     bulk_save_file_costs,
     check_fetch_backoff,
@@ -23,6 +24,7 @@ from cache_db import (
     load_cost_cache,
     record_account_event,
     record_fetch_failure,
+    record_rate_limit_snapshots,
     release_costs_lock,
     release_fetch_lock,
     save_ccreport_file,
@@ -126,6 +128,14 @@ _INSERT_RECORD = (
 )
 
 
+# One rollup row in _CCR_ROLLUP_COLS order: the six-part key, the ts span, the
+# four token sums, cost, count.
+_ROLLUP_ROW = (
+    "2026-06-15", "2026-06-15", "sess-1", "proj", "claude-sonnet-5",
+    "me@work.example", 100.0, 900.0, 10, 20, 30, 40, 1.5, 7,
+)
+
+
 def _seed_ccreport(conn, rows, *, path="/tmp/proj/a.jsonl") -> None:
     """Insert (mid, model, ts, cost) rows under one ccreport_files parent."""
     conn.execute(
@@ -162,7 +172,7 @@ class TestSchemaColumns:
             assert {"cwd", "repo"} <= _columns(conn, "ccreport_records")
             # Tables added after a DB was created arrive through the schema
             # script, which only runs because SCHEMA_VERSION moved.
-            assert "account_events" in _tables(conn)
+            assert {"account_events", "rate_limit_snapshots"} <= _tables(conn)
         finally:
             conn.close()
             cache_db._conn = None
@@ -682,6 +692,29 @@ class TestScopedCcreportLoaders:
     def test_an_unmatched_prefix_loads_nothing(self, seeded):
         assert cache_db.load_ccreport_records_under("/p/-tmp-nothing/") == {}
 
+    def test_a_prefix_meta_load_equals_a_full_load_filtered_by_that_prefix(
+        self, seeded,
+    ):
+        everything, _ = bulk_load_ccreport_cache()
+        expected = {
+            path: fp for path, fp in everything.items()
+            if path.startswith(self.PROJ)
+        }
+        assert cache_db.load_ccreport_file_meta_under(self.PROJ) == expected
+        # The fingerprints themselves, not just the paths: a render compares
+        # them against a stat() and would serve stale records if they drifted.
+        assert expected == {self.PROJ + "a.jsonl": (1, 1),
+                            self.PROJ + "sub/b.jsonl": (2, 2)}
+
+    def test_a_sibling_sharing_the_prefix_string_has_no_fingerprint_either(
+        self, seeded,
+    ):
+        assert self.SIBLING + "c.jsonl" not in cache_db.load_ccreport_file_meta_under(
+            self.PROJ)
+
+    def test_an_unmatched_prefix_has_no_fingerprints(self, seeded):
+        assert cache_db.load_ccreport_file_meta_under("/p/-tmp-nothing/") == {}
+
     @pytest.mark.parametrize(
         "prefix, expected",
         [("/a/b/", ("/a/b/", "/a/b0")), ("xy", ("xy", "xz"))],
@@ -713,6 +746,9 @@ class TestCcreportSaltGate:
     @pytest.fixture
     def mismatched(self, db):
         save_ccreport_file(self.PATH, 111, 222, [self.RECORD])
+        cache_db.save_ccreport_rollups([_ROLLUP_ROW], "fp-1")
+        # After the file, which clears the scopes as any record write does.
+        cache_db.save_project_scope("/tmp/proj", "proj", ["/p/-tmp-proj/"])
         cache_db._set_meta(db, "ccreport_schema_salt", "not-the-salt")
         db.commit()
         return db
@@ -727,11 +763,27 @@ class TestCcreportSaltGate:
             pytest.param(
                 lambda: cache_db.load_ccreport_records_for_session("s1"),
                 id="session"),
+            pytest.param(
+                lambda: cache_db.load_ccreport_file_meta_under("/p/-tmp-proj/"),
+                id="prefix-meta"),
+            pytest.param(
+                lambda: cache_db.load_project_scope("/tmp/proj"),
+                id="project-scope"),
+            pytest.param(lambda: cache_db.load_ccreport_file_meta(), id="all-meta"),
+            pytest.param(
+                lambda: cache_db.load_ccreport_records_since(0.0), id="since"),
+            pytest.param(
+                lambda: cache_db.load_ccreport_file_meta_before(9e9), id="meta-before"),
+            pytest.param(lambda: cache_db.load_ccreport_rollups(), id="rollups"),
+            pytest.param(
+                lambda: cache_db.read_ccreport_rollup_fingerprint(), id="rollup-fp"),
         ],
     )
     def test_a_mismatched_salt_reads_as_empty(self, mismatched, read):
+        # A tuple is a result in its own right (bulk returns a pair, a cached
+        # scope a name and its prefixes), so emptiness is asked of its parts.
         result = read()
-        assert not any(result) if isinstance(result, tuple) else result == {}
+        assert not any(result) if isinstance(result, tuple) else not result
 
     def test_a_missing_salt_reads_as_empty(self, db):
         save_ccreport_file(self.PATH, 111, 222, [self.RECORD])
@@ -743,8 +795,11 @@ class TestCcreportSaltGate:
         bulk_load_ccreport_cache()
         cache_db.load_ccreport_records_under("/p/-tmp-proj/")
         cache_db.load_ccreport_records_for_session("s1")
+        cache_db.load_project_scope("/tmp/proj")
         assert mismatched.execute(
             "SELECT COUNT(*) FROM ccreport_records").fetchone()[0] == 1
+        assert mismatched.execute(
+            "SELECT COUNT(*) FROM project_scopes").fetchone()[0] == 1
         assert mismatched.execute(
             "SELECT COUNT(*) FROM ccreport_files").fetchone()[0] == 1
         # The cost above all: an orphan's came from a JSONL that is gone.
@@ -806,6 +861,154 @@ class TestInvalidateCcreport:
         assert cache_db.check_ccreport_valid(9, "hash") is False
         assert self._cost(two_files, self.GONE) == 0.25
         assert self._cost(two_files, self.LIVE) == 0.25
+
+
+class TestCcreportRollups:
+    """Per-day aggregates for the days past ccreport's cutoff (macsetup-4rte).
+
+    The rows are derived data — every one is rebuildable from
+    ccreport_records — so what these guard is not the rows but the pairing
+    between them and the fingerprint that vouches for them.
+    """
+
+    def test_a_row_round_trips_in_column_order(self, db):
+        cache_db.save_ccreport_rollups([_ROLLUP_ROW], "fp-1")
+        assert cache_db.load_ccreport_rollups() == [_ROLLUP_ROW]
+        assert cache_db.read_ccreport_rollup_fingerprint() == "fp-1"
+
+    def test_a_save_replaces_the_whole_table(self, db):
+        """The cutoff moves daily, so a rebuild is a new set, not a delta."""
+        cache_db.save_ccreport_rollups([_ROLLUP_ROW], "fp-1")
+        other = ("2026-06-16", *_ROLLUP_ROW[1:])
+        cache_db.save_ccreport_rollups([other], "fp-2")
+        assert cache_db.load_ccreport_rollups() == [other]
+        assert cache_db.read_ccreport_rollup_fingerprint() == "fp-2"
+
+    def test_an_empty_build_still_stamps_its_fingerprint(self, db):
+        """A corpus with nothing old enough must not rebuild on every run."""
+        cache_db.save_ccreport_rollups([], "fp-empty")
+        assert cache_db.load_ccreport_rollups() == []
+        assert cache_db.read_ccreport_rollup_fingerprint() == "fp-empty"
+
+    def test_a_failed_commit_leaves_neither_the_rows_nor_the_fingerprint(
+        self, db, monkeypatch,
+    ):
+        """A fingerprint outliving its rows is the one failure that reads as valid."""
+        cache_db.save_ccreport_rollups([_ROLLUP_ROW], "fp-1")
+        monkeypatch.setattr(cache_db, "get_connection", lambda: _FailingCommit(db))
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            cache_db.save_ccreport_rollups([("2026-06-16", *_ROLLUP_ROW[1:])], "fp-2")
+        # Back to the real connection by patching over the wrapper, not by
+        # undoing: an undo would also drop the fixture's DB_PATH redirect and
+        # read the machine's actual cache.
+        monkeypatch.setattr(cache_db, "get_connection", lambda: db)
+        assert cache_db.load_ccreport_rollups() == [_ROLLUP_ROW]
+        assert cache_db.read_ccreport_rollup_fingerprint() == "fp-1"
+
+    def test_invalidating_the_record_cache_drops_the_fingerprint(self, db):
+        """It NULLs the very costs the rollups froze."""
+        save_ccreport_file("/tmp/proj/a.jsonl", 111, 222, [])
+        cache_db.save_ccreport_rollups([_ROLLUP_ROW], "fp-1")
+        invalidate_ccreport({"/tmp/proj/a.jsonl"})
+        cache_db.init_ccreport_meta(1, "test-hash")  # as _ensure_cache_valid does
+        assert cache_db.read_ccreport_rollup_fingerprint() is None
+
+
+class TestCcreportRollupReadPath:
+    """The two queries that let a run skip the pre-cutoff records."""
+
+    LIVE = "/tmp/proj/live.jsonl"
+    GONE = "/tmp/proj/purged.jsonl"
+
+    def _rec(self, mid: str, ts: float) -> dict:
+        return {"mid": mid, "model": "claude-opus-5", "ts": ts, "sid": "s1",
+                "project": "proj", "cwd": "/tmp/proj", "repo": "gh/x",
+                "dk": mid, "cost": 0.25, "t": [1, 2, 3, 4]}
+
+    @pytest.fixture
+    def corpus(self, db):
+        save_ccreport_file(self.LIVE, 111, 222,
+                           [self._rec("old", 100.0), self._rec("new", 900.0)])
+        save_ccreport_file(self.GONE, 333, 444, [self._rec("orphan-new", 950.0)])
+        return db
+
+    def test_only_records_at_or_after_the_cutoff_come_back(self, corpus):
+        by_file = cache_db.load_ccreport_records_since(900.0)
+        assert [r["mid"] for r in by_file[self.LIVE]] == ["new"]
+
+    def test_one_query_covers_live_and_purged_files_alike(self, corpus):
+        """No join through ccreport_files, so an orphan is not a second query."""
+        by_file = cache_db.load_ccreport_records_since(500.0)
+        assert set(by_file) == {self.LIVE, self.GONE}
+
+    def test_the_row_order_is_insert_order(self, corpus):
+        """Dedup keeps the first occurrence, so the order decides the winner."""
+        by_file = cache_db.load_ccreport_records_since(0.0)
+        assert [r["mid"] for r in by_file[self.LIVE]] == ["old", "new"]
+
+    def test_only_files_holding_an_older_record_are_fingerprinted(self, corpus):
+        assert cache_db.load_ccreport_file_meta_before(900.0) == [
+            (self.LIVE, 111, 222),
+        ]
+        assert cache_db.load_ccreport_file_meta_before(0.0) == []
+
+    def test_the_meta_carries_the_same_fingerprint_the_record_cache_uses(self, corpus):
+        assert cache_db.load_ccreport_file_meta() == {
+            self.LIVE: (111, 222), self.GONE: (333, 444),
+        }
+
+
+class TestProjectScopeCache:
+    """A stored scope is trusted without a fingerprint, so its inputs must clear it.
+
+    The row is a pure function of project_overrides and the cached record
+    identities; nothing on it says which version of those it came from. What
+    keeps it honest is that every writer of either empties the table.
+    """
+
+    CWD = "/tmp/proj"
+    PREFIXES = ["/p/-tmp-proj/", "/p/-tmp-other/"]
+    RECORD = {
+        "mid": "m1", "model": "claude-opus-5", "ts": 1.5, "sid": "s1",
+        "project": "proj", "cwd": CWD, "repo": "gh/x", "dk": "dk1",
+        "cost": 0.25, "t": [1, 2, 3, 4],
+    }
+
+    @pytest.fixture
+    def cached(self, db):
+        cache_db.save_project_scope(self.CWD, "proj", self.PREFIXES)
+        return db
+
+    def test_a_saved_scope_comes_back_as_it_went_in(self, cached):
+        assert cache_db.load_project_scope(self.CWD) == ("proj", self.PREFIXES)
+
+    def test_an_uncached_cwd_reads_as_a_miss(self, cached):
+        assert cache_db.load_project_scope("/tmp/elsewhere") is None
+
+    def test_a_second_save_replaces_the_first(self, cached):
+        cache_db.save_project_scope(self.CWD, "renamed", ["/p/-tmp-proj/"])
+        assert cache_db.load_project_scope(self.CWD) == ("renamed", ["/p/-tmp-proj/"])
+
+    def test_adding_a_rule_clears_the_scopes(self, cached):
+        cache_db.add_project_override("name", "other", "proj")
+        assert cache_db.load_project_scope(self.CWD) is None
+
+    def test_deleting_a_rule_clears_the_scopes(self, cached):
+        cache_db.add_project_override("name", "other", "proj")
+        cache_db.save_project_scope(self.CWD, "proj", self.PREFIXES)
+        assert cache_db.delete_project_override("other") == 1
+        assert cache_db.load_project_scope(self.CWD) is None
+
+    def test_caching_a_record_clears_the_scopes(self, cached):
+        # A newly parsed file can be the one that joins another directory to
+        # this project, so its identity has to reach the next render.
+        save_ccreport_files([("/p/-tmp-other/a.jsonl", 1, 1, [dict(self.RECORD)])])
+        assert cache_db.load_project_scope(self.CWD) is None
+
+    def test_invalidating_the_ccreport_cache_clears_the_scopes(self, cached):
+        invalidate_ccreport({"/p/-tmp-proj/a.jsonl"})
+        cache_db.init_ccreport_meta(1, "test-hash")
+        assert cache_db.load_project_scope(self.CWD) is None
 
 
 class TestFlatPricingVariantsMigration:
@@ -1476,3 +1679,115 @@ class TestAdoptedAccount:
             (cache_db.ADOPTED_TS, "uuid-home"), (100.0, "uuid-work"),
             (300.0, "uuid-home"),
         ]
+
+
+class TestRateLimitSnapshots:
+    """Offered on every render; a row only when the reading actually moved."""
+
+    RESETS = 5_000.0
+    GATE = cache_db._RL_SNAPSHOT_MIN_INTERVAL_S
+
+    def _sample(self, pct, resets=None, window="session", model=None, source="stdin"):
+        return RateLimitSample(
+            window, pct, self.RESETS if resets is None else resets, model, source,
+        )
+
+    def _rows(self, db, window="session"):
+        return db.execute(
+            "SELECT ts, used_pct, resets_at, model, source FROM rate_limit_snapshots "
+            "WHERE window = ? ORDER BY ts",
+            (window,),
+        ).fetchall()
+
+    def test_the_first_sample_of_a_window_is_always_written(self, db):
+        record_rate_limit_snapshots([self._sample(23.5)], now=1000.0)
+        assert self._rows(db) == [(1000.0, 23.5, self.RESETS, None, "stdin")]
+
+    def test_the_raw_float_is_stored_not_the_gated_integer(self, db):
+        """The gate rounds so the table stays small; fill rate needs the float."""
+        record_rate_limit_snapshots([self._sample(23.456)], now=1000.0)
+        assert self._rows(db)[0][1] == 23.456
+
+    def test_an_unchanged_reading_writes_nothing(self, db):
+        record_rate_limit_snapshots([self._sample(23.5)], now=1000.0)
+        record_rate_limit_snapshots([self._sample(23.5)], now=1000.0 + 10 * self.GATE)
+        assert len(self._rows(db)) == 1
+
+    def test_a_reading_inside_the_same_whole_percent_writes_nothing(self, db):
+        record_rate_limit_snapshots([self._sample(23.4)], now=1000.0)
+        record_rate_limit_snapshots([self._sample(22.8)], now=1000.0 + 10 * self.GATE)
+        assert len(self._rows(db)) == 1
+
+    def test_a_changed_reading_inside_the_interval_writes_nothing(self, db):
+        """Two sessions rendering together straddle an integer boundary."""
+        record_rate_limit_snapshots([self._sample(23.4)], now=1000.0)
+        record_rate_limit_snapshots([self._sample(23.6)], now=1000.0 + self.GATE - 1)
+        assert len(self._rows(db)) == 1
+
+    def test_a_changed_reading_after_the_interval_is_written(self, db):
+        record_rate_limit_snapshots([self._sample(23.4)], now=1000.0)
+        record_rate_limit_snapshots([self._sample(23.6)], now=1000.0 + self.GATE)
+        assert [r[0:2] for r in self._rows(db)] == [(1000.0, 23.4), (1300.0, 23.6)]
+
+    def test_a_new_window_instance_is_written_immediately(self, db):
+        """A fresh window's first sample must not wait out the interval."""
+        record_rate_limit_snapshots([self._sample(80.0)], now=1000.0)
+        record_rate_limit_snapshots(
+            [self._sample(0.2, resets=self.RESETS + 18_000)], now=1001.0,
+        )
+        assert [(r[0], r[2]) for r in self._rows(db)] == [
+            (1000.0, self.RESETS), (1001.0, self.RESETS + 18_000),
+        ]
+
+    def test_each_window_is_gated_on_its_own_history(self, db):
+        record_rate_limit_snapshots([
+            self._sample(23.5), self._sample(41.0, window="week"),
+        ], now=1000.0)
+        # session moved a whole percent, week did not.
+        record_rate_limit_snapshots([
+            self._sample(30.0), self._sample(41.2, window="week"),
+        ], now=1000.0 + self.GATE)
+        assert len(self._rows(db)) == 2
+        assert len(self._rows(db, "week")) == 1
+
+    def test_the_scoped_window_keeps_its_model_and_source(self, db):
+        record_rate_limit_snapshots(
+            [self._sample(12, window="scoped", model="claude-opus-4", source="api")],
+            now=1000.0,
+        )
+        assert self._rows(db, "scoped") == [
+            (1000.0, 12.0, self.RESETS, "claude-opus-4", "api"),
+        ]
+
+    def test_the_gated_out_render_takes_no_write_lock(self, db):
+        """Every render offers every window; the unchanged case is the norm."""
+        record_rate_limit_snapshots([self._sample(23.5)], now=1000.0)
+        commits = _count_commits(db)
+        try:
+            record_rate_limit_snapshots([self._sample(23.5)], now=2000.0)
+        finally:
+            db.set_trace_callback(None)
+        assert commits() == 0
+
+    def test_two_samples_of_one_window_in_the_same_tick_keep_the_later(self, db):
+        record_rate_limit_snapshots([self._sample(23.5)], now=1000.0)
+        record_rate_limit_snapshots(
+            [self._sample(0.5, resets=self.RESETS + 18_000)], now=1000.0,
+        )
+        assert self._rows(db) == [(1000.0, 0.5, self.RESETS + 18_000, None, "stdin")]
+
+    def test_an_empty_sample_list_is_a_no_op(self, db):
+        record_rate_limit_snapshots([], now=1000.0)
+        assert self._rows(db) == []
+
+    def test_the_newest_lookup_is_a_primary_key_scan(self, db):
+        """The render pays this SELECT per window on every single render."""
+        plan = db.execute(
+            "EXPLAIN QUERY PLAN SELECT ts, used_pct, resets_at "
+            "FROM rate_limit_snapshots WHERE window = ? ORDER BY ts DESC LIMIT 1",
+            ("session",),
+        ).fetchall()
+        detail = " ".join(r[3] for r in plan)
+        assert "USING PRIMARY KEY" in detail
+        assert "SCAN" not in detail
+        assert "TEMP B-TREE" not in detail

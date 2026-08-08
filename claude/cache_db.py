@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # pricing.py imports cache_db only inside functions, so this direction is safe.
 from pricing import project_key, rolling_cost_keys
@@ -42,7 +42,7 @@ _conn: sqlite3.Connection | None = None
 # BUMP THIS on any change to _SCHEMA_SQL, _ADDED_COLUMNS, or the migration list
 # in _run_migrations — an existing DB is otherwise never reopened on the slow
 # path and never sees the new DDL. A needless bump costs one slow open per DB.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -152,6 +152,40 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
 CREATE INDEX IF NOT EXISTS idx_ccr_file_ts ON ccreport_records(file_path, ts);
 CREATE INDEX IF NOT EXISTS idx_ccr_sid ON ccreport_records(sid);
 
+-- Per-day aggregates of the records ccreport has already read, for the days
+-- old enough that nothing can still change them. A bare report deserializes
+-- ~95k record rows to fold them into a handful of tables; the days past the
+-- rollup cutoff fold to a few thousand rows here instead (macsetup-4rte).
+--
+-- The key is the finest grain any report needs: session for the session table,
+-- project/model/account for theirs, day for the daily and monthly ones, and
+-- oslo_date because the NOK rate is per Oslo date and a local day can straddle
+-- two of them. cost is frozen at build time — it is the sum of what each
+-- record's cost() answered, log-provided or computed — so pricing.py is hashed
+-- into the fingerprint, which the record cache deliberately does not do.
+--
+-- Whether these rows still describe the corpus is one meta row,
+-- ccreport_rollup_fp; rows and fingerprint are written in one transaction, and
+-- ccreport rebuilds the lot on any mismatch. Nothing here is irreplaceable:
+-- every row is derivable from ccreport_records.
+CREATE TABLE IF NOT EXISTS ccreport_rollups (
+    day           TEXT NOT NULL,   -- local YYYY-MM-DD, what the reports bucket by
+    oslo_date     TEXT NOT NULL,   -- ISO date the NOK rate is looked up under
+    sid           TEXT NOT NULL,
+    project       TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    account       TEXT NOT NULL,
+    min_ts        REAL NOT NULL,
+    max_ts        REAL NOT NULL,
+    input_tokens  INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_create  INTEGER NOT NULL,
+    cache_read    INTEGER NOT NULL,
+    cost          REAL NOT NULL,
+    n             INTEGER NOT NULL,
+    PRIMARY KEY (day, oslo_date, sid, project, model, account)
+) WITHOUT ROWID;
+
 -- Manual project-grouping rules, applied as a pure function over the signals
 -- stored on each record (name/remote/cwd) at report time. Local data, never
 -- committed: merges and renames live here, not in code.
@@ -162,6 +196,28 @@ CREATE TABLE IF NOT EXISTS project_overrides (
     target      TEXT NOT NULL,
     UNIQUE (match_kind, match_value)
 );
+
+-- The project scope a render resolves for a cwd: the merge target's name, and
+-- every project directory whose records resolve to that same target. Deriving
+-- it needs a GROUP BY over every cached record, 0.020s of an 0.085s statusline
+-- call, and the answer is a pure function of project_overrides and those
+-- records (macsetup-6cov). So a present row is valid by construction rather
+-- than by a fingerprint: every writer of either input — both override writers,
+-- save_ccreport_files, invalidate_ccreport — empties this table in the same
+-- transaction, and readers gate on the ccreport salt so a stale row format
+-- degrades the cached scope exactly as it degrades a freshly derived one.
+--
+-- Not airtight, deliberately: a render that derives a scope just before a
+-- ccreport write and stores it just after keeps that pre-write answer until
+-- the next write clears it. What it costs is one merged directory missing from
+-- the cost windows, which is what the render would have shown anyway, and the
+-- next ccreport run ends it. Fencing that race would put a read-modify-write
+-- on the WAL for it.
+CREATE TABLE IF NOT EXISTS project_scopes (
+    cwd      TEXT PRIMARY KEY,
+    name     TEXT NOT NULL,
+    prefixes TEXT NOT NULL   -- JSON array of path prefixes
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS extra_usage_snapshots (
     ts    REAL PRIMARY KEY,
@@ -185,6 +241,30 @@ CREATE TABLE IF NOT EXISTS account_events (
     email             TEXT,
     organization_uuid TEXT,
     organization_name TEXT
+) WITHOUT ROWID;
+
+-- Append-only utilization samples, written by the statusline render. The live
+-- percentages are the only record there is that a window ever filled, so
+-- without this table a report can say what a window costs but not how it got
+-- there. resets_at is the window-instance key: rows sharing one are samples of
+-- the same 5-hour/7-day window, which is what lets a report derive a fill rate
+-- rather than a scatter of unrelated readings.
+--
+-- Deliberately no account column — a row is attributed by its ts against
+-- account_events, exactly as ccreport attributes a record, so a later /login or
+-- an `adopt` re-attributes these samples too with nothing to rewrite here.
+--
+-- No pruning yet: the write gate in record_rate_limit_snapshots bounds this at
+-- ~100 rows per window instance, and how long a fill history is worth keeping
+-- is a reporting-side decision that has no reader yet.
+CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
+    ts        REAL NOT NULL,
+    window    TEXT NOT NULL,   -- 'session' | 'week' | 'sonnet' | 'scoped'
+    used_pct  REAL NOT NULL,
+    resets_at REAL NOT NULL,   -- epoch seconds; rows sharing it are one window instance
+    model     TEXT,            -- scoped window only
+    source    TEXT NOT NULL,   -- 'stdin' | 'api'
+    PRIMARY KEY (window, ts)
 ) WITHOUT ROWID;
 """
 
@@ -297,7 +377,7 @@ def get_connection() -> sqlite3.Connection:
         conn.execute("PRAGMA cache_size = -2000")
         # Every process pays this bootstrap on its first DB touch — statusline
         # imports this module for every render — and on a warm DB all of it is
-        # no-ops: 14 IF NOT EXISTS statements, six ALTERs raising and catching
+        # no-ops: 15 IF NOT EXISTS statements, six ALTERs raising and catching
         # "duplicate column", a SELECT per migration flag. The stamp says the
         # whole thing already ran to completion at this SCHEMA_VERSION.
         bootstrap_needed = _user_version(conn) != SCHEMA_VERSION
@@ -1520,6 +1600,12 @@ def invalidate_ccreport(live_paths: set[str]) -> None:
             chunk,
         )
     conn.execute("DELETE FROM meta WHERE key IN ('ccreport_version', 'ccreport_script_hash', 'ccreport_schema_salt')")
+    # The rollups froze costs the UPDATE above just NULLed, so they no longer
+    # describe the corpus. Dropping the fingerprint is enough — the rebuild
+    # replaces the rows — and it keeps the stale set unreadable in the window
+    # before that rebuild runs.
+    conn.execute("DELETE FROM meta WHERE key = ?", (_ROLLUP_FP_KEY,))
+    _clear_project_scopes(conn)
     conn.commit()
 
 
@@ -1615,6 +1701,33 @@ def load_ccreport_records_under(prefix: str) -> dict[str, list[dict]]:
     ).fetchall())
 
 
+def load_ccreport_file_meta_under(prefix: str) -> dict[str, tuple[int, int]]:
+    """Cached (mtime_ns, size) for every file path starting *prefix*.
+
+    The fingerprint half of load_ccreport_records_under, for a reader deciding
+    per file whether the cached records still describe what is on disk
+    (macsetup-rn21). load_ccreport_file_identities answers a different
+    question — which project a file belongs to — and carries no fingerprint,
+    and bulk_load_ccreport_cache pays for every file on the machine.
+
+    Empty when the cached rows are not in this build's format; see
+    _ccreport_readable. That is what makes a stale-format cache degrade to a
+    full re-parse rather than to wrong numbers.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return {}
+    lo, hi = prefix_range(prefix)
+    return {
+        row[0]: (row[1], row[2])
+        for row in conn.execute(
+            "SELECT path, mtime_ns, size FROM ccreport_files "
+            "WHERE path >= ? AND path < ?",
+            (lo, hi),
+        ).fetchall()
+    }
+
+
 def load_ccreport_records_for_session(session_id: str) -> dict[str, list[dict]]:
     """Cached records for one session id, as {path: [record]}.
 
@@ -1659,6 +1772,52 @@ def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, li
         f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records"
     ).fetchall()
     return file_meta, _group_by_file(rec_rows)
+
+
+def load_ccreport_file_meta() -> dict[str, tuple[int, int]]:
+    """Cached (mtime_ns, size) for every cached file, machine-wide.
+
+    The unscoped twin of load_ccreport_file_meta_under, for the rollup read
+    path: it needs to know which files moved on disk and nothing else about
+    them, and bulk_load_ccreport_cache's second query is exactly the ~95k
+    record rows that path exists to not read.
+
+    Empty when the cached rows are not in this build's format; see
+    _ccreport_readable.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return {}
+    return {
+        row[0]: (row[1], row[2])
+        for row in conn.execute("SELECT path, mtime_ns, size FROM ccreport_files")
+    }
+
+
+def load_ccreport_records_since(cutoff_ts: float) -> dict[str, list[dict]]:
+    """Cached records at or after *cutoff_ts*, as {path: [record]}.
+
+    One scan covers live and orphaned files alike, which is what lets the
+    rollup path apply the same dedup to the recent slice that a full load
+    applies to everything. A full table scan on purpose: no index leads with
+    ts, and a standalone one is deliberately not there (macsetup-3le2).
+
+    ORDER BY id pins the row order to insert order — the order
+    bulk_load_ccreport_cache hands the same rows to the same dedup — rather
+    than leaving first-occurrence winners to whatever the planner picks. A
+    table scan already yields rowid order, so it costs no sort.
+
+    Empty when the cached rows are not in this build's format; see
+    _ccreport_readable.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return {}
+    return _group_by_file(conn.execute(
+        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records "  # noqa: S608
+        "WHERE ts >= ? ORDER BY id",
+        (cutoff_ts,),
+    ).fetchall())
 
 
 def load_ccreport_file_identities() -> list[tuple[str, str | None, str | None, str]]:
@@ -1725,6 +1884,7 @@ def save_ccreport_files(entries: list[tuple[str, int, int, list[dict]]]) -> None
                 f"VALUES ({_CCR_INSERT_PLACEHOLDERS})",
                 rows,
             )
+        _clear_project_scopes(conn)
         conn.execute("COMMIT")
     except Exception:
         _rollback_if_open(conn)
@@ -1736,6 +1896,99 @@ def save_ccreport_file(
 ) -> None:
     """Save/replace a single file entry and all its records."""
     save_ccreport_files([(path, mtime_ns, size, records)])
+
+
+def load_ccreport_file_meta_before(cutoff_ts: float) -> list[tuple[str, int, int]]:
+    """(path, mtime_ns, size) for every cached file holding a record older
+    than *cutoff_ts*, sorted by path.
+
+    The half of the corpus a rollup froze, identified the same way the record
+    cache identifies a file. Growing, shrinking or re-parsing any of these
+    changes what the rollup should have said, so this is what the rollup
+    fingerprint is built over. EXISTS rather than a join so idx_ccr_file_ts
+    answers each file with one seek and stops.
+
+    Empty when the cached rows are not in this build's format; see
+    _ccreport_readable.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return []
+    return conn.execute(
+        "SELECT path, mtime_ns, size FROM ccreport_files f WHERE EXISTS ("
+        "  SELECT 1 FROM ccreport_records r WHERE r.file_path = f.path AND r.ts < ?"
+        ") ORDER BY path",
+        (cutoff_ts,),
+    ).fetchall()
+
+
+# The rollup columns, in table order: the six-part key, the timestamp span, the
+# four token sums, then cost and record count. Both the SELECT and the INSERT
+# are built from this, so ccreport reads a row back in the order it wrote one.
+_CCR_ROLLUP_COLS = (
+    "day", "oslo_date", "sid", "project", "model", "account",
+    "min_ts", "max_ts",
+    "input_tokens", "output_tokens", "cache_create", "cache_read",
+    "cost", "n",
+)
+_CCR_ROLLUP_SELECT = ", ".join(_CCR_ROLLUP_COLS)
+_CCR_ROLLUP_PLACEHOLDERS = ", ".join("?" * len(_CCR_ROLLUP_COLS))
+
+_ROLLUP_FP_KEY = "ccreport_rollup_fp"
+
+
+def read_ccreport_rollup_fingerprint() -> str | None:
+    """The fingerprint the stored rollup rows were built under, or None.
+
+    None also when the rows are not in this build's format — the salt gates
+    this the same as every other ccreport reader, so a format change makes the
+    rollups miss and rebuild rather than serve rows nobody can interpret.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return None
+    return _get_meta(conn, _ROLLUP_FP_KEY)
+
+
+def load_ccreport_rollups() -> list[tuple]:
+    """Every rollup row, as tuples in _CCR_ROLLUP_COLS order.
+
+    Callers must have checked read_ccreport_rollup_fingerprint first: these
+    rows carry no validity of their own, and a stale set is wrong numbers
+    rather than missing ones.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return []
+    return conn.execute(
+        f"SELECT {_CCR_ROLLUP_SELECT} FROM ccreport_rollups"  # noqa: S608
+    ).fetchall()
+
+
+def save_ccreport_rollups(rows: list[tuple], fingerprint: str) -> None:
+    """Replace the whole rollup table and stamp it with *fingerprint*.
+
+    One transaction for both, because a fingerprint that outlives the rows it
+    describes is the one failure mode that reads as valid: the next run would
+    serve a short table as the whole of history. Whole-table replace rather
+    than a merge — the cutoff moves a day forward every day, so most of what
+    changes between builds is which rows exist at all.
+    """
+    conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM ccreport_rollups")
+        if rows:
+            conn.executemany(
+                f"INSERT INTO ccreport_rollups ({_CCR_ROLLUP_SELECT}) "  # noqa: S608
+                f"VALUES ({_CCR_ROLLUP_PLACEHOLDERS})",
+                rows,
+            )
+        _set_meta(conn, _ROLLUP_FP_KEY, fingerprint)
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_if_open(conn)
+        raise
 
 
 def count_ccreport_records_without_signals() -> int:
@@ -1777,6 +2030,7 @@ def add_project_override(match_kind: str, match_value: str, target: str) -> None
         "ON CONFLICT (match_kind, match_value) DO UPDATE SET target = excluded.target",
         (match_kind, match_value, target),
     )
+    _clear_project_scopes(conn)
     conn.commit()
 
 
@@ -1792,8 +2046,55 @@ def delete_project_override(match_value: str, match_kind: str | None = None) -> 
         cur = conn.execute(
             "DELETE FROM project_overrides WHERE match_value = ?", (match_value,)
         )
+    _clear_project_scopes(conn)
     conn.commit()
     return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Resolved project scopes (per cwd)
+# ---------------------------------------------------------------------------
+
+def load_project_scope(cwd: str) -> tuple[str, list[str]] | None:
+    """The cached (name, prefixes) pricing.project_scope resolved for *cwd*.
+
+    None when nothing is cached, and also when the salt says the rows are not
+    in this build's format: load_ccreport_file_identities reads as empty there
+    and project_scope degrades to the unmerged scope, so a cached scope has to
+    degrade with it rather than keep serving merged prefixes its own reader
+    could no longer re-derive.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return None
+    row = conn.execute(
+        "SELECT name, prefixes FROM project_scopes WHERE cwd = ?", (cwd,)
+    ).fetchone()
+    if row is None:
+        return None
+    return (row[0], list(json.loads(row[1])))
+
+
+def save_project_scope(cwd: str, name: str, prefixes: list[str]) -> None:
+    """Cache the scope resolved for *cwd*, replacing any earlier answer."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR REPLACE INTO project_scopes (cwd, name, prefixes) "
+        "VALUES (?, ?, ?)",
+        (cwd, name, json.dumps(prefixes)),
+    )
+    conn.commit()
+
+
+def _clear_project_scopes(conn: sqlite3.Connection) -> None:
+    """Drop every cached scope. No commit — this rides the caller's write.
+
+    Emptying rather than patching: a rule or a record can move any cwd's scope,
+    and the cwd nobody is standing in costs nothing to leave uncached. Callers
+    are every writer of the two inputs, which is what lets a surviving row be
+    trusted without a fingerprint of its own.
+    """
+    conn.execute("DELETE FROM project_scopes")
 
 
 # ---------------------------------------------------------------------------
@@ -1951,6 +2252,86 @@ def clear_adopted_account() -> bool:
     cur = conn.execute("DELETE FROM account_events WHERE ts = ?", (ADOPTED_TS,))
     conn.commit()
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Rate limit utilization samples (written by the statusline render)
+# ---------------------------------------------------------------------------
+
+# Seconds a changed reading has to be apart from the stored one to land, within
+# the same window instance. Two sessions rendering side by side read the same
+# quota microseconds apart, so a value sitting on an integer boundary — 23.9
+# here, 24.1 there — would otherwise write a row per render forever. A window
+# fills over hours; nothing worth plotting happens inside five minutes.
+_RL_SNAPSHOT_MIN_INTERVAL_S = 300
+
+
+class RateLimitSample(NamedTuple):
+    """One window's utilization as a single render read it.
+
+    Named rather than a bare tuple because the two ends live in different files:
+    used_pct and resets_at are both floats, so a swapped pair would store a
+    plausible-looking row instead of failing.
+    """
+
+    window: str
+    used_pct: float
+    resets_at: float
+    model: str | None
+    source: str
+
+
+def record_rate_limit_snapshots(
+    samples: list[RateLimitSample], now: float,
+) -> None:
+    """Append the *samples* whose reading has actually moved.
+
+    The caller is the statusline, on every render, offering every window it can
+    see — so the unchanged case has to cost one SELECT per window and no write
+    lock: (window, ts) is the primary key of a WITHOUT ROWID table, making
+    "newest sample of this window" the first step of a reverse key scan.
+
+    A sample lands when there is nothing stored for the window, when resets_at
+    names a different window instance, or when the reading changed by a whole
+    percent and _RL_SNAPSHOT_MIN_INTERVAL_S has passed. The whole-percent gate
+    is what bounds one window instance at ~100 rows; the resets_at exception is
+    there so a fresh window's first sample is not held back by it. used_pct
+    stores the raw float — the gate rounds, the row does not.
+
+    No exception handling here: the render call site owns that, like every other
+    bookkeeping write it makes.
+    """
+    conn = get_connection()
+    wrote = False
+    for window, used_pct, resets_at, model, source in samples:
+        prior = conn.execute(
+            "SELECT ts, used_pct, resets_at FROM rate_limit_snapshots "
+            "WHERE window = ? ORDER BY ts DESC LIMIT 1",
+            (window,),
+        ).fetchone()
+        if prior is not None:
+            prior_ts, prior_pct, prior_resets = prior
+            if (
+                prior_resets == resets_at
+                and (
+                    int(round(used_pct)) == int(round(prior_pct))
+                    or now - prior_ts < _RL_SNAPSHOT_MIN_INTERVAL_S
+                )
+            ):
+                continue
+        # OR REPLACE covers two renders landing inside one tick of time.time():
+        # that is the same instant, so the later reading is the one to keep.
+        conn.execute(
+            "INSERT OR REPLACE INTO rate_limit_snapshots "
+            "(ts, window, used_pct, resets_at, model, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (now, window, float(used_pct), float(resets_at), model, source),
+        )
+        wrote = True
+    # Guarded so the gated-out render leaves no doubt it took no write lock,
+    # rather than relying on sqlite3 not having begun a transaction for SELECTs.
+    if wrote:
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------

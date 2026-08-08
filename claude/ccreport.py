@@ -16,6 +16,7 @@ import bisect
 import calendar
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from rich.text import Text
 
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cache_db
 from cache_db import (
     ADOPTED_TS,
     add_project_override,
@@ -46,14 +48,21 @@ from cache_db import (
     init_ccreport_meta,
     invalidate_ccreport,
     load_account_events,
+    load_ccreport_file_meta,
+    load_ccreport_file_meta_before,
+    load_ccreport_records_since,
+    load_ccreport_rollups,
     read_adopted_account,
+    read_ccreport_rollup_fingerprint,
     read_latest_account,
     save_ccreport_files,
+    save_ccreport_rollups,
     set_adopted_account,
 )
+import pricing
 import project_identity
 from exchange import get_rate, load_rates, to_oslo_date
-from pricing import calc_cost, dedup_identity, extract_assistant_fields
+from pricing import _local_tz, calc_cost, dedup_identity, extract_assistant_fields
 
 # Project naming and the merge/override rules are shared with pricing.py, which
 # scopes the statusline's per-project costs by them; see project_identity.
@@ -310,6 +319,16 @@ class UsageRecord:
     parsed from the log (which never names an account) and not written to the
     record cache, so a change log that grows a missing event fixes every past
     report on the next run instead of needing a re-parse."""
+    count: int = 1
+    """How many API calls this stands for. One, except for the records a rollup
+    row deserializes to, which stand for a whole day of a session's calls — the
+    Calls column adds this rather than counting records."""
+    oslo_date: date | None = None
+    """The FX date to convert this record's cost under, when it cannot be
+    derived from `timestamp`. A rollup record's timestamp is the newest in its
+    group, and a local day can straddle two Oslo dates, so the date the group
+    was actually rolled up under travels with it. None everywhere else, where
+    to_oslo_date(timestamp) is the answer by construction."""
     _cost: float | None = field(default=None, repr=False, compare=False)
     """Memo for cost(). Deliberately not cost_usd: that field means 'the log gave
     us this' and is what _serialize_records writes to the SQLite cache, so a
@@ -392,6 +411,16 @@ class NokCtx:
         return hit
 
 
+def record_oslo_date(rec: UsageRecord) -> date:
+    """The FX date a record converts under: its own, else its timestamp's.
+
+    A rollup record carries the date it was aggregated under, which is the only
+    correct answer for it — re-deriving from its timestamp would move the whole
+    group onto whichever Oslo date the newest call in it happened to fall on.
+    """
+    return rec.oslo_date if rec.oslo_date is not None else to_oslo_date(rec.timestamp)
+
+
 def record_cost_nok(rec: UsageRecord, cost_usd: float, nok: NokCtx) -> tuple[float | None, bool]:
     """Convert a record's USD cost to NOK using its day's exchange rate.
 
@@ -399,7 +428,7 @@ def record_cost_nok(rec: UsageRecord, cost_usd: float, nok: NokCtx) -> tuple[flo
     Returns (nok_amount, estimated) where estimated is True only at the
     trailing edge of rate data (the true rate is not yet known).
     """
-    rate, estimated = nok.rate_for(to_oslo_date(rec.timestamp))
+    rate, estimated = nok.rate_for(record_oslo_date(rec))
     if rate is None:
         return None, False
     multiplier = 1.25 if nok.mva else 1.0
@@ -435,7 +464,7 @@ def _bucket_by(
             _accum_nok(b, rec, cost, nok)
         if rec.model != "<synthetic>":
             b.models[rec.model] = b.models.get(rec.model, 0.0) + cost
-        b.count += 1
+        b.count += rec.count
     return buckets
 
 
@@ -447,7 +476,7 @@ def load_rates_for_records(records: list[UsageRecord], *, mva: bool = True) -> t
     """
     if not records:
         return NokCtx(mva=mva), False
-    dates: set[date] = {to_oslo_date(r.timestamp) for r in records}
+    dates: set[date] = {record_oslo_date(r) for r in records}
     rates = load_rates(dates)
     if not rates:
         return NokCtx(mva=mva), False
@@ -642,66 +671,126 @@ def _keep(
     return True
 
 
+def _keep_filters(
+    since: datetime | None,
+    until: datetime | None,
+    project_filter: str | None,
+    account_filter: str | None,
+) -> dict:
+    """The keyword bundle every _keep call in a load shares.
+
+    One per load, because ``seen_keys`` is the run's dedup state: two bundles
+    would dedup the live and the purged half of the corpus independently.
+    """
+    return {
+        "since": since, "until": until, "project_filter": project_filter,
+        "account_filter": account_filter,
+        "seen_keys": set(), "override": _build_override_fn(),
+        # One read of the change log for the run; every record is stamped from
+        # it, cached and freshly parsed alike.
+        "accounts": AccountTimeline(load_account_events()),
+    }
+
+
+def _refresh_changed_files(
+    files: list[Path], file_meta: dict[str, tuple[int, int]],
+) -> tuple[dict[str, list[UsageRecord]], set[str]]:
+    """Re-parse and cache every file whose (mtime_ns, size) left the cache.
+
+    Returns what each re-parsed file now holds, plus the paths that could not
+    be read at all — a caller must drop those rather than fall back to their
+    cached records, which is what makes an unreadable file under-report for one
+    run instead of reporting a mix of two parses.
+
+    Saves in batches so no single transaction spans a long stretch of parsing.
+    """
+    fresh: dict[str, list[UsageRecord]] = {}
+    unreadable: set[str] = set()
+    pending: list[tuple[str, int, int, list[dict]]] = []
+    for path in files:
+        key = str(path)
+        try:
+            st = path.stat()
+        except OSError:
+            unreadable.add(key)
+            continue
+        cached = file_meta.get(key)
+        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            continue
+        try:
+            records = parse_jsonl_file(path)
+        except (OSError, UnicodeDecodeError):
+            # Skipping the save leaves the file's previous cache entry whole;
+            # this run under-reports it, the next readable parse restores it.
+            # Saving a partial parse would not.
+            unreadable.add(key)
+            continue
+        fresh[key] = records
+        pending.append((key, st.st_mtime_ns, st.st_size, _serialize_records(records)))
+        if len(pending) >= _SAVE_BATCH:
+            save_ccreport_files(pending)
+            pending = []
+    save_ccreport_files(pending)
+    return fresh, unreadable
+
+
 def load_all_records(
     since: datetime | None = None,
     until: datetime | None = None,
     project_filter: str | None = None,
     account_filter: str | None = None,
+    *,
+    use_rollups: bool = False,
 ) -> list[UsageRecord]:
     """Load and deduplicate all usage records.
 
     Uses a SQLite cache keyed by (mtime_ns, size) to avoid re-parsing
     unchanged files.  Deduplication uses a composite key of message_id +
     request_id (matching ccusage).  First occurrence wins.
+
+    *use_rollups* serves the days older than the cutoff from precomputed
+    aggregates instead of their records; see _load_with_rollups. Off by
+    default, and only ever on for a whole-corpus report — every caller that
+    needs record-level detail (a filter, --json, adopt) gets the full stream
+    without having to know rollups exist.
     """
     files = discover_jsonl_files()
-    _ensure_cache_valid({str(p) for p in files})
-    seen_keys: set[str] = set()
-    filters = {
-        "since": since, "until": until, "project_filter": project_filter,
-        "account_filter": account_filter,
-        "seen_keys": seen_keys, "override": _build_override_fn(),
-        # One read of the change log for the run; every record is stamped from
-        # it, cached and freshly parsed alike.
-        "accounts": AccountTimeline(load_account_events()),
-    }
+    live_paths = {str(p) for p in files}
+    _ensure_cache_valid(live_paths)
+    if use_rollups:
+        if since or until or project_filter or account_filter:
+            raise ValueError(
+                "rollups aggregate away what a filter selects on; "
+                "load the full record stream instead"
+            )
+        return _load_with_rollups(files, live_paths)
+    return _load_full(files, live_paths, since, until, project_filter, account_filter)
+
+
+def _load_full(
+    files: list[Path],
+    live_paths: set[str],
+    since: datetime | None,
+    until: datetime | None,
+    project_filter: str | None,
+    account_filter: str | None,
+) -> list[UsageRecord]:
+    """Every record the cache and the live files hold, filtered and deduped."""
+    filters = _keep_filters(since, until, project_filter, account_filter)
     all_records: list[UsageRecord] = []
-    live_paths: set[str] = set()
 
     # Bulk-load cache (2 queries instead of N+1)
     file_meta, records_by_file = bulk_load_ccreport_cache()
-
-    pending: list[tuple[str, int, int, list[dict]]] = []
+    fresh, unreadable = _refresh_changed_files(files, file_meta)
 
     for path in files:
         key = str(path)
-        live_paths.add(key)
-        try:
-            st = path.stat()
-        except OSError:
+        if key in unreadable:
             continue
-        cached = file_meta.get(key)
-
-        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        records = fresh.get(key)
+        if records is None:
             records = _deserialize_records(records_by_file.get(key, []))
-        else:
-            try:
-                records = parse_jsonl_file(path)
-            except (OSError, UnicodeDecodeError):
-                # Skipping the save leaves the file's previous cache entry
-                # whole; this run under-reports it, the next readable parse
-                # restores it. Saving a partial parse would not.
-                continue
-            pending.append(
-                (key, st.st_mtime_ns, st.st_size, _serialize_records(records))
-            )
-            if len(pending) >= _SAVE_BATCH:
-                save_ccreport_files(pending)
-                pending = []
-
         all_records += [r for r in records if _keep(r, **filters)]
-
-    save_ccreport_files(pending)
 
     # Records from files purged off disk but still cached: bulk_load already
     # returned them, so no second query — its result covers every cached file,
@@ -713,6 +802,209 @@ def load_all_records(
 
     all_records.sort(key=lambda r: r.timestamp)
     return all_records
+
+
+# --- Per-day rollups for the days that can no longer change ---
+
+ROLLUP_WINDOW_DAYS = 14
+"""How many days back from local midnight stay on the record path.
+
+Everything older is served from ccreport_rollups. Deliberately the same span as
+the monthly report's trailing-day projection: that window starts at exactly
+this cutoff, so it reads live records only and never has to make sense of a
+day-sized aggregate. Moving one of the two means moving the other.
+"""
+
+
+def _rollup_cutoff() -> datetime:
+    """The oldest instant still served from records: local midnight, minus the
+    window. Rolls forward once a day, which costs one rebuild per day."""
+    today = datetime.now().astimezone()
+    midnight = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - timedelta(days=ROLLUP_WINDOW_DAYS)
+
+
+def _pricing_hash() -> str:
+    """SHA256 of pricing.py, for the rollup fingerprint only.
+
+    A rollup freezes each record's cost() at build time, and nothing recomputes
+    a frozen sum — so a price edit has to invalidate the rollups. _script_hash
+    deliberately leaves pricing out for the opposite reason: a record cache
+    stores names, not costs, and re-parsing the corpus every time a model is
+    added would cost far more than it saves.
+    """
+    try:
+        return hashlib.sha256(Path(pricing.__file__).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _rollup_fingerprint(cutoff: datetime, orphans: set[str]) -> str:
+    """Digest of every input a stored rollup row froze an answer about.
+
+    Any mismatch rebuilds, so a part missing here is silently wrong numbers.
+    The account log and the override rules are in it because both re-attribute
+    history at read time with no re-parse — the very thing a rollup would
+    otherwise hide. The orphan set is in it because a file being purged moves
+    it to the back of the dedup order, which can hand a duplicated message's
+    surviving copy a different project.
+    """
+    parts: list[str] = [
+        # The record cache's own contract: a version bump or a naming change
+        # re-parses the corpus the rollups were built from.
+        f"{CACHE_VERSION}:{_script_hash()}",
+        _pricing_hash(),
+        # Through the module attribute, which is how project_identity reaches
+        # the same table — the rules the fingerprint covers are then the rules
+        # the load will actually apply, under a stub as much as in production.
+        repr(cache_db.get_project_overrides()),
+        repr(load_account_events()),
+        # Days are bucketed in local time, and the FX date in Oslo time; a
+        # machine that moves zone re-buckets every day it has ever recorded.
+        str(_local_tz()),
+        cutoff.strftime("%Y-%m-%d"),
+    ]
+    parts += [
+        f"{path}\0{mtime_ns}\0{size}"
+        for path, mtime_ns, size in load_ccreport_file_meta_before(cutoff.timestamp())
+    ]
+    parts.append("orphans")
+    parts += sorted(orphans)
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part.encode())
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _build_rollups(
+    records: list[UsageRecord], cutoff_ts: float, fingerprint: str,
+) -> None:
+    """Aggregate the pre-cutoff half of *records* into the rollup table.
+
+    Fed the post-_keep stream of a full load — deduplicated, renamed by the
+    override rules, stamped with an account — never a GROUP BY over
+    ccreport_records, which would count the duplicate rows _keep drops (more
+    than half the table) and would freeze the two attributes that are read-time
+    by design.
+    """
+    rows: dict[tuple, list] = {}
+    for rec in records:
+        ts = rec.timestamp.timestamp()
+        if ts >= cutoff_ts:
+            continue
+        key = (
+            rec.timestamp.astimezone().strftime("%Y-%m-%d"),
+            record_oslo_date(rec).isoformat(),
+            rec.session_id, rec.project, rec.model, rec.account,
+        )
+        t = rec.tokens
+        row = rows.get(key)
+        if row is None:
+            rows[key] = [ts, ts, t.input, t.output, t.cache_create, t.cache_read,
+                         rec.cost(), rec.count]
+            continue
+        row[0] = min(row[0], ts)
+        row[1] = max(row[1], ts)
+        row[2] += t.input
+        row[3] += t.output
+        row[4] += t.cache_create
+        row[5] += t.cache_read
+        row[6] += rec.cost()
+        row[7] += rec.count
+    save_ccreport_rollups([(*key, *row) for key, row in rows.items()], fingerprint)
+
+
+def _rollup_records(rows: list[tuple]) -> list[UsageRecord]:
+    """Rollup rows as one synthetic record each, oldest group first.
+
+    These never go through _keep: they were deduped, renamed and attributed
+    when the rollup was built, and running them through it again would dedup a
+    whole day of a session down to one call.
+
+    Ordered by min_ts rather than by the timestamp they carry, so the session
+    report picks the same "first" bucket a full load would. The timestamp is
+    the group's newest, which is what the session report shows as "last"; both
+    fall on the same local day, since the day is part of the key.
+    """
+    pairs: list[tuple[float, UsageRecord]] = []
+    for (_day, oslo_date, sid, project, model, account,
+         min_ts, max_ts, tin, tout, tcc, tcr, cost, n) in rows:
+        pairs.append((min_ts, UsageRecord(
+            message_id="",
+            model=model,
+            tokens=TokenCounts(input=tin, output=tout,
+                               cache_create=tcc, cache_read=tcr),
+            timestamp=datetime.fromtimestamp(max_ts, tz=timezone.utc),
+            session_id=sid,
+            project=project,
+            # The frozen sum. cost_usd normally means "the log said so" and is
+            # what _serialize_records persists, which is safe here only because
+            # a rollup record never reaches the record cache.
+            cost_usd=cost,
+            account=account,
+            count=n,
+            oslo_date=date.fromisoformat(oslo_date),
+        )))
+    pairs.sort(key=lambda pair: pair[0])
+    return [rec for _min_ts, rec in pairs]
+
+
+def _load_with_rollups(files: list[Path], live_paths: set[str]) -> list[UsageRecord]:
+    """The whole corpus, with everything past the cutoff served as rollup rows.
+
+    Returns the same aggregate totals a full load does; what it does not return
+    is one record per API call for the old days, which is why only the
+    unfiltered report path may ask for it.
+    """
+    cutoff = _rollup_cutoff()
+    cutoff_ts = cutoff.timestamp()
+
+    # Before the fingerprint rather than after: the fingerprint is built from
+    # cached file metadata, and an appended or newly discovered file can carry
+    # records older than the cutoff. Catching up first means a change shows up
+    # on the run that saw it, not on the one after.
+    file_meta = load_ccreport_file_meta()
+    _fresh, unreadable = _refresh_changed_files(files, file_meta)
+
+    # Cached files no longer on disk. Taken from the pre-refresh metadata,
+    # which is complete for the question: anything the refresh added is a file
+    # that exists.
+    orphans = set(file_meta) - live_paths
+    fingerprint = _rollup_fingerprint(cutoff, orphans)
+    if read_ccreport_rollup_fingerprint() != fingerprint:
+        # Costs this run what the run before it cost — the files are already
+        # parsed and saved, so the full load below is a pure cache read.
+        records = _load_full(files, live_paths, None, None, None, None)
+        _build_rollups(records, cutoff_ts, fingerprint)
+        return records
+
+    filters = _keep_filters(None, None, None, None)
+    by_file = load_ccreport_records_since(cutoff_ts)
+    recent: list[UsageRecord] = []
+    # Live files in the same sorted order as a full load, then the orphans, so
+    # a duplicated message's first occurrence — the copy that wins, with its
+    # project — is the same one either way.
+    for path in files:
+        key = str(path)
+        # As a full load does. Its pre-cutoff half still comes from the rollup,
+        # which a full load would have dropped along with the rest — the run
+        # under-reports the file either way, this one by less.
+        if key in unreadable:
+            continue
+        recent += [
+            r for r in _deserialize_records(by_file.get(key, []))
+            if _keep(r, **filters)
+        ]
+    for file_path, raw in by_file.items():
+        if file_path in live_paths:
+            continue
+        recent += [r for r in _deserialize_records(raw) if _keep(r, **filters)]
+
+    recent.sort(key=lambda r: r.timestamp)
+    # Two already-sorted runs that cannot interleave: every rollup group ends
+    # before the cutoff and every record here starts at it.
+    return _rollup_records(load_ccreport_rollups()) + recent
 
 
 # --- Formatting ---
@@ -1068,8 +1360,14 @@ def report_monthly(records: list[UsageRecord], *, nok: NokCtx) -> None:
                 label_style="dim bold italic",
             )
 
-            # Projected based on trailing 14-day daily average
-            window = 14
+            # Projected based on trailing 14-day daily average.
+            #
+            # start_14d is _rollup_cutoff() computed the same way, so this
+            # window sits entirely on the live-record side of it: a rollup
+            # record, which stands for a whole day, is never in `recent` and
+            # never has to be split across the boundary. Widening the window
+            # past ROLLUP_WINDOW_DAYS would break that.
+            window = ROLLUP_WINDOW_DAYS
             end_14d = today.replace(hour=0, minute=0, second=0, microsecond=0)
             start_14d = end_14d - timedelta(days=window)
             recent = [r for r in records if start_14d <= r.timestamp.astimezone() < end_14d]
@@ -1079,7 +1377,7 @@ def report_monthly(records: list[UsageRecord], *, nok: NokCtx) -> None:
                 projected_14d = agg_14d.cost / window * days_in_month
                 projected_14d_nok = (agg_14d.cost_nok / window) * days_in_month if nok.enabled else 0.0
                 _summary_row(
-                    table, "PROJ 14d" if narrow else "PROJECTED", projected_14d,
+                    table, f"PROJ {window}d" if narrow else "PROJECTED", projected_14d,
                     narrow=narrow, nok=nok,
                     nok_cost=projected_14d_nok, nok_estimated=agg_14d.nok_estimated,
                     note=_flex_cell(f"Last {window} days avg"),
@@ -1473,6 +1771,12 @@ def cmd_adopt(args) -> None:
 
 
 def main() -> None:
+    # Before anything opens the DB: every path below it touches cache_db, and
+    # get_connection reads this once, when it opens the singleton connection.
+    # An interactive report is a bad place to spend the once-a-day 72 MB copy;
+    # the statusline's detached refresh takes it instead (macsetup-3xzh). An
+    # explicit setting from the environment wins.
+    os.environ.setdefault("CLAUDE_CACHE_SNAPSHOT_DEFER", "1")
     parser = argparse.ArgumentParser(
         description="Analyze Claude Code token usage and costs from local JSONL logs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1554,9 +1858,15 @@ def main() -> None:
     project_filter = args.project if hasattr(args, "project") else None
     account_filter = args.account if hasattr(args, "account") else None
 
+    wants_json = bool(getattr(args, "json", False))
     records = load_all_records(
         since=since, until=until,
         project_filter=project_filter, account_filter=account_filter,
+        # A rollup row is one day of one session, so it can answer a report's
+        # totals and nothing finer. Every filter selects on something it has
+        # aggregated away, and --json prints one entry per API call.
+        use_rollups=not (since or until or project_filter or account_filter
+                         or wants_json),
     )
 
     if not records:
@@ -1568,7 +1878,7 @@ def main() -> None:
     if nok.enabled and not has_full_coverage:
         print("⚠ Some dates lack exchange rate data; NOK values are partial.", file=sys.stderr)
 
-    if hasattr(args, "json") and args.json:
+    if wants_json:
         report_json(records, nok=nok)
         return
 

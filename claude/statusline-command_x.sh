@@ -9,4 +9,6 @@ export CLAUDE_STATUSLINE_CHANGES=0
 export CLAUDE_STATUSLINE_GIT_DIFFSTAT=0
 export CLAUDE_STATUSLINE_DOGCAT=0
 
+export CLAUDE_STATUSLINE_RENDER_TIME=1
+
 exec "$(dirname "${BASH_SOURCE[0]}")/statusline-command.py" "$@"

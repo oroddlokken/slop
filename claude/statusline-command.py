@@ -87,6 +87,7 @@ from typing import NamedTuple
 # pricing.py and cache_db.py live in the same directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_db import (
+    RateLimitSample,
     accumulate_cache_stats,
     check_fetch_backoff,
     compute_extra_window_deltas,
@@ -94,6 +95,7 @@ from cache_db import (
     read_cost_summary,
     read_usage_stale,
     record_account_event,
+    record_rate_limit_snapshots,
     usage_is_fresh,
 )
 from pricing import (
@@ -845,6 +847,100 @@ def _capture_account() -> None:
         oauth = json.loads(CLAUDE_CONFIG_JSON.read_bytes()).get("oauthAccount")
         if isinstance(oauth, dict):
             record_account_event(oauth)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- Rate limit history capture ---
+
+
+def _rl_sample(
+    window: str, pct: object, resets_at: object, model: str | None, source: str, now: float,
+) -> RateLimitSample | None:
+    """One utilization sample, or None when the reading is not usable as history.
+
+    A window with no reset time is dropped rather than stored with a placeholder:
+    resets_at is what ties samples of the same window instance together, so a row
+    without a real one belongs to no window and cannot be plotted against any.
+
+    A reset already in the past is dropped for the reason _adjust_passed_resets
+    exists — the percentage still on hand describes the window that just ended,
+    and the display substitutes 0 for it. Either value stamped with the current
+    time is a fabricated sample of the new window.
+    """
+    if pct is None or resets_at is None:
+        return None
+    try:
+        used = float(pct)  # type: ignore[arg-type]
+        resets = float(resets_at)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if resets <= now:
+        return None
+    return RateLimitSample(window, used, resets, model, source)
+
+
+def _rl_samples(data: dict, usage_data: dict, now: float) -> list[RateLimitSample]:
+    """Every window this render can see, as samples to offer the change gate.
+
+    S and W come from the raw stdin dict, not from _native_rate_limits: that one
+    rounds to whole percent to match the cache's ints, and how fast a window
+    fills is exactly what the rounding throws away. Sonnet and the scoped limit
+    have no native source, so they come from the usage cache — already ints, and
+    stale between fetches, which costs nothing because the gate in cache_db
+    drops a re-offered reading.
+    """
+    samples = []
+    rl = data.get("rate_limits") or {}
+    for key, window in (("five_hour", "session"), ("seven_day", "week")):
+        w = rl.get(key) or {}
+        sample = _rl_sample(
+            window, w.get("used_percentage"), w.get("resets_at"), None, "stdin", now,
+        )
+        if sample:
+            samples.append(sample)
+    for pct_key, reset_key, window, model in (
+        ("sonnet_percent", "sonnet_reset", "sonnet", None),
+        ("scoped_percent", "scoped_reset", "scoped", usage_data.get("scoped_model")),
+    ):
+        reset_iso = usage_data.get(reset_key)
+        sample = _rl_sample(
+            window,
+            usage_data.get(pct_key),
+            _parse_iso_epoch(str(reset_iso)) if reset_iso else None,
+            model,
+            "api",
+            now,
+        )
+        if sample:
+            samples.append(sample)
+    return samples
+
+
+def _snapshot_rate_limits(
+    data: dict, usage_data: dict, now: float, *, test_mode: bool,
+) -> None:
+    """Persist how full each rate limit window is, when the reading has moved.
+
+    The render is the capture point for the same reason it is for the account:
+    the live percentages are all there is. Claude Code sends the current reading
+    and keeps no history, and a session JSONL records tokens, not quota — so a
+    window that fills and resets unobserved leaves nothing for a report to read.
+
+    Skipped for `-t`/`-t0` and whenever CLAUDE_STATUSLINE_USAGE_JSON is set.
+    Both are fabricated readings meant for eyeballing a layout, and this table
+    is permanent history that no later render can correct.
+
+    Best-effort, like every other bookkeeping write in the render: the short
+    RENDER_DB_TIMEOUT_S makes a contended DB cost one sample rather than the
+    status line.
+    """
+    if test_mode or os.environ.get("CLAUDE_STATUSLINE_USAGE_JSON"):
+        return
+    try:
+        samples = _rl_samples(data, usage_data, now)
+        if samples:
+            record_rate_limit_snapshots(samples, now)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1693,9 +1789,17 @@ def _layout_and_print(
     DOT = f"{SUBDUED} · {RST}"
 
     top = [s for s in top if s]
-    # Render time and active-session count trail the top line
+    # Render time trails the cost line, after AT; with that line switched off
+    # it trails the session segment instead, after ctx. Active session count
+    # trails the top line either way.
     if _on("RENDER_TIME", default=False):
-        top.append(f"{SUBDUED}{time.monotonic() - _t_start:.3f}s{RST}")
+        elapsed = f"{SUBDUED}{time.monotonic() - _t_start:.3f}s{RST}"
+        if usage_cost:
+            usage_cost = f"{usage_cost}{DOT}{elapsed}"
+        elif session:
+            session = f"{session} {elapsed}"
+        else:
+            top.append(elapsed)
     if sessions:
         top.append(sessions)
     top_str = " ".join(top)
@@ -1835,9 +1939,12 @@ def main() -> None:
             usage_data.update(native_rl)
             usage_data["_native_rl"] = True
         dcat_data = _fetch_dcat(inp.cwd)
-        # Nothing on the line depends on this; it sits here to overlap the git
-        # and macmon subprocesses started above rather than trail them.
+        # Nothing on the line depends on these two; they sit here to overlap the
+        # git and macmon subprocesses started above rather than trail them.
         _capture_account()
+        # After the native_rl merge, so the sonnet/scoped half sees the same
+        # usage_data the line will render.
+        _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
 
         # Collect git results and macmon data
         git = _collect_git(git_procs)

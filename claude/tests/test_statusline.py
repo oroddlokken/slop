@@ -567,3 +567,148 @@ class TestCaptureAccount:
             other.rollback()
             other.close()
         assert self._log() == []
+
+
+class TestRateLimitSamples:
+    """What the render offers the snapshot gate, and what it refuses to invent."""
+
+    NOW = 1_000_000.0
+    RESETS = NOW + 8100
+
+    def _stdin(self, **windows):
+        return {"rate_limits": windows}
+
+    def _iso(self, epoch):
+        import datetime as dt
+
+        return dt.datetime.fromtimestamp(epoch).isoformat()  # noqa: DTZ006
+
+    def test_stdin_percentages_are_passed_through_unrounded(self):
+        """_native_rate_limits rounds for the display; the fill rate needs the float."""
+        data = self._stdin(
+            five_hour={"used_percentage": 23.47, "resets_at": self.RESETS},
+            seven_day={"used_percentage": 41.02, "resets_at": self.RESETS + 400_000},
+        )
+        assert sl._rl_samples(data, {}, self.NOW) == [
+            ("session", 23.47, self.RESETS, None, "stdin"),
+            ("week", 41.02, self.RESETS + 400_000, None, "stdin"),
+        ]
+
+    def test_api_resets_are_converted_from_iso(self):
+        usage = {
+            "sonnet_percent": 12, "sonnet_reset": self._iso(self.RESETS),
+            "scoped_percent": 7, "scoped_reset": self._iso(self.RESETS),
+            "scoped_model": "claude-opus-4-5",
+        }
+        assert sl._rl_samples({}, usage, self.NOW) == [
+            ("sonnet", 12.0, self.RESETS, None, "api"),
+            ("scoped", 7.0, self.RESETS, "claude-opus-4-5", "api"),
+        ]
+
+    def test_a_passed_reset_records_nothing(self):
+        """The percentage on hand belongs to the window that just ended."""
+        data = self._stdin(
+            five_hour={"used_percentage": 80.0, "resets_at": self.NOW - 1},
+        )
+        usage = {"sonnet_percent": 80, "sonnet_reset": self._iso(self.NOW - 1)}
+        assert sl._rl_samples(data, usage, self.NOW) == []
+
+    @pytest.mark.parametrize("window", [
+        {},                                          # neither field
+        {"used_percentage": 23.5},                   # no reset to key the instance on
+        {"resets_at": RESETS},                       # no reading
+        {"used_percentage": None, "resets_at": RESETS},
+        {"used_percentage": 23.5, "resets_at": None},
+        {"used_percentage": "n/a", "resets_at": RESETS},
+        {"used_percentage": 23.5, "resets_at": "soon"},
+    ])
+    def test_an_incomplete_stdin_window_is_skipped(self, window):
+        assert sl._rl_samples(self._stdin(five_hour=window), {}, self.NOW) == []
+
+    def test_a_missing_rate_limits_block_is_not_an_error(self):
+        """Pro/Max only, and absent until the session's first API response."""
+        assert sl._rl_samples({}, {}, self.NOW) == []
+        assert sl._rl_samples({"rate_limits": None}, {}, self.NOW) == []
+
+    def test_one_unusable_window_does_not_take_the_others_with_it(self):
+        data = self._stdin(
+            five_hour={"used_percentage": None, "resets_at": self.RESETS},
+            seven_day={"used_percentage": 41.0, "resets_at": self.RESETS},
+        )
+        assert [s.window for s in sl._rl_samples(data, {}, self.NOW)] == ["week"]
+
+    def test_a_scoped_reading_with_no_model_still_samples(self):
+        """The plan may scope a limit the cache has no model name for."""
+        usage = {"scoped_percent": 7, "scoped_reset": self._iso(self.RESETS)}
+        assert sl._rl_samples({}, usage, self.NOW) == [
+            ("scoped", 7.0, self.RESETS, None, "api"),
+        ]
+
+
+class TestSnapshotRateLimitsGating:
+    """Fabricated readings must never reach a table no later render can correct."""
+
+    NOW = 1_000_000.0
+
+    @pytest.fixture()
+    def spy(self, monkeypatch):
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            sl, "record_rate_limit_snapshots",
+            lambda samples, now: calls.append((samples, now)),
+        )
+        return calls
+
+    def _data(self):
+        return {"rate_limits": {
+            "five_hour": {"used_percentage": 23.5, "resets_at": self.NOW + 8100},
+        }}
+
+    def test_a_real_render_records(self, spy):
+        sl._snapshot_rate_limits(self._data(), {}, self.NOW, test_mode=False)
+        assert [s.window for s in spy[0][0]] == ["session"]
+
+    def test_test_mode_records_nothing(self, spy):
+        sl._snapshot_rate_limits(self._data(), {}, self.NOW, test_mode=True)
+        assert spy == []
+
+    def test_pre_provided_usage_json_records_nothing(self, spy, monkeypatch):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_USAGE_JSON", '{"session_percent": 23}')
+        sl._snapshot_rate_limits(self._data(), {}, self.NOW, test_mode=False)
+        assert spy == []
+
+    def test_nothing_to_sample_takes_no_db_call(self, spy):
+        sl._snapshot_rate_limits({}, {}, self.NOW, test_mode=False)
+        assert spy == []
+
+    @pytest.fixture()
+    def blocked_db(self, monkeypatch):
+        import sqlite3
+
+        import cache_db
+
+        monkeypatch.setenv("CLAUDE_CACHE_DB_TIMEOUT", "0.1")
+        cache_db.get_connection()
+        cache_db.close_connection()  # reopen under the short timeout
+        other = sqlite3.connect(str(cache_db.DB_PATH), timeout=5)
+        other.execute("BEGIN IMMEDIATE")
+        yield
+        other.rollback()
+        other.close()
+
+    def test_the_write_raises_when_the_db_is_held(self, blocked_db):
+        """The guard is only worth having if this is what it catches."""
+        import sqlite3
+
+        with pytest.raises(sqlite3.OperationalError):
+            sl.record_rate_limit_snapshots(
+                sl._rl_samples(self._data(), {}, self.NOW), self.NOW,
+            )
+
+    def test_a_held_database_costs_the_table_a_sample_not_the_render(self, blocked_db):
+        import cache_db
+
+        sl._snapshot_rate_limits(self._data(), {}, self.NOW, test_mode=False)
+        rows = cache_db.get_connection().execute(
+            "SELECT COUNT(*) FROM rate_limit_snapshots").fetchone()[0]
+        assert rows == 0
