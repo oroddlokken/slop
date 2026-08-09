@@ -75,6 +75,8 @@ Each lens is a specific critical angle. The user picks a scope (standard, full, 
 
 6. **Contradictions** — Flag intra-prompt conflicts between sections (e.g., persona says "be brief", output shape says "explain thoroughly"). Pay special attention to **examples contradicting rules** — when examples drift from written rules, the examples win silently. For each: quote both passages, explain the conflict, recommend which wins.
 
+   Also flag **counts that contradict the enumeration they introduce** — "you have five tools available" above six tool definitions, "follow these three rules" above a four-item list, a phrasebook described as four phrases and written with five. Both halves sit in the prompt, so this needs no external context to check: count the list. Recommend removing the number ("the tools below", "the rules that follow") rather than correcting it, since a corrected count breaks again the next time an item is added. Keep the number only where it is itself the instruction ("ask at most two questions").
+
 7. **Persona (Operational, not Emotional)** — Flag emotional adjectives without operational definition ("be warm", "be helpful", "be professional"). Adjectives like these add no information the base model doesn't already carry; the steering value comes from specifying concrete operational attributes. For each detected adjective, check whether these attributes are specified:
    - **Register** — match user's formality, or fixed?
    - **Address** — first name, title, none, inherit from session?

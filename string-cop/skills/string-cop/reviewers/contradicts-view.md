@@ -20,6 +20,7 @@ These read as reassurance, and `reassurance` will flag them as unasked-for. You 
 ### The claim about what is on the screen
 
 - A count described one way and computed another: "12 of 40 ranked" where the denominator is the filtered set, not the archive. If the sentence says "of your photos" and the number counts the filtered pass, the sentence is wrong
+- A count written into the copy instead of interpolated: "12 checks run on every commit" beside a registry that now holds thirteen. The literal was true when typed and nothing recomputes it, so suggest the count-free wording ("every check in the registry") rather than the corrected number — a corrected literal drifts again on the next addition
 - "Sorted by date" above a query ordering by id
 - "Showing the last 30 days" above a query with no date bound, or a different bound
 - A legend naming a series the chart does not draw, or naming it differently
@@ -74,7 +75,7 @@ This class is where Critical lives. Read the handler.
 1. **Start from the render-truth anchor table** in the inventory. Those claims were pre-identified as testable; work them first.
 2. **Grep the inventory for absolutes** — `never`, `always`, `no `, `nothing`, `only`, `all`, `every`, `cannot`, `guaranteed`, `permanently`, `immediately`. Each is a claim with a code path behind it.
 3. **Grep for numbers and units** in strings, then find the corresponding constant or formatter. A hint naming `~6.6-day half-life` should sit near a constant that produces 6.6 days.
-4. **For every count or total described in prose**, read the view that computes it and confirm the described set matches the computed set.
+4. **For every count or total described in prose**, read the view that computes it and confirm the described set matches the computed set. Where the number is a literal rather than an interpolation, count the set it names in the source and propose the count-free replacement.
 5. **For every button, confirm, and destructive control**, read its handler. Label against behaviour. This is where Critical findings come from.
 6. **Check freshness claims against the scheduler, the cache TTL, and the query.**
 7. **Follow every instruction string** — the key, the page, the flag, the menu item. Confirm the target exists.
