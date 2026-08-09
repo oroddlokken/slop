@@ -16,7 +16,7 @@ Launch ~20 parallel adversarial agents, each trying to break the codebase from a
 
 ## Rules
 
-- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
+- **Ask the user for mode (Step 1) and launch strategy** (Sequential or 1+Parallel). Recommend Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
 - **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently.
 - **Agents inherit the default model** — do not override with a specific model.
 - **Agents analyze code without modifying files.** Users review findings before acting.
@@ -57,7 +57,7 @@ Available fuzzers:
 | upgrade-path | Data from old versions, schema drift, backwards compat gaps, migration holes |
 | adversarial-user | Intentionally hostile inputs, CSRF scenarios, replay attacks, parameter tampering |
 
-Default to **Full** if the user doesn't specify.
+Skip the question only when the user's invocation already named a mode (e.g. "run fuzz-my-stuff-up quick" → Quick). A bare `/fuzz-my-stuff-up` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
 
 **Why fuzzers share one methodology:** Unlike the sibling review skills (dba, accountant, codehealth), which give each lens its own criteria file, the fuzzers intentionally share a single generic attack methodology defined in `fuzzer-agent.md` rather than per-fuzzer criteria files — fuzzing is open-ended, and a fixed checklist would narrow it. Each fuzzer differs only by its attack angle. Ground every finding in the actual snapshot code with a concrete, reproducible scenario — never a hypothetical.
 
@@ -155,7 +155,7 @@ Use the agent template (`fuzzer-agent.md`). The template places shared content (
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. Spreads token spend across the run instead of bursting it against the 5-hour quota. Slowest.
 - **1+Parallel** — Launch one agent, then the remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Same cost as Sequential, much faster.
 
-If the user doesn't specify, use **Sequential**.
+Skip the question only when the user's invocation already named a strategy; otherwise ask and wait for the answer, recommending **Sequential**.
 
 **Prompt caching** — Agents do not share cached prompt content with each other. Measured over a 16-agent run (2026-08-04): every agent read back the same ~7K tokens of system prompt and tool definitions, then created everything else fresh — including a byte-identical 11K-token snapshot, once per agent.
 

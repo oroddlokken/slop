@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import os
 import sys
-import tomllib
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 
 # Repos live directly beneath repo-root container dirs. A session's project
@@ -35,14 +35,22 @@ _BASELINE_REPO_ROOT = Path.home() / "git"
 Resolver = Callable[[str | None, str | None, str], str]
 
 
-def _load_repo_roots() -> tuple[str, ...]:
+@cache
+def repo_roots() -> tuple[str, ...]:
     """Return the ~/git baseline plus repo_roots from the config file.
 
     Sorted deepest-first, which makes matching longest-prefix regardless of
     config order. No config file (or no repo_roots key) leaves just the
     baseline; a malformed file warns instead of taking the reports down
     with it.
+
+    Read on first use rather than at import, and only once: pricing imports this
+    module on every statusline render, including the fast renders that name no
+    project at all, and this was a file open and a TOML parse in each of them
+    (macsetup-3jqw).
     """
+    import tomllib
+
     roots = {str(_BASELINE_REPO_ROOT)}
     try:
         with open(CONFIG_PATH, "rb") as f:
@@ -56,7 +64,16 @@ def _load_repo_roots() -> tuple[str, ...]:
     return tuple(sorted(roots, key=len, reverse=True))
 
 
-REPO_ROOTS = _load_repo_roots()
+def __getattr__(name: str) -> object:
+    """Resolve the REPO_ROOTS module constant repo_roots() replaced.
+
+    Nothing in this repo reads it any more, but it was a public module
+    attribute; anything out of tree that still imports it gets the same tuple
+    rather than an ImportError.
+    """
+    if name == "REPO_ROOTS":
+        return repo_roots()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def repo_from_path(cwd: str) -> str | None:
@@ -65,7 +82,7 @@ def repo_from_path(cwd: str) -> str | None:
     None leaves the caller free to fall back to the plain basename for paths
     outside every repo root.
     """
-    for root in REPO_ROOTS:
+    for root in repo_roots():
         prefix = root + "/"
         if cwd.startswith(prefix):
             repo = cwd[len(prefix):].split("/", 1)[0]

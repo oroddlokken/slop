@@ -101,12 +101,10 @@ class TestStatuslineToggles:
 
 
 def _load_statusline():
-    """statusline-command.py is a script, not an importable module name."""
-    import importlib.util
+    import sys
     from pathlib import Path
 
-    path = Path(__file__).resolve().parent.parent / "statusline-command.py"
-    spec = importlib.util.spec_from_file_location("statusline_command", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import statusline_command
+
+    return statusline_command

@@ -15,7 +15,7 @@ import json
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -58,10 +58,43 @@ USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 USAGE_API_TIMEOUT = 5  # seconds per attempt
 USAGE_API_RETRIES = 2  # max retries on transient errors
 USAGE_API_RETRY_DELAY = 1.0  # seconds between retries
+USAGE_API_MAX_RETRY_DELAY = 5.0  # ceiling on a Retry-After the server asks for
 CREDENTIALS_SERVICE = "Claude Code-credentials"
 
 # HTTP status codes worth retrying
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+KEYCHAIN_TIMEOUT = 5  # seconds per `security` lookup
+KEYCHAIN_DUMP_TIMEOUT = 10  # seconds for the one `security dump-keychain`
+
+# Candidate services probed after the primary lookup misses, each costing its
+# own KEYCHAIN_TIMEOUT. The list is sorted newest-first, and a machine that has
+# logged in repeatedly accumulates entries without bound — uncapped, a keychain
+# that answers slowly turns the tail of that list into minutes of serial waiting
+# under the fetch lock. Five covers switching between a handful of accounts;
+# past that the credentials file is the likelier answer anyway (macsetup-3dl3).
+MAX_KEYCHAIN_CANDIDATES = 5
+
+# Longest get_usage_token() + fetch_usage_api() can legitimately run, which is
+# how long main() holds the fetch lock: every keychain call it may make, then
+# every API attempt and the sleeps between them. Kept as an expression over the
+# same constants those paths use so it cannot drift from them.
+_TOKEN_LOOKUP_MAX_S = (
+    KEYCHAIN_TIMEOUT  # primary find-generic-password
+    + KEYCHAIN_DUMP_TIMEOUT  # dump-keychain on a miss
+    + MAX_KEYCHAIN_CANDIDATES * KEYCHAIN_TIMEOUT  # one lookup per candidate
+)
+_API_CALL_MAX_S = (1 + USAGE_API_RETRIES) * USAGE_API_TIMEOUT + (
+    USAGE_API_RETRIES * USAGE_API_MAX_RETRY_DELAY
+)
+# Margin for the work the timeouts do not bound: the JSONL scan in
+# compute_costs, the cache write, and process startup.
+_LOCK_HOLD_MARGIN_S = 15
+
+# A TTL below this makes the next spawn treat a lock that is still doing its job
+# as abandoned and issue a second concurrent fetch — against an endpoint that,
+# in the case that got the holder here, is already answering 429.
+FETCH_LOCK_MAX_HOLD_S = _TOKEN_LOOKUP_MAX_S + _API_CALL_MAX_S + _LOCK_HOLD_MARGIN_S
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +107,7 @@ def _read_token_from_keychain(service: str = CREDENTIALS_SERVICE) -> str | None:
     try:
         raw = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-w"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=KEYCHAIN_TIMEOUT,
         )
         if raw.returncode != 0 or not raw.stdout.strip():
             return None
@@ -84,11 +117,16 @@ def _read_token_from_keychain(service: str = CREDENTIALS_SERVICE) -> str | None:
 
 
 def _list_keychain_candidates() -> list[str]:
-    """List Claude Code credential service names from keychain, newest first."""
+    """List Claude Code credential service names from keychain, newest first.
+
+    At most MAX_KEYCHAIN_CANDIDATES of them: each one the caller keeps costs a
+    serial `security` call under the fetch lock, and the newest entry is the one
+    the running Claude Code wrote.
+    """
     try:
         raw = subprocess.run(
             ["security", "dump-keychain"],
-            capture_output=True, timeout=10,
+            capture_output=True, timeout=KEYCHAIN_DUMP_TIMEOUT,
         )
         if raw.returncode != 0:
             return []
@@ -102,7 +140,7 @@ def _list_keychain_candidates() -> list[str]:
     services: list[tuple[str, str | None]] = []
     # Split on individual keychain item boundaries instead of keychain file
     # boundaries, so multiple entries within one keychain are found (macsetup-1ypj)
-    items = re.split(r'(?=class:)', output)
+    items = re.split(r"(?=class:)", output)
     for item in items:
         svc_m = re.search(r'"svce"<blob>="([^"]+)"', item)
         if not svc_m:
@@ -117,7 +155,7 @@ def _list_keychain_candidates() -> list[str]:
 
     # Sort by modification date descending (newest first)
     services.sort(key=lambda x: x[1] or "", reverse=True)
-    return [svc for svc, _ in services]
+    return [svc for svc, _ in services[:MAX_KEYCHAIN_CANDIDATES]]
 
 
 def _read_token_from_credentials_file() -> str | None:
@@ -184,7 +222,7 @@ def request_usage_body(token: str) -> dict[str, Any]:
             retry_after = e.headers.get("Retry-After") if e.headers else None
             if retry_after:
                 try:
-                    delay = max(delay, min(float(retry_after), 5.0))
+                    delay = max(delay, min(float(retry_after), USAGE_API_MAX_RETRY_DELAY))
                 except ValueError:
                     pass
             time.sleep(delay)
@@ -273,8 +311,8 @@ def _enrich_and_emit(
     try:
         costs = compute_costs(
             session_id=session_id, cwd=cwd,
-            session_reset_iso=data.get("session_reset"),
-            week_reset_iso=data.get("week_reset"),
+            session_reset_iso=data.get("session_reset") or _arg_value("--session-reset"),
+            week_reset_iso=data.get("week_reset") or _arg_value("--week-reset"),
         )
         data.update(costs)
     except Exception as e:  # noqa: BLE001
@@ -436,14 +474,19 @@ def main() -> None:
             sys.exit(1)
 
         clear_fetch_failures()
-        data["last_updated"] = datetime.now(tz=timezone.utc).astimezone().isoformat()
+        data["last_updated"] = datetime.now(tz=UTC).astimezone().isoformat()
         data["_meta"] = {"fetch_duration_s": fetch_duration, "method": "api"}
 
         try:
+            # The response's own resets_at wins; the flags are the caller's
+            # native stdin bounds, standing in when this response omitted a
+            # window — without any bound compute_costs returns no
+            # session_window_cost and the previous window's total survives
+            # in the row (macsetup-x2aq).
             costs = compute_costs(
                 session_id=session_id_arg, cwd=cwd_arg,
-                session_reset_iso=data.get("session_reset"),
-                week_reset_iso=data.get("week_reset"),
+                session_reset_iso=data.get("session_reset") or _arg_value("--session-reset"),
+                week_reset_iso=data.get("week_reset") or _arg_value("--week-reset"),
             )
             data.update(costs)
         except Exception as e:  # noqa: BLE001

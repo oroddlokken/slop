@@ -7,7 +7,6 @@ here reads the real log or the real cache.
 from __future__ import annotations
 
 import datetime as dt
-import importlib.util
 import io
 import json
 import os
@@ -18,35 +17,24 @@ import pytest
 from rich.console import Console
 
 import cache_db
+import ccreport as ccr
 
-_CCREPORT = Path(__file__).resolve().parent.parent / "ccreport.py"
-
-
-def _load_ccreport():
-    """ccreport.py is a script, not an importable module name."""
-    spec = importlib.util.spec_from_file_location("ccreport", _CCREPORT)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-ccr = _load_ccreport()
-UTC = dt.timezone.utc
+UTC = dt.UTC
 
 
 def _rec(**kw):
-    defaults = dict(
-        message_id="m1", model="claude-opus-5",
-        tokens=ccr.TokenCounts(input=10, output=20, cache_create=30, cache_read=40),
-        timestamp=dt.datetime(2026, 6, 15, 12, tzinfo=UTC),
-        session_id="s1", project="proj", cost_usd=1.0, dedup_key=None,
-    )
+    defaults = {
+        "message_id": "m1", "model": "claude-opus-5",
+        "tokens": ccr.TokenCounts(input=10, output=20, cache_create=30, cache_read=40),
+        "timestamp": dt.datetime(2026, 6, 15, 12, tzinfo=UTC),
+        "session_id": "s1", "project": "proj", "cost_usd": 1.0, "dedup_key": None,
+    }
     return ccr.UsageRecord(**{**defaults, **kw})
 
 
 def _filters(**kw):
-    base = dict(since=None, until=None, project_filter=None, account_filter=None,
-                seen_keys=set(), override=None, accounts=None)
+    base = {"since": None, "until": None, "project_filter": None, "account_filter": None,
+                "seen_keys": set(), "override": None, "accounts": None}
     return {**base, **kw}
 
 
@@ -101,8 +89,8 @@ class TestKeep:
     def test_a_zero_token_record_still_dedupes_on_its_message_id(self):
         """<synthetic> rows carry no tokens but do carry an id."""
         f = _filters()
-        empty = dict(dedup_key=None, model="<synthetic>",
-                     tokens=ccr.TokenCounts())
+        empty = {"dedup_key": None, "model": "<synthetic>",
+                     "tokens": ccr.TokenCounts()}
         assert ccr._keep(_rec(**empty), **f) is True
         assert ccr._keep(_rec(**empty), **f) is False
         assert ccr._keep(_rec(message_id="m2", **empty), **f) is True
@@ -110,7 +98,7 @@ class TestKeep:
     def test_no_id_and_no_tokens_is_never_a_duplicate(self):
         """Session and timestamp alone are not enough to drop a record on."""
         f = _filters()
-        blank = dict(dedup_key=None, message_id="", tokens=ccr.TokenCounts())
+        blank = {"dedup_key": None, "message_id": "", "tokens": ccr.TokenCounts()}
         assert ccr._keep(_rec(**blank), **f) is True
         assert ccr._keep(_rec(**blank), **f) is True
 
@@ -137,7 +125,7 @@ def loader(tmp_path, monkeypatch):
     # salt. Stamped here rather than inside the stub so it costs no COMMIT the
     # save-batching tests would count.
     cache_db.init_ccreport_meta(ccr.CACHE_VERSION, "test-hash")
-    monkeypatch.setattr(cache_db, "get_project_overrides", lambda: [])
+    monkeypatch.setattr(cache_db, "get_project_overrides", list)
     yield projects
     cache_db.get_connection().close()
     cache_db._conn = None
@@ -204,6 +192,130 @@ class TestLoadAllRecordsFiltersOrphans:
         (loader / "b.jsonl").unlink()
         ids = {r.message_id for r in ccr.load_all_records()}
         assert ids == {"msg-a", "msg-b"}
+
+
+class TestDateFiltersReachSql:
+    """A one-day report must not build the whole corpus first (macsetup-6a2f)."""
+
+    SINCE = dt.datetime(2026, 6, 1, tzinfo=UTC)
+
+    def _cached_corpus(self, loader) -> None:
+        _write_jsonl(loader / "old.jsonl", when="2026-01-15T12:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-old"])
+        _write_jsonl(loader / "new.jsonl", when="2026-06-15T12:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-new"])
+        ccr.load_all_records()  # fills the cache, so the next run is a pure read
+
+    def test_the_window_is_pushed_into_the_query(self, loader, monkeypatch):
+        self._cached_corpus(loader)
+        asked: list[tuple] = []
+        real = ccr.load_ccreport_records_in_range
+        monkeypatch.setattr(
+            ccr, "load_ccreport_records_in_range",
+            lambda since_ts, until_ts: (asked.append((since_ts, until_ts))
+                                        or real(since_ts, until_ts)))
+
+        kept = ccr.load_all_records(since=self.SINCE)
+        assert [r.message_id for r in kept] == ["msg-new"]
+        assert asked == [(self.SINCE.timestamp(), None)]
+
+    def test_out_of_window_rows_are_never_deserialized(self, loader, monkeypatch):
+        self._cached_corpus(loader)
+        built: list[int] = []
+        real = ccr._deserialize_records
+        monkeypatch.setattr(ccr, "_deserialize_records",
+                            lambda raw: built.append(len(raw)) or real(raw))
+
+        ccr.load_all_records(since=self.SINCE)
+        assert sum(built) == 1, "a record outside the window was built anyway"
+
+    def test_an_unfiltered_load_still_reads_everything(self, loader):
+        self._cached_corpus(loader)
+        assert len(ccr.load_all_records()) == 2
+
+    def test_a_project_filter_alone_leaves_the_window_open(self, loader, monkeypatch):
+        """Attribution is decided at read time, so it cannot go to SQL."""
+        self._cached_corpus(loader)
+        asked: list[tuple] = []
+        real = ccr.load_ccreport_records_in_range
+        monkeypatch.setattr(
+            ccr, "load_ccreport_records_in_range",
+            lambda since_ts, until_ts: (asked.append((since_ts, until_ts))
+                                        or real(since_ts, until_ts)))
+
+        assert len(ccr.load_all_records(project_filter="live")) == 2
+        assert asked == [(None, None)]
+
+
+class TestRollupRebuildReusesItsCallersWork:
+    """The rebuild used to stat and re-parse the whole corpus twice (macsetup-4sx0)."""
+
+    @pytest.fixture
+    def corpus(self, loader):
+        # Well before _rollup_cutoff(), so the record lands in the rollup half.
+        _write_jsonl(loader / "a.jsonl", when="2026-01-15T12:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-1"])
+        return loader
+
+    def test_the_rebuild_refreshes_the_corpus_once(self, corpus, monkeypatch):
+        seen: list[int] = []
+        real = ccr._refresh_changed_files
+        monkeypatch.setattr(
+            ccr, "_refresh_changed_files",
+            lambda files, meta: seen.append(len(files)) or real(files, meta))
+
+        ccr.load_all_records(use_rollups=True)  # fingerprint misses, so it rebuilds
+        assert seen == [1], "the rebuild statted and re-parsed the corpus again"
+
+    def test_the_account_log_is_read_once_per_rebuild(self, corpus, monkeypatch):
+        reads: list[int] = []
+        real = ccr.load_account_events
+        monkeypatch.setattr(ccr, "load_account_events",
+                            lambda: reads.append(1) or real())
+
+        ccr.load_all_records(use_rollups=True)
+        assert len(reads) == 1
+
+    def test_the_rebuild_returns_what_a_full_load_does(self, corpus):
+        """Threading the refresh through must not change which records survive."""
+        assert ([r.message_id for r in ccr.load_all_records(use_rollups=True)]
+                == [r.message_id for r in ccr.load_all_records()])
+
+
+class TestJsonOutput:
+    """--json streams; the document it streams must be the one it always was."""
+
+    def _rendered(self, capsys, records, nok) -> str:
+        ccr.report_json(records, nok=nok)
+        return capsys.readouterr().out
+
+    def _dumped(self, records, nok) -> str:
+        return json.dumps([ccr._json_entry(r, nok) for r in records], indent=2) + "\n"
+
+    def test_the_streamed_document_matches_a_single_dumps(self, capsys):
+        nok = ccr.NokCtx()
+        records = [_rec(message_id=f"m{i}") for i in range(3)]
+        assert self._rendered(capsys, records, nok) == self._dumped(records, nok)
+
+    def test_one_record_matches_too(self, capsys):
+        nok = ccr.NokCtx()
+        records = [_rec()]
+        assert self._rendered(capsys, records, nok) == self._dumped(records, nok)
+
+    def test_an_empty_corpus_is_an_empty_array(self, capsys):
+        assert self._rendered(capsys, [], ccr.NokCtx()) == "[]\n"
+
+    def test_the_nok_keys_still_ride_along(self, capsys):
+        nok = ccr.NokCtx({"2026-06-15": 10.0}, "2026-06-15", True)
+        records = [_rec()]
+        out = self._rendered(capsys, records, nok)
+        assert out == self._dumped(records, nok)
+        assert json.loads(out)[0]["cost_nok"] == 12.5
+
+
+def test_the_script_hash_is_memoized():
+    """A rollup run asks twice, and no process edits its own source mid-run."""
+    assert ccr._script_hash() is ccr._script_hash()
 
 
 class TestSaveBatching:
@@ -370,7 +482,7 @@ class TestOverrideReachesPurgedHistory:
         return ccr._build_override_fn()
 
     def test_no_rules_costs_the_hot_loop_nothing(self, monkeypatch):
-        monkeypatch.setattr(cache_db, "get_project_overrides", lambda: [])
+        monkeypatch.setattr(cache_db, "get_project_overrides", list)
         assert ccr._build_override_fn() is None
 
     def test_a_remote_rule_follows_its_live_records_onto_the_orphans(self, monkeypatch):
@@ -603,7 +715,7 @@ class TestKeepAttributesAccounts:
         assert rec.account == "me@work.example"
 
     def test_the_filter_is_a_case_insensitive_substring(self):
-        f = dict(accounts=self._tl(), account_filter="WORK")
+        f = {"accounts": self._tl(), "account_filter": "WORK"}
         assert ccr._keep(self._at(1500.0), **_filters(**f)) is True
         assert ccr._keep(self._at(2500.0), **_filters(**f)) is False
 
@@ -631,7 +743,7 @@ class TestAccountAttributionEndToEnd:
             )
 
     def _epoch(self, iso: str) -> float:
-        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+        return dt.datetime.fromisoformat(iso).timestamp()
 
     def test_a_mid_session_switch_splits_one_session_file(self, loader):
         """/login mid-session is the case the change log exists for."""
@@ -762,7 +874,7 @@ class TestAdopt:
         return types.SimpleNamespace(**{"remove": False, "yes": True, **kw})
 
     def _epoch(self, iso: str) -> float:
-        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+        return dt.datetime.fromisoformat(iso).timestamp()
 
     def _capture(self, ts: float, uuid: str, email: str, org: str = "Org"):
         cache_db.record_account_event(
@@ -992,7 +1104,7 @@ class TestAccountsWorthShowing:
 class TestDefaultReportDispatch:
     """What a bare `ccreport` prints, and in what order."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def run(self, monkeypatch):
         """Run main() over *accounts*, returning the reports it called."""
         def _run(*accounts, argv=("ccreport.py",)):
@@ -1045,7 +1157,7 @@ class TestReportDefersTheDailySnapshot:
     setting it after the copy (macsetup-2huo).
     """
 
-    @pytest.fixture()
+    @pytest.fixture
     def seen(self, monkeypatch):
         """The deferral as get_connection saw it, per open, over `ccreport overrides`."""
         values: list[str | None] = []
@@ -1106,7 +1218,7 @@ def _write_entries(path: Path, entries: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
 
 
-def _rates_for(records) -> "ccr.NokCtx":
+def _rates_for(records) -> ccr.NokCtx:
     """A different rate for every Oslo date the corpus touches.
 
     Different on purpose: a record converted under the wrong date then lands on
@@ -1251,7 +1363,7 @@ class TestRollupParity:
 class TestRollupFingerprint:
     """Every read-time input a rollup row froze has to force a rebuild."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def builds(self, monkeypatch):
         """The fingerprint of each rebuild, in order."""
         written: list[str] = []
@@ -1367,7 +1479,7 @@ class TestRollupFingerprint:
 class TestRollupsServeOnlyTheUnfilteredReport:
     """A rollup row is a day of one session; anything finer needs the records."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def reads(self, rollup_corpus, monkeypatch):
         """Rollup reads, counted, with a valid rollup table already in place."""
         ccr.load_all_records(use_rollups=True)  # builds
@@ -1441,6 +1553,7 @@ class TestRecordOsloDate:
     def test_the_bulk_rate_load_asks_for_the_carried_dates(self, monkeypatch):
         """Else the rate a rollup record needs is the one date never fetched."""
         asked: list[set] = []
-        monkeypatch.setattr(ccr, "load_rates", lambda dates: asked.append(dates) or {})
+        monkeypatch.setattr(
+            ccr, "load_rates", lambda dates, _pf=None: asked.append(dates) or {})
         ccr.load_rates_for_records([_rec(oslo_date=dt.date(2026, 1, 1))])
         assert asked == [{dt.date(2026, 1, 1)}]

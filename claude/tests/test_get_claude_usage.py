@@ -1,6 +1,9 @@
-"""Tests for get_claude_usage.py's follower wait loop."""
+"""Tests for get_claude_usage.py's follower wait loop and token lookup."""
 
 from __future__ import annotations
+
+import subprocess
+from urllib.error import HTTPError
 
 import pytest
 
@@ -143,3 +146,204 @@ class TestApiQuotaFields:
         row = cache_db.read_usage_stale()
         assert "sonnet_percent" not in row
         assert row["session_percent"] == 20
+
+
+class TestWindowBoundFlags:
+    """--session-reset/--week-reset carry the caller's native stdin window bounds.
+
+    The rollover case they exist for: a five_hour response without resets_at
+    nulls the column, compute_costs then omits session_window_cost rather than
+    zeroing it, and the row keeps the previous window's total (macsetup-x2aq).
+    """
+
+    NATIVE = "2026-08-09T19:20:00"
+    CACHED = "2026-08-09T14:20:00"
+    FROM_API = "2026-08-09T20:00:00"
+
+    @pytest.fixture
+    def computed(self, monkeypatch):
+        """The kwargs every compute_costs call was made with."""
+        seen: list[dict] = []
+
+        def fake(**kwargs):
+            seen.append(kwargs)
+            return {}
+
+        monkeypatch.setattr(gcu, "compute_costs", fake)
+        return seen
+
+    @staticmethod
+    def _argv(monkeypatch, *args):
+        monkeypatch.setattr(gcu.sys, "argv", ["get_claude_usage.py", *args])
+
+    def test_costs_only_prefers_the_flag_over_the_cached_row(self, computed, monkeypatch):
+        import cache_db
+
+        cache_db.write_usage_cache({"session_reset": self.CACHED})
+        self._argv(monkeypatch, "--costs-only", "--session-reset", self.NATIVE)
+        gcu._run_costs_only(None, None)
+        assert computed[0]["session_reset_iso"] == self.NATIVE
+
+    def test_costs_only_falls_back_to_the_cached_row(self, computed, monkeypatch):
+        import cache_db
+
+        cache_db.write_usage_cache({"session_reset": self.CACHED})
+        self._argv(monkeypatch, "--costs-only")
+        gcu._run_costs_only(None, None)
+        assert computed[0]["session_reset_iso"] == self.CACHED
+
+    @pytest.fixture
+    def full_fetch(self, monkeypatch):
+        """main()'s leader path with everything but the response body stubbed."""
+        monkeypatch.setattr(gcu, "get_usage_token", lambda: "tok")
+        monkeypatch.setattr(gcu, "read_usage_cache", lambda _max_age: None)
+        monkeypatch.setattr(gcu, "try_acquire_fetch_lock", lambda *a, **k: True)
+        monkeypatch.setattr(gcu, "release_fetch_lock", lambda: None)
+        monkeypatch.setattr(gcu, "clear_fetch_failures", lambda: None)
+        monkeypatch.setattr(gcu, "write_usage_cache", lambda *a, **k: None)
+
+        def _run(mapped):
+            monkeypatch.setattr(gcu, "fetch_usage_api", lambda _t: dict(mapped))
+            gcu.main()
+
+        return _run
+
+    def test_the_response_reset_wins_over_the_flag(self, computed, full_fetch, monkeypatch, capsys):
+        self._argv(monkeypatch, "--session-reset", self.NATIVE)
+        full_fetch({"session_percent": 7, "session_reset": self.FROM_API})
+        capsys.readouterr()
+        assert computed[0]["session_reset_iso"] == self.FROM_API
+
+    def test_the_flag_stands_in_when_the_response_omits_resets_at(
+        self, computed, full_fetch, monkeypatch, capsys,
+    ):
+        self._argv(monkeypatch, "--session-reset", self.NATIVE, "--week-reset", self.CACHED)
+        full_fetch({"session_percent": 7})
+        capsys.readouterr()
+        assert computed[0]["session_reset_iso"] == self.NATIVE
+        assert computed[0]["week_reset_iso"] == self.CACHED
+
+    def test_no_flag_and_no_response_reset_leaves_the_window_unset(
+        self, computed, full_fetch, monkeypatch, capsys,
+    ):
+        self._argv(monkeypatch)
+        full_fetch({"session_percent": 7})
+        capsys.readouterr()
+        assert computed[0]["session_reset_iso"] is None
+
+
+def _dump_output(count: int) -> bytes:
+    """A `security dump-keychain` transcript listing *count* candidate services.
+
+    Modification dates descend with the index, so entry 0 is the newest.
+    """
+    items = []
+    for i in range(count):
+        items.append(
+            'class: "genp"\n'
+            "attributes:\n"
+            f'    "svce"<blob>="{gcu.CREDENTIALS_SERVICE}-{i}"\n'
+            f'    "mdat"<timedate>=0x3230 "{9999 - i:04d}0101120000Z\\000"\n'
+        )
+    return "".join(items).encode()
+
+
+class TestKeychainCandidateCap:
+    """A machine that has logged in many times accumulates candidate services,
+    and each one costs a serial KEYCHAIN_TIMEOUT under the fetch lock."""
+
+    @pytest.fixture
+    def security_calls(self, monkeypatch):
+        """Record every `security` invocation; every lookup misses.
+
+        The dump lists twice the cap, so an uncapped loop is visible as extra
+        find-generic-password calls rather than as a slow test.
+        """
+        calls: list[list[str]] = []
+        dump = _dump_output(2 * gcu.MAX_KEYCHAIN_CANDIDATES)
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "dump-keychain":
+                return subprocess.CompletedProcess(argv, 0, stdout=dump, stderr=b"")
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+        monkeypatch.setattr(gcu.subprocess, "run", fake_run)
+        monkeypatch.setattr(gcu.sys, "platform", "darwin")
+        monkeypatch.setattr(gcu, "_read_token_from_credentials_file", lambda: None)
+        return calls
+
+    def test_the_candidate_list_is_capped(self, security_calls):
+        assert len(gcu._list_keychain_candidates()) == gcu.MAX_KEYCHAIN_CANDIDATES
+
+    def test_the_newest_candidates_are_the_ones_kept(self, security_calls):
+        kept = gcu._list_keychain_candidates()
+        assert kept[0] == f"{gcu.CREDENTIALS_SERVICE}-0"
+        assert kept == sorted(kept, key=lambda s: int(s.rsplit("-", 1)[1]))
+
+    def test_a_total_miss_probes_the_primary_plus_the_cap(self, security_calls):
+        assert gcu.get_usage_token() is None
+        lookups = [c for c in security_calls if c[1] == "find-generic-password"]
+        assert len(lookups) == 1 + gcu.MAX_KEYCHAIN_CANDIDATES
+
+    def test_a_candidate_hit_stops_the_loop(self, monkeypatch, security_calls):
+        token = '{"claudeAiOauth": {"accessToken": "found"}}'
+        hit = f"{gcu.CREDENTIALS_SERVICE}-1"
+        real_run = gcu.subprocess.run
+
+        def fake_run(argv, **kwargs):
+            if argv[1] == "find-generic-password" and argv[3] == hit:
+                real_run(argv, **kwargs)
+                return subprocess.CompletedProcess(argv, 0, stdout=token, stderr="")
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(gcu.subprocess, "run", fake_run)
+        assert gcu.get_usage_token() == "found"
+        lookups = [c for c in security_calls if c[1] == "find-generic-password"]
+        assert [c[3] for c in lookups] == [gcu.CREDENTIALS_SERVICE,
+                                           f"{gcu.CREDENTIALS_SERVICE}-0", hit]
+
+
+class TestFetchLockHoldBudget:
+    """The lock TTL has to outlast what main() legitimately does while holding
+    it, or the next spawn calls a live fetch abandoned and starts a second one."""
+
+    def test_the_budget_covers_the_worst_case_hold(self):
+        keychain = gcu.KEYCHAIN_TIMEOUT * (1 + gcu.MAX_KEYCHAIN_CANDIDATES)
+        keychain += gcu.KEYCHAIN_DUMP_TIMEOUT
+        api = (1 + gcu.USAGE_API_RETRIES) * gcu.USAGE_API_TIMEOUT
+        api += gcu.USAGE_API_RETRIES * gcu.USAGE_API_MAX_RETRY_DELAY
+        assert keychain + api < gcu.FETCH_LOCK_MAX_HOLD_S
+
+    def test_a_hostile_retry_after_stays_inside_the_budget(self, monkeypatch):
+        """A 429 asking for a 15-minute wait must not stretch the hold past it."""
+        import email.message
+
+        headers = email.message.Message()
+        headers["Retry-After"] = "900"
+        sleeps: list[float] = []
+
+        def refuse(*_a, **_k):
+            raise HTTPError(gcu.USAGE_API_URL, 429, "Too Many Requests", headers, None)
+
+        monkeypatch.setattr(gcu, "urlopen", refuse)
+        monkeypatch.setattr(gcu.time, "sleep", sleeps.append)
+        with pytest.raises(HTTPError):
+            gcu.request_usage_body("tok")
+        assert len(sleeps) == gcu.USAGE_API_RETRIES
+        assert sum(sleeps) <= gcu.USAGE_API_RETRIES * gcu.USAGE_API_MAX_RETRY_DELAY
+
+    def test_the_lock_ttl_cache_db_enforces_covers_that_budget(self):
+        """cache_db holds its own copy of the number: importing this module from
+        there would invert the layering and cost the render path a pricing
+        import. So the two are kept in step here instead — a TTL below the hold
+        lets the next spawn call a live fetch abandoned and start a second one
+        against the endpoint that is already answering 429 (macsetup-3dl3)."""
+        import cache_db
+
+        ttl = getattr(cache_db, "FETCH_LOCK_STALE_TIMEOUT", None)
+        assert ttl is not None, (
+            "cache_db must expose FETCH_LOCK_STALE_TIMEOUT separately from the "
+            "costs lock's _LOCK_STALE_TIMEOUT, and is_fetch_blocked must read it"
+        )
+        assert ttl >= gcu.FETCH_LOCK_MAX_HOLD_S

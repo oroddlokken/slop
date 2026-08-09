@@ -8,6 +8,8 @@ Various slop I have made for use with Claude Code or OpenCode.
 
 [comment-cop](comment-cop) reviews the prose layer instead of the logic — stale comments, rambling, LLM filler, and the places where the missing *why* would have saved someone. [string-cop](string-cop) does the same for the strings the user actually reads — copy that contradicts the screen, reassures about nothing, or lectures where a number would do.
 
+[perf-cop](perf-cop) is the runtime-cost sweep — parallel agents hunting hot loops, chatty I/O, blocking calls and cold-start weight, where every finding has to name the workload it costs or it gets demoted.
+
 [dba](dba) is a database & SQL deep-dive — parallel agents scanning through lenses like injection, N+1, schema drift, and transaction gaps, distilled into prioritized fixes.
 
 [test-my-tests](test-my-tests) asks whether your tests would actually catch real bugs, not just whether they exist.

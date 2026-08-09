@@ -1,26 +1,24 @@
-"""Tests for statusline-command.py helpers that encode a rule, not a layout."""
+"""Tests for statusline_command.py helpers that encode a rule, not a layout."""
 
 from __future__ import annotations
 
-import importlib.util
+import datetime as dt
 import os
+import re
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parent.parent / "statusline-command.py"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import statusline_command as sl
 
 
-def _load():
-    """statusline-command.py is a script, not an importable module name."""
-    spec = importlib.util.spec_from_file_location("statusline_command", _SCRIPT)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-sl = _load()
+def _iso_offset(seconds: float) -> str:
+    """last_updated as the usage row stores it: local-time ISO, *seconds* from now."""
+    return dt.datetime.fromtimestamp(time.time() + seconds, dt.UTC).astimezone().isoformat()
 
 
 @pytest.fixture(autouse=True)
@@ -237,7 +235,7 @@ class TestScopedCountdown:
     countdown twice on one line (macsetup-4raz).
     """
 
-    @pytest.fixture()
+    @pytest.fixture
     def render(self, monkeypatch):
         import datetime as dt
         import re
@@ -248,7 +246,7 @@ class TestScopedCountdown:
 
         def _render(scoped_offset_s, week_offset_s=353000):
             def iso(s):
-                return dt.datetime.fromtimestamp(now + s, dt.timezone.utc).isoformat()
+                return dt.datetime.fromtimestamp(now + s, dt.UTC).isoformat()
 
             usage = {
                 "week_percent": "62", "week_reset": iso(week_offset_s),
@@ -278,6 +276,52 @@ class TestScopedCountdown:
         assert render(600000) == "Fa:9% 6d22h"
 
 
+class TestScopedWeekCost:
+    """The scoped quota spends the week window, so it carries a week cost too.
+
+    It is week_cost narrowed to the family the quota caps, keyed by the same
+    helper the accumulation uses so a display name and a model ID agree.
+    """
+
+    @pytest.fixture
+    def render(self, monkeypatch):
+        import datetime as dt
+        import re
+        import time
+
+        monkeypatch.setenv("CLAUDE_STATUSLINE_SCOPED_THRESHOLD", "0")
+        now = time.time()
+
+        def _render(week_model_costs, scoped_model="Fable"):
+            reset = dt.datetime.fromtimestamp(now + 353000, dt.UTC).isoformat()
+            usage = {
+                "week_percent": "84", "week_reset": reset, "week_cost": 1694.0,
+                "scoped_percent": "31", "scoped_model": scoped_model,
+                "scoped_reset": reset, "_current_model": f"{scoped_model} 5",
+                "_native_rl": True,
+            }
+            if week_model_costs is not None:
+                usage["week_model_costs"] = week_model_costs
+            inners, _, sc_shown = sl._render_rate_limits(usage, now)
+            assert sc_shown
+            return re.sub(r"\x1b\[[0-9;]*m", "", inners[-1])
+
+        return _render
+
+    def test_the_familys_share_renders_beside_the_percentage(self, render):
+        assert render({"fable": 123.4, "opus": 9.0}) == "Fa:31% $124 2d21h/7d -11%"
+
+    def test_a_family_the_split_does_not_name_renders_bare(self, render):
+        assert render({"opus": 9.0}) == "Fa:31% 2d21h/7d -11%"
+
+    def test_no_split_at_all_renders_as_before(self, render):
+        """A cost summary written before the split existed, or with none of it."""
+        assert render(None) == "Fa:31% 2d21h/7d -11%"
+
+    def test_the_lookup_follows_whichever_model_is_capped(self, render):
+        assert render({"opus": 40.0}, scoped_model="Opus") == "Op:31% $40 2d21h/7d -11%"
+
+
 class TestMergeCostData:
     """The cold-start recompute must get the window bounds from stdin.
 
@@ -285,7 +329,7 @@ class TestMergeCostData:
     the S segment renders bare on the first call of a session (macsetup-4uja).
     """
 
-    @pytest.fixture()
+    @pytest.fixture
     def calls(self, monkeypatch):
         monkeypatch.setenv("CLAUDE_STATUSLINE_HISTORIC_COST", "1")
         seen: list[dict] = []
@@ -318,6 +362,301 @@ class TestMergeCostData:
         usage = {"session_percent": 10, "week_cost": 1.0}
         sl._merge_cost_data(usage, "sid", "", None, {"week_cost": 9.0})
         assert usage["week_cost"] == 9.0
+
+    def test_the_per_model_week_split_is_carried_over(self, calls):
+        """The usage table has no column for it, so the summary is its only route."""
+        usage = {"session_percent": 10}
+        split = {"fable": 12.0}
+        sl._merge_cost_data(usage, "sid", "", None, {"week_model_costs": split})
+        assert usage["week_model_costs"] == split
+
+
+class TestProjectCostRescanIsGated:
+    """compute_project_rolling_costs is an unbounded rescan (macsetup-oyz3).
+
+    Every *_project_cost key it produces is also written by compute_costs and
+    cached in the cost summary, so running it over numbers that were merged one
+    line earlier buys the render nothing.
+    """
+
+    PROJ_KEY = "twenty_four_hour_project_cost"
+
+    @pytest.fixture
+    def rescans(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_HISTORIC_COST", "1")
+        seen: list[str] = []
+        monkeypatch.setattr(
+            sl, "compute_project_rolling_costs",
+            lambda cwd: seen.append(cwd) or {self.PROJ_KEY: 99.0},
+        )
+        return seen
+
+    def test_the_key_is_in_the_summary_merge_list(self):
+        assert self.PROJ_KEY in sl.rolling_cost_keys()
+
+    def test_a_summary_with_project_costs_skips_the_rescan(self, rescans):
+        usage = {"session_percent": 10}
+        sl._merge_cost_data(usage, "sid", "/tmp/proj", None, {self.PROJ_KEY: 4.0})
+        assert rescans == []
+        assert usage[self.PROJ_KEY] == 4.0
+
+    def test_a_summary_without_them_still_rescans(self, rescans):
+        usage = {"session_percent": 10}
+        sl._merge_cost_data(usage, "sid", "/tmp/proj", None, {"week_cost": 4.0})
+        assert rescans == ["/tmp/proj"]
+        assert usage[self.PROJ_KEY] == 99.0
+
+
+class TestGitDiffstatIsGatedOnItsToggle:
+    """`git diff --shortstat HEAD` refreshes the index and diffs every tracked
+    path — the costliest of the four spawns, and _render_git drops its result
+    unless GIT_DIFFSTAT is on (macsetup-5wg1).
+    """
+
+    @pytest.fixture
+    def spawned(self, monkeypatch):
+        seen: list[list[str]] = []
+
+        def fake_popen(cmd, **kw):
+            seen.append(cmd)
+            return object()
+
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT", "1")
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        return seen
+
+    def test_off_spawns_no_diffstat(self, spawned, monkeypatch):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT_DIFFSTAT", "0")
+        procs = sl._start_git("/tmp/proj")
+        assert "diffstat" not in procs
+        assert not any("--shortstat" in cmd for cmd in spawned)
+
+    def test_on_spawns_it(self, spawned, monkeypatch):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT_DIFFSTAT", "1")
+        assert "diffstat" in sl._start_git("/tmp/proj")
+        assert any("--shortstat" in cmd for cmd in spawned)
+
+    def test_collect_reads_zeros_when_it_was_never_spawned(self, monkeypatch):
+        """_collect_git must not KeyError on the absent entry."""
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT_DIFFSTAT", "0")
+        procs = {name: _FakeProc(out) for name, out in (
+            ("status", b"## main\n M a.py\n"), ("stash", b""), ("toplevel", b"/tmp/proj\n"),
+        )}
+        git = sl._collect_git(procs)
+        assert (git.branch, git.insertions, git.deletions) == ("main", 0, 0)
+
+
+class TestRenderGitIndicators:
+    """Six any() passes over the porcelain list became one (macsetup-pym4).
+
+    The flags are what changed, not the alphabet, so these pin the mapping from
+    status code to indicator and the order they are concatenated in.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _git_on(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT", "1")
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT_DIFFSTAT", "0")
+
+    def _ind(self, *files, stash="", branch_line="## main"):
+        out = sl._render_git("\n".join((branch_line, *files)), stash, "main", 0, 0)
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+        return plain.removeprefix("main").strip("[]")
+
+    @pytest.mark.parametrize(("line", "expected"), [
+        # A conflict code is a staged code too, so "=" rarely travels alone.
+        ("UU a.py", "="), ("AA a.py", "=+"), ("DD a.py", "=+✘!"), ("AU a.py", "=+"),
+        ("M  a.py", "+"), ("A  a.py", "+"), ("C  a.py", "+"),
+        ("R  a.py -> b.py", "+»"),
+        ("D  a.py", "+✘"),
+        (" M a.py", "!"), (" D a.py", "!"),
+        ("?? a.py", "?"),
+    ])
+    def test_one_file_at_a_time(self, line, expected):
+        assert self._ind(line) == expected
+
+    def test_the_order_is_conflict_stash_staged_renamed_deleted_unstaged_untracked(self):
+        assert self._ind(
+            "UU c.py", "R  a.py -> b.py", "D  d.py", " M e.py", "?? f.py", stash="x",
+        ) == "=$+»✘!?"
+
+    def test_a_clean_tree_has_no_brackets(self):
+        assert sl._render_git("## main", "", "main", 0, 0).endswith("main\x1b[0m")
+
+    def test_a_blank_line_is_not_a_status(self):
+        """The porcelain output ends with a newline, so files carries an empty
+        entry; "" is a substring of every alphabet these flags test against.
+        """
+        assert self._ind("") == ""
+
+    def test_the_diffstat_only_shows_when_its_toggle_is_on(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT_DIFFSTAT", "1")
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", sl._render_git("## main", "", "main", 3, 1))
+        assert plain == "main[+3-1]"
+
+
+class _FakeProc:
+    """Stands in for a Popen whose output is already known."""
+
+    def __init__(self, out: bytes):
+        self._out = out
+
+    def communicate(self, timeout=None):
+        return self._out, b""
+
+    def kill(self):
+        pass
+
+
+class TestDspVerdictIsMemoized:
+    """The ancestor claude's argv is fixed at launch, so the ps walk is a
+    once-per-session question, not a once-per-slow-render one (macsetup-5dna).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _dsp_on(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_DSP", "1")
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    def _ps(self, *rows: str) -> _FakeProc:
+        return _FakeProc(("\n".join(rows) + "\n").encode())
+
+    def test_a_memoized_verdict_spawns_nothing(self, monkeypatch):
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("spawned ps"))
+        assert sl._start_dsp_check(True) is None
+        assert sl._start_dsp_check(False) is None
+
+    def test_no_memo_spawns(self, monkeypatch):
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: "proc")
+        assert sl._start_dsp_check(None) == "proc"
+
+    def test_the_flag_is_found_up_the_chain(self, monkeypatch):
+        monkeypatch.setattr(sl.os, "getppid", lambda: 200)
+        proc = self._ps(
+            f"100 1 /bin/claude {sl.DSP_FLAG}",
+            "200 100 /bin/bash statusline.sh",
+        )
+        assert sl._collect_dsp(proc) is True
+
+    def test_an_unflagged_chain_is_a_real_false(self, monkeypatch):
+        monkeypatch.setattr(sl.os, "getppid", lambda: 200)
+        assert sl._collect_dsp(self._ps("100 1 /bin/claude", "200 100 /bin/bash")) is False
+
+    @pytest.mark.parametrize("proc", [None, _FakeProc(b"")])
+    def test_no_answer_is_none_not_false(self, proc):
+        """None is what stops _fetch_all memoizing a verdict it never reached."""
+        assert sl._collect_dsp(proc) is None
+
+    def test_the_memo_file_outlives_the_fetch_cache(self):
+        sid = "dsp-session"
+        sl._save_memo(sid, {"dsp": True})
+        assert sl._load_memo(sid) == {"dsp": True}
+        assert sl._memo_path(sid) != sl._fast_cache_path(sid)
+
+    def test_an_unreadable_memo_is_just_an_empty_one(self):
+        sid = "torn-session"
+        sl._memo_path(sid).write_text("{not json", encoding="utf-8")
+        assert sl._load_memo(sid) == {}
+
+    def test_turning_the_toggle_off_beats_a_memoized_true(self, monkeypatch, tmp_path):
+        """_start_dsp_check stops seeing the toggle once a verdict is memoized,
+        so _fetch_all is what has to re-read it.
+        """
+        sid = "toggle-session"
+        sl._save_memo(sid, {"dsp": True})
+        monkeypatch.setenv("CLAUDE_STATUSLINE_DSP", "0")
+        monkeypatch.setenv("CLAUDE_STATUSLINE_GIT", "0")
+        monkeypatch.setenv("CLAUDE_STATUSLINE_HISTORIC_COST", "0")
+        monkeypatch.setattr(sl, "_fetch_usage", lambda *a: {})
+        monkeypatch.setattr(sl, "_fetch_dcat", lambda cwd: {})
+        monkeypatch.setattr(sl, "_capture_account", lambda memo=None: None)
+        monkeypatch.setattr(sl, "_accumulate_cache_stats", lambda *a: (0, 0, 0))
+        monkeypatch.setattr(sl, "compute_session_cost", lambda *a: 0.0)
+        inp = sl._InputData(
+            cwd=str(tmp_path), model="Opus", effort="", thinking_off=False,
+            used="10", ctx_size=200_000, lines_added=0, lines_removed=0,
+            cache_create=0, cache_read=0, input_fresh=0, total_in=0, session_id=sid,
+        )
+        fetched = sl._fetch_all(inp, {}, {}, 1_000_000.0, test_mode=True)
+        assert fetched.dsp is False
+        assert sl._load_memo(sid) == {"dsp": True}, "the verdict itself is unchanged"
+
+
+class TestSpawnUsageRefreshWindowBounds:
+    """The refresh must be told the window it is totalling, from stdin first.
+
+    Right after a rollover the API can answer without resets_at, which writes
+    session_reset as an explicit null; compute_costs then omits
+    session_window_cost and the previous window's total survives every
+    subsequent refresh (macsetup-x2aq).
+    """
+
+    NATIVE = {"session_reset": "2026-08-09T19:20:00", "week_reset": "2026-08-12T09:00:00"}
+    CACHED = {"session_reset": "2026-08-09T14:20:00", "week_reset": "2026-08-11T09:00:00"}
+
+    @pytest.fixture
+    def spawned(self, monkeypatch):
+        seen: list[list[str]] = []
+        # The render imports subprocess inside the function, so there is no
+        # sl.subprocess to patch — the module object itself is the seam.
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: seen.append(cmd))
+        return seen
+
+    @staticmethod
+    def _flag(cmd, flag):
+        return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+    @pytest.mark.parametrize("costs_only", [True, False])
+    def test_native_resets_win_over_the_cached_row(self, spawned, costs_only):
+        sl._spawn_usage_refresh(
+            "sid", "/tmp/proj", dict(self.CACHED),
+            costs_only=costs_only, native_rl=dict(self.NATIVE),
+        )
+        assert self._flag(spawned[0], "--session-reset") == self.NATIVE["session_reset"]
+        assert self._flag(spawned[0], "--week-reset") == self.NATIVE["week_reset"]
+
+    @pytest.mark.parametrize("native", [None, {}, {"session_percent": 7}])
+    def test_the_cached_row_is_the_fallback(self, spawned, native):
+        """Including a native reading that carries a percent but no resets_at."""
+        sl._spawn_usage_refresh(
+            "sid", "/tmp/proj", dict(self.CACHED), costs_only=True, native_rl=native,
+        )
+        assert self._flag(spawned[0], "--session-reset") == self.CACHED["session_reset"]
+        assert self._flag(spawned[0], "--week-reset") == self.CACHED["week_reset"]
+
+    def test_a_null_cached_reset_does_not_suppress_the_native_one(self, spawned):
+        """The rollover shape: the row's column was nulled by the last response."""
+        sl._spawn_usage_refresh(
+            "sid", "/tmp/proj", {"session_reset": None, "week_reset": None},
+            costs_only=True, native_rl=dict(self.NATIVE),
+        )
+        assert self._flag(spawned[0], "--session-reset") == self.NATIVE["session_reset"]
+
+    def test_neither_source_has_a_bound(self, spawned):
+        sl._spawn_usage_refresh("sid", "/tmp/proj", {}, costs_only=True, native_rl={})
+        assert "--session-reset" not in spawned[0]
+        assert "--week-reset" not in spawned[0]
+
+    def test_fetch_usage_threads_the_native_limits_down(self, monkeypatch):
+        """_spawn_usage_refresh only sees native_rl if its caller passes it."""
+        import cache_db
+
+        seen: list[dict] = []
+        monkeypatch.setattr(
+            sl, "_spawn_usage_refresh",
+            lambda *a, **k: seen.append(k),
+        )
+        cache_db.write_usage_cache({
+            "session_percent": 5,
+            # Older than USAGE_FETCH_INTERVAL_S, younger than USAGE_HEARTBEAT_S:
+            # a costs-only spawn, which is the one that re-persists the total.
+            "last_updated": _iso_offset(-1200),
+        })
+        native = {"session_percent": 7, **self.NATIVE}
+        sl._fetch_usage("sid", "/tmp/proj", native, None)
+        assert len(seen) == 1
+        assert seen[0]["costs_only"] is True
+        assert seen[0]["native_rl"] == native
 
 
 class TestRefreshEnv:
@@ -369,7 +708,7 @@ class TestRenderDefersTheDailySnapshot:
             return real()
 
         monkeypatch.setattr(cache_db, "get_connection", spy)
-        monkeypatch.setattr(sl.sys, "argv", ["statusline-command.py", "-t"])
+        monkeypatch.setattr(sl.sys, "argv", ["statusline_command.py", "-t"])
         monkeypatch.setenv("CLAUDE_STATUSLINE_USAGE_JSON", json.dumps(
             {"session_percent": 23, "week_percent": 41},
         ))
@@ -386,7 +725,7 @@ class TestRenderDefersTheDailySnapshot:
 class TestFetchUsageReadsTheRowOnce:
     """Three reads of the singleton row per render is three too many (macsetup-2xfb)."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def traced(self, monkeypatch):
         import cache_db
 
@@ -406,11 +745,7 @@ class TestFetchUsageReadsTheRowOnce:
         return _run
 
     def _iso(self, offset_s):
-        import datetime as dt
-
-        return dt.datetime.fromtimestamp(
-            __import__("time").time() + offset_s, dt.timezone.utc,
-        ).astimezone().isoformat()
+        return _iso_offset(offset_s)
 
     def test_fresh_row(self, traced):
         assert traced({"session_percent": 5, "last_updated": self._iso(0)}) == 1
@@ -438,7 +773,7 @@ class TestFetchUsageReadsTheRowOnce:
 class TestRenderSurvivesContention:
     """A busy database costs the render a statistic, never the whole line."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def blocked_db(self, monkeypatch):
         import sqlite3
 
@@ -465,7 +800,7 @@ class TestRenderSurvivesContention:
         import json
         import re
 
-        monkeypatch.setattr(sl.sys, "argv", ["statusline-command.py", "-t"])
+        monkeypatch.setattr(sl.sys, "argv", ["statusline_command.py", "-t"])
         # Keeps the render off the network: no refresh subprocess to spawn.
         monkeypatch.setenv("CLAUDE_STATUSLINE_USAGE_JSON", json.dumps(
             {"session_percent": 23, "week_percent": 41},
@@ -491,7 +826,7 @@ class TestCaptureAccount:
         "organizationName": "Work AS",
     }
 
-    @pytest.fixture()
+    @pytest.fixture
     def config(self, tmp_path, monkeypatch):
         """A stand-in ~/.claude.json the test writes; returns its path."""
         path = tmp_path / "claude.json"
@@ -548,6 +883,56 @@ class TestCaptureAccount:
             config.write_text(body)
         sl._capture_account()
         assert self._log() == []
+
+    def test_an_unchanged_file_is_not_reparsed(self, config):
+        """~/.claude.json is ~258 KB for one key, so an (mtime, size) that has
+        not moved skips the parse: no rewrite, no possible account switch
+        (macsetup-zrsx). Rewritten here at the same size with the mtime pinned,
+        which is exactly the state the gate is allowed to ignore.
+        """
+        import json
+
+        memo: dict = {}
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        sl._capture_account(memo)
+        stamp = memo["account"]
+
+        st = config.stat()
+        # Same field widths, so only the mtime could have given the switch away.
+        config.write_text(json.dumps({"oauthAccount": {
+            **self.ACC, "accountUuid": "uuid-home", "emailAddress": "me@home.example",
+        }}))
+        os.utime(config, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert config.stat().st_size == st.st_size, "the rewrite has to be same-size"
+        sl._capture_account(memo)
+
+        assert [e["email"] for e in self._log()] == ["me@work.example"]
+        assert memo["account"] == stamp
+
+    def test_a_rewrite_reopens_the_gate(self, config):
+        import json
+
+        memo: dict = {}
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        sl._capture_account(memo)
+        config.write_text(json.dumps({"oauthAccount": {
+            "accountUuid": "uuid-home", "emailAddress": "me@home.example",
+        }}))
+        sl._capture_account(memo)
+        assert [e["email"] for e in self._log()] == ["me@work.example", "me@home.example"]
+
+    def test_a_failed_capture_does_not_earn_the_skip(self, config):
+        """A torn read has to be retried next render, not skipped as 'seen'."""
+        import json
+
+        memo: dict = {}
+        config.write_text("{not json")
+        sl._capture_account(memo)
+        assert "account" not in memo
+
+        config.write_text(json.dumps({"oauthAccount": self.ACC}))
+        sl._capture_account(memo)
+        assert [e["email"] for e in self._log()] == ["me@work.example"]
 
     def test_a_held_database_costs_the_log_a_sample_not_the_render(self, config, monkeypatch):
         import json
@@ -650,11 +1035,15 @@ class TestSnapshotRateLimitsGating:
 
     NOW = 1_000_000.0
 
-    @pytest.fixture()
+    @pytest.fixture
     def spy(self, monkeypatch):
+        # Patched on cache_db, not sl: the render imports it lazily inside
+        # _snapshot_rate_limits, so there is no sl-level name to intercept.
+        import cache_db
+
         calls: list[tuple] = []
         monkeypatch.setattr(
-            sl, "record_rate_limit_snapshots",
+            cache_db, "record_rate_limit_snapshots",
             lambda samples, now: calls.append((samples, now)),
         )
         return calls
@@ -681,7 +1070,7 @@ class TestSnapshotRateLimitsGating:
         sl._snapshot_rate_limits({}, {}, self.NOW, test_mode=False)
         assert spy == []
 
-    @pytest.fixture()
+    @pytest.fixture
     def blocked_db(self, monkeypatch):
         import sqlite3
 
@@ -700,8 +1089,10 @@ class TestSnapshotRateLimitsGating:
         """The guard is only worth having if this is what it catches."""
         import sqlite3
 
+        import cache_db
+
         with pytest.raises(sqlite3.OperationalError):
-            sl.record_rate_limit_snapshots(
+            cache_db.record_rate_limit_snapshots(
                 sl._rl_samples(self._data(), {}, self.NOW), self.NOW,
             )
 
@@ -712,3 +1103,184 @@ class TestSnapshotRateLimitsGating:
         rows = cache_db.get_connection().execute(
             "SELECT COUNT(*) FROM rate_limit_snapshots").fetchone()[0]
         assert rows == 0
+
+
+class TestFastCache:
+    """Renders within FAST_TTL_S reuse the previous render's fetch results.
+
+    The file is the whole fast path: a miss for any reason just costs a slow
+    render, so every check here errs toward missing rather than serving
+    another directory's git segment or a stale shape.
+    """
+
+    NOW = 1_000_000.0
+    CWD = "/some/project"
+    SID = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+
+    @pytest.fixture(autouse=True)
+    def _tmpdir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        return tmp_path
+
+    def _fetched(self, **overrides):
+        base = {
+            "git": sl.GitInfo("## main", "", "/some/project", "main", 3, 1),
+            "battery": {"pct": 80, "state": "charging", "time": ""},
+            "dsp": True, "dcat": {"by_status": {"open": 2}},
+            "usage": {"session_percent": 23, "week_cost": 12.5},
+            "chat_cost": 1.25, "cums": (10, 20, 30), "total_in": 42_000,
+            "sandbox": "sbx", "sessions": "+2sess",
+        }
+        return sl._Fetched(**{**base, **overrides})
+
+    def test_roundtrip(self):
+        sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
+        got, ts = sl._load_fetched(self.SID, self.CWD, self.NOW + 1)
+        assert got == self._fetched()
+        assert isinstance(got.git, sl.GitInfo)
+        assert isinstance(got.cums, tuple)
+        assert ts == self.NOW
+
+    def test_the_slow_only_badges_survive_the_roundtrip(self):
+        """Both are rendered strings now, resolved on the slow path (macsetup-5t4g)."""
+        sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
+        got, _ = sl._load_fetched(self.SID, self.CWD, self.NOW + 1)
+        assert (got.sandbox, got.sessions) == ("sbx", "+2sess")
+
+    def test_expired_file_misses(self):
+        sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
+        assert sl._load_fetched(self.SID, self.CWD, self.NOW + sl.FAST_TTL_S) is None
+
+    def test_a_future_timestamp_misses(self):
+        """Clock skew must not grant an unbounded TTL."""
+        sl._save_fetched(self.SID, self.CWD, self.NOW + 60, self._fetched())
+        assert sl._load_fetched(self.SID, self.CWD, self.NOW) is None
+
+    def test_another_directory_misses(self):
+        """The session can change workspace between renders."""
+        sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
+        assert sl._load_fetched(self.SID, "/elsewhere", self.NOW + 1) is None
+
+    def test_another_session_misses(self):
+        sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
+        assert sl._load_fetched("other-session", self.CWD, self.NOW + 1) is None
+
+    def test_a_stale_schema_misses(self, monkeypatch):
+        sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched())
+        monkeypatch.setattr(sl, "_FAST_CACHE_SCHEMA", sl._FAST_CACHE_SCHEMA + 1)
+        assert sl._load_fetched(self.SID, self.CWD, self.NOW + 1) is None
+
+    def test_a_torn_file_misses(self):
+        sl._fast_cache_path(self.SID).write_text('{"schema":', encoding="utf-8")
+        assert sl._load_fetched(self.SID, self.CWD, self.NOW + 1) is None
+
+    def test_no_session_id_never_caches(self, tmp_path):
+        sl._save_fetched("", self.CWD, self.NOW, self._fetched())
+        assert list(tmp_path.iterdir()) == []
+        assert sl._load_fetched("", self.CWD, self.NOW) is None
+
+    def test_session_id_is_sanitized_into_the_filename(self):
+        sid = "../../etc/passwd"
+        sl._save_fetched(sid, self.CWD, self.NOW, self._fetched())
+        assert sl._load_fetched(sid, self.CWD, self.NOW + 1)[0] == self._fetched()
+        name = sl._fast_cache_path(sid).name
+        assert "/" not in name.replace("claude-statusline-", "", 1)
+
+
+class TestCatchUpCacheStats:
+    """The one bookkeeping write the fast path keeps (see _catch_up_cache_stats)."""
+
+    NOW = 1_000_000.0
+    CWD = "/some/project"
+    SID = "catchup-session"
+
+    @pytest.fixture(autouse=True)
+    def _tmpdir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        return tmp_path
+
+    def _inp(self, total_in):
+        return sl._InputData(
+            cwd=self.CWD, model="Opus", effort="", thinking_off=False,
+            used="10", ctx_size=200_000, lines_added=0, lines_removed=0,
+            cache_create=5, cache_read=6, input_fresh=7, total_in=total_in,
+            session_id=self.SID,
+        )
+
+    def _fetched(self, total_in=42_000):
+        return sl._Fetched(
+            git=sl.GitInfo("", "", "", "", 0, 0), battery={},
+            dsp=False, dcat={}, usage={}, chat_cost=0.0,
+            cums=(1, 2, 3), total_in=total_in, sandbox="", sessions="",
+        )
+
+    def test_unchanged_total_in_touches_nothing(self, monkeypatch):
+        def boom(*a):
+            raise AssertionError("no accumulation without a new API response")
+
+        monkeypatch.setattr(sl, "_accumulate_cache_stats", boom)
+        fetched = self._fetched(total_in=42_000)
+        assert sl._catch_up_cache_stats(self._inp(42_000), fetched, self.NOW) is fetched
+
+    def test_a_new_total_in_accumulates_and_keeps_the_file_ts(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            sl, "_accumulate_cache_stats",
+            lambda *a: seen.append(a) or (11, 22, 33),
+        )
+        sl._save_fetched(self.SID, self.CWD, self.NOW, self._fetched(total_in=42_000))
+        got = sl._catch_up_cache_stats(
+            self._inp(43_000), self._fetched(total_in=42_000), self.NOW,
+        )
+        assert seen == [(self.SID, 6, 5, 7, 43_000)]
+        assert got.cums == (11, 22, 33)
+        assert got.total_in == 43_000
+        # The rewrite must not extend the TTL: stale git data would otherwise
+        # ride along for as long as the turn keeps producing API responses.
+        reloaded = sl._load_fetched(self.SID, self.CWD, self.NOW + 1)
+        assert reloaded is not None
+        assert reloaded[0].cums == (11, 22, 33)
+        assert sl._load_fetched(self.SID, self.CWD, self.NOW + sl.FAST_TTL_S) is None
+
+    def test_a_held_database_costs_the_stats_not_the_render(self, monkeypatch):
+        import sqlite3
+
+        def boom(*a):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(sl, "_accumulate_cache_stats", boom)
+        fetched = self._fetched(total_in=42_000)
+        assert sl._catch_up_cache_stats(self._inp(43_000), fetched, self.NOW) is fetched
+
+
+class TestRenderElapsed:
+    """The second time figure is bash's: the render only embeds the token.
+
+    The wrapper times the whole Python invocation and substitutes the token
+    afterwards, because no in-process clock can see its own interpreter
+    startup and exit.
+    """
+
+    def _plain(self, monkeypatch, token):
+        import re
+        import time
+
+        if token is not None:
+            monkeypatch.setenv("CLAUDE_STATUSLINE_TOTAL_TOKEN", token)
+        out = sl._render_elapsed(time.monotonic())
+        return re.sub(r"\x1b\[[0-9;]*m", "", out)
+
+    @pytest.mark.parametrize("token", [None, ""])
+    def test_no_token_shows_in_process_time_alone(self, monkeypatch, token):
+        """Unset means nothing downstream will substitute — emitting the token
+        would print it literally, so it must not appear."""
+        import re
+
+        assert re.fullmatch(r"\d\.\d{3}s", self._plain(monkeypatch, token))
+
+    def test_the_token_is_embedded_verbatim(self, monkeypatch):
+        """Any transformation here would break bash's exact-match substitution."""
+        import re
+
+        out = self._plain(monkeypatch, "__SL_TOTAL__")
+        assert re.fullmatch(r"\d\.\d{3}s/__SL_TOTAL__", out)

@@ -4,7 +4,7 @@ Single database at ~/.cache/macsetup/claude/cache.db.
 
 Consumers:
   - get_claude_usage.py  (usage data + cost cache)
-  - statusline-command.py (usage read + session stats/costs)
+  - statusline_command.py (usage read + session stats/costs)
   - ccreport.py          (file-level record cache)
 """
 
@@ -16,7 +16,8 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
 from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
@@ -42,7 +43,7 @@ _conn: sqlite3.Connection | None = None
 # BUMP THIS on any change to _SCHEMA_SQL, _ADDED_COLUMNS, or the migration list
 # in _run_migrations — an existing DB is otherwise never reopened on the slow
 # path and never sees the new DDL. A needless bump costs one slow open per DB.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -85,14 +86,18 @@ CREATE TABLE IF NOT EXISTS usage (
     meta_json             TEXT
 );
 
+-- week_model_json holds the week total split by model family as a JSON object,
+-- the one bucket a per-model weekly quota is spent against. A column rather
+-- than a table: it is a handful of keys per file, read and written whole.
 CREATE TABLE IF NOT EXISTS file_costs (
-    path          TEXT PRIMARY KEY,
-    mtime_ns      INTEGER NOT NULL,
-    size          INTEGER NOT NULL,
-    week_cost     REAL NOT NULL DEFAULT 0,
-    month_cost    REAL NOT NULL DEFAULT 0,
-    all_time_cost REAL NOT NULL DEFAULT 0,
-    session_cost  REAL
+    path            TEXT PRIMARY KEY,
+    mtime_ns        INTEGER NOT NULL,
+    size            INTEGER NOT NULL,
+    week_cost       REAL NOT NULL DEFAULT 0,
+    month_cost      REAL NOT NULL DEFAULT 0,
+    all_time_cost   REAL NOT NULL DEFAULT 0,
+    session_cost    REAL,
+    week_model_json TEXT
 ) WITHOUT ROWID;
 
 -- file_path leads the key so the ON DELETE CASCADE and the per-file rewrite in
@@ -186,6 +191,31 @@ CREATE TABLE IF NOT EXISTS ccreport_rollups (
     PRIMARY KEY (day, oslo_date, sid, project, model, account)
 ) WITHOUT ROWID;
 
+-- The all-time cost of every record whose source JSONL is gone, pre-summed.
+-- Orphaned records are 83% of ccreport_records on a real machine and none of
+-- them can ever change: the log they were parsed from is deleted, so nothing
+-- re-parses them. compute_costs still had to walk all of them on every render
+-- because all_time has no window to bound it by (macsetup-3rm3).
+--
+-- The grain is the coarsest one that still answers "is this the cwd's own
+-- project": the directory prefix the file sat under, which is what
+-- path_in_project tests, plus the (project, cwd, repo) identity every record
+-- in a file shares, which is what record_project resolves. Both tests then
+-- run over a few hundred rows instead of ~86k. The override rules are
+-- deliberately NOT baked in — the identity is stored raw and resolved at read
+-- time, so a `ccreport merge` re-groups these totals with no rebuild.
+--
+-- Valid only against ccreport_orphan_fp, written in the same transaction; see
+-- pricing._orphan_alltime_fingerprint for what that covers.
+CREATE TABLE IF NOT EXISTS ccreport_orphan_costs (
+    dir_prefix TEXT NOT NULL,   -- '<projects dir>/<dir>/', '' if outside one
+    project    TEXT NOT NULL,
+    cwd        TEXT NOT NULL,   -- '' rather than NULL: part of the key
+    repo       TEXT NOT NULL,   -- ''  ""
+    cost       REAL NOT NULL,
+    PRIMARY KEY (dir_prefix, project, cwd, repo)
+) WITHOUT ROWID;
+
 -- Manual project-grouping rules, applied as a pure function over the signals
 -- stored on each record (name/remote/cwd) at report time. Local data, never
 -- committed: merges and renames live here, not in code.
@@ -203,9 +233,13 @@ CREATE TABLE IF NOT EXISTS project_overrides (
 -- call, and the answer is a pure function of project_overrides and those
 -- records (macsetup-6cov). So a present row is valid by construction rather
 -- than by a fingerprint: every writer of either input — both override writers,
--- save_ccreport_files, invalidate_ccreport — empties this table in the same
--- transaction, and readers gate on the ccreport salt so a stale row format
--- degrades the cached scope exactly as it degrades a freshly derived one.
+-- save_ccreport_files, invalidate_ccreport — clears what it can have moved in
+-- the same transaction, and readers gate on the ccreport salt so a stale row
+-- format degrades the cached scope exactly as it degrades a freshly derived
+-- one. A rule change and an invalidation empty the table; a record save empties
+-- it only when it actually changes a file's identity, since re-parsing a
+-- session log that grew rewrites the identity it already had
+-- (_save_invalidates_scopes).
 --
 -- Not airtight, deliberately: a render that derives a scope just before a
 -- ccreport write and stores it just after keeps that pre-write answer until
@@ -280,6 +314,9 @@ CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
 #   working dir still exists. NULL for orphans parsed before this existed.
 # - the weekly_scoped per-model limit, as named columns rather than meta_json
 #   so the SELECT built from _USAGE_FIELDS picks them up
+# - file_costs week_model_json: the ALTER only makes the column readable. Rows
+#   written before it carry NULL while still matching on mtime and size, so
+#   _COST_ENTRY_SCHEMA below is what makes them re-scan
 _ADDED_COLUMNS: list[tuple[str, str, str]] = [
     *(("usage", key, "REAL") for key in rolling_cost_keys()),
     ("usage", "scoped_percent", "INTEGER"),
@@ -287,7 +324,15 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
     ("usage", "scoped_reset", "TEXT"),
     ("ccreport_records", "cwd", "TEXT"),
     ("ccreport_records", "repo", "TEXT"),
+    ("file_costs", "week_model_json", "TEXT"),
 ]
+
+# Shape of a file_costs row's payload, stored in meta as `cost_schema` and
+# checked the way the week and month keys are. Bump it when a stored entry
+# gains or loses a field: a row from the previous shape still matches on mtime
+# and size, so nothing else would ever make it re-scan, and the missing field
+# reads as an empty total rather than an error.
+_COST_ENTRY_SCHEMA = "2"
 
 
 def _add_column(
@@ -312,10 +357,18 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 _PARAM_CHUNK = 500
 
 
-def _param_chunks(paths: set[str]) -> list[list[str]]:
+# Paths per invalidation transaction. Well under _PARAM_CHUNK because what
+# bounds a chunk there is parameters bound and here it is rows written: one path
+# carries every record of one session log — ~47 on this corpus, up to 900 — so
+# 500 paths is most of a 98k-row table rewritten inside one transaction, which
+# is what a render's 0.25 s busy timeout used to lose to (macsetup-48xh).
+_INVALIDATE_CHUNK = 100
+
+
+def _param_chunks(paths: set[str], size: int = _PARAM_CHUNK) -> list[list[str]]:
     """*paths* split into batches small enough to bind in one statement."""
     ordered = sorted(paths)
-    return [ordered[i:i + _PARAM_CHUNK] for i in range(0, len(ordered), _PARAM_CHUNK)]
+    return [ordered[i:i + size] for i in range(0, len(ordered), size)]
 
 
 def _rollback_if_open(conn: sqlite3.Connection) -> None:
@@ -495,7 +548,7 @@ def _run_migrations(conn: sqlite3.Connection) -> bool:
         if affected:
             placeholders = ",".join("?" * len(affected))
             conn.execute(
-                f"UPDATE ccreport_records SET cost = NULL "
+                f"UPDATE ccreport_records SET cost = NULL "  # noqa: S608
                 f"WHERE ts >= ? AND model IN ({placeholders})",
                 (cutoff_ts, *affected),
             )
@@ -686,7 +739,7 @@ def _snapshot_keep() -> int:
 
 
 def _today_utc() -> str:
-    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(tz=UTC).strftime("%Y-%m-%d")
 
 
 def _daily_snapshot_deferred() -> bool:
@@ -705,12 +758,64 @@ def _daily_snapshot_deferred() -> bool:
 # what every other process waits behind.
 _SNAPSHOT_TMP_STALE_S = 3600.0
 
-# Pages copied per step of the online backup, and the pause between steps.
-# conn.backup() with no arguments copies the whole DB in one uninterrupted call
-# holding a read lock; stepping it lets a writer in between batches. 1024 pages
-# is 4 MB at the default page size, so even a large DB is a few dozen steps.
+# Pages copied per step of the online backup. conn.backup() with no arguments
+# copies the whole DB in one uninterrupted call holding a read lock; stepping it
+# lets a writer in between batches. 1024 pages is 4 MB at the default page size,
+# so even a large DB is a few dozen steps.
+#
+# sleep= is not a pause between steps: CPython sleeps only after a step that
+# returned SQLITE_BUSY or SQLITE_LOCKED, i.e. only when the copy could not
+# proceed at all. Steps that make progress follow each other with nothing in
+# between, so this value bounds nothing on its own — _snapshot_guard does.
 _SNAPSHOT_BACKUP_PAGES = 1024
 _SNAPSHOT_BACKUP_SLEEP = 0.01
+
+# What stops a copy that will never finish. SQLite restarts a backup from page 1
+# whenever another process writes the source, and every statusline render writes
+# — so on a busy machine the loop inside conn.backup() can restart indefinitely.
+# It has no cap of its own, a restart returns SQLITE_OK, and the process that
+# takes the daily snapshot is the detached refresh whose stderr is DEVNULL, so a
+# wedged copy is invisible while the whole cost refresh waits behind it
+# (macsetup-66ic).
+#
+# The deadline is the real bound; the restart cap ends a copy that is plainly
+# losing the race without first burning the full deadline of IO for a file that
+# gets thrown away. Hitting either skips the day — tomorrow's run tries again,
+# and yesterday's snapshot is still there.
+_SNAPSHOT_DEADLINE_S = 20.0
+_SNAPSHOT_MAX_RESTARTS = 5
+
+
+class _SnapshotAbortedError(Exception):
+    """The stepped backup hit its deadline or its restart cap."""
+
+
+def _snapshot_guard(deadline: float) -> Callable[[int, int, int], None]:
+    """A conn.backup progress callback that gives up on a copy going nowhere.
+
+    Raising out of the callback is the only way to stop CPython's backup loop;
+    it aborts the copy and propagates the exception, which _maybe_snapshot
+    catches. A restart shows up as *remaining* going back up — the copy is
+    handed the whole page count again — since nothing else in the API reports
+    one.
+    """
+    state = {"remaining": -1, "restarts": 0}
+
+    def progress(_status: int, remaining: int, _pagecount: int) -> None:
+        if 0 <= state["remaining"] < remaining:
+            state["restarts"] += 1
+            if state["restarts"] > _SNAPSHOT_MAX_RESTARTS:
+                raise _SnapshotAbortedError(
+                    f"gave up after {state['restarts']} restarts "
+                    "(the source keeps changing under the copy)"
+                )
+        state["remaining"] = remaining
+        if time.monotonic() >= deadline:
+            raise _SnapshotAbortedError(
+                f"gave up after its {_SNAPSHOT_DEADLINE_S:.0f}s deadline"
+            )
+
+    return progress
 
 
 def _claim_snapshot_tmp(tmp: Path) -> bool:
@@ -770,11 +875,12 @@ def _maybe_snapshot(conn: sqlite3.Connection) -> tuple[Path | None, bool]:
                 dst,
                 pages=_SNAPSHOT_BACKUP_PAGES,
                 sleep=_SNAPSHOT_BACKUP_SLEEP,
+                progress=_snapshot_guard(time.monotonic() + _SNAPSHOT_DEADLINE_S),
             )
         finally:
             dst.close()
         tmp.replace(target)
-    except (sqlite3.Error, OSError) as e:
+    except (sqlite3.Error, OSError, _SnapshotAbortedError) as e:
         try:
             print(f"Warning: cache.db snapshot failed: {e}", file=sys.stderr)
         except OSError:
@@ -946,7 +1052,7 @@ def usage_is_fresh(d: dict[str, Any], max_age: int) -> bool:
             return False
     except (ValueError, TypeError):
         return False
-    now = datetime.now(tz=timezone.utc).astimezone()
+    now = datetime.now(tz=UTC).astimezone()
     for key in ("session_reset", "week_reset"):
         iso = d.get(key)
         if iso:
@@ -990,7 +1096,27 @@ def read_usage_stale() -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 _BACKOFF_SCHEDULE = [45, 120, 240]  # seconds, indexed by consecutive failures
-_LOCK_STALE_TIMEOUT = 30  # seconds before a held lock is considered abandoned
+
+# Seconds before a held lock reads as abandoned. This one is the costs lock's:
+# its holder does a JSONL rescan and a cache write and nothing that waits on the
+# network, so 30 s covers the hold several times over.
+_LOCK_STALE_TIMEOUT = 30
+
+# The fetch lock gets its own, an order of magnitude longer, because its holder
+# can spend a degraded keychain lookup and a retrying API call under it. It must
+# stay at or above get_claude_usage.FETCH_LOCK_MAX_HOLD_S, which derives the
+# worst case from the timeouts that actually run there — that expression is the
+# authority for this number, not the literal below.
+#
+# Not imported from there: get_claude_usage imports this module, and a lazy
+# import would pull urllib and subprocess onto the render path. What keeps the
+# two in step instead is a test on that side (test_get_claude_usage.py,
+# TestFetchLockHoldBudget), so raising the hold without raising this fails there.
+#
+# Set under the hold, the next spawn calls a fetch that is still doing its job
+# abandoned and starts a second one — against the endpoint that, in the case
+# that made the holder slow, is already answering 429 (macsetup-3dl3).
+FETCH_LOCK_STALE_TIMEOUT = 80.0
 
 
 # UUID token per lock prefix, set while this process holds that lock.
@@ -1032,13 +1158,15 @@ def _check_backoff_in_txn(conn: sqlite3.Connection, now: float) -> bool:
     return _backoff_active(meta.get(_BACKOFF_KEYS[0]), meta.get(_BACKOFF_KEYS[1]), now)
 
 
-def _try_acquire_lock(prefix: str, *, check_backoff: bool) -> bool:
+def _try_acquire_lock(prefix: str, *, check_backoff: bool, stale_timeout: float) -> bool:
     """Atomically acquire the ``{prefix}_lock``. Returns True if acquired.
 
     Uses BEGIN IMMEDIATE to serialise concurrent writers so the
-    read-check-write is atomic.  A lock older than _LOCK_STALE_TIMEOUT
+    read-check-write is atomic.  A lock older than *stale_timeout*
     is treated as abandoned (e.g. crashed process), and so is one whose
-    timestamp does not parse.
+    timestamp does not parse. Each lock passes its own, because what a stale
+    lock means is a claim about how long that lock's holder can legitimately
+    run; is_fetch_blocked has to judge both by the same values this does.
 
     An owner token (UUID) is stored alongside the lock so that only
     the process that acquired the lock can release it.
@@ -1074,7 +1202,7 @@ def _try_acquire_lock(prefix: str, *, check_backoff: bool) -> bool:
         locked_at_str = meta.get(time_key)
         if locked_at_str:
             try:
-                if now - float(locked_at_str) < _LOCK_STALE_TIMEOUT:
+                if now - float(locked_at_str) < stale_timeout:
                     conn.execute("COMMIT")
                     return False
             except ValueError:
@@ -1114,7 +1242,9 @@ def _release_lock(prefix: str) -> None:
 
 def try_acquire_fetch_lock() -> bool:
     """Acquire the API fetch lock, refusing while in error backoff."""
-    return _try_acquire_lock("fetch", check_backoff=True)
+    return _try_acquire_lock(
+        "fetch", check_backoff=True, stale_timeout=FETCH_LOCK_STALE_TIMEOUT,
+    )
 
 
 def release_fetch_lock() -> None:
@@ -1130,7 +1260,9 @@ def try_acquire_costs_lock() -> bool:
     freshness bump that a costs-only run never makes. Also skips the API error
     backoff, which says nothing about whether local JSONL can be rescanned.
     """
-    return _try_acquire_lock("costs", check_backoff=False)
+    return _try_acquire_lock(
+        "costs", check_backoff=False, stale_timeout=_LOCK_STALE_TIMEOUT,
+    )
 
 
 def release_costs_lock() -> None:
@@ -1165,24 +1297,54 @@ def check_fetch_backoff() -> bool:
     return _check_backoff_in_txn(get_connection(), time.time())
 
 
-def is_fetch_blocked() -> bool:
-    """Whether an active fetch lock or the error backoff bars a fetch now.
+def _lock_is_live(locked_at_str: str | None, now: float, stale_timeout: float) -> bool:
+    """Whether a stored lock timestamp describes a lock still worth respecting.
 
-    One SELECT for all three keys — the statusline asks this on every render
+    Same staleness rule _try_acquire_lock applies, so the gate below and the
+    acquire agree on what an abandoned lock is. A timestamp that does not parse
+    reads as stale there and as absent here — either way, not blocking.
+    """
+    if not locked_at_str:
+        return False
+    try:
+        return now - float(locked_at_str) < stale_timeout
+    except ValueError:
+        return False
+
+
+def is_fetch_blocked() -> bool:
+    """Whether a live refresh lock or the error backoff bars a refresh now.
+
+    Both locks, because the statusline's only use of this is deciding whether
+    spawning a refresh could achieve anything, and both spawns it can make end
+    in a _try_acquire_lock. A leader holding the costs lock across a
+    multi-second compute_costs used to be invisible here, so every slow render
+    in that window spawned a detached interpreter that acquired nothing and
+    exited (macsetup-1huq).
+
+    Each lock is judged by its own staleness timeout, the one its acquirer
+    applies. Judging the fetch lock by the costs lock's 30 s would call a fetch
+    that is still inside its 80 s budget abandoned and spawn the duplicate this
+    gate exists to prevent, 50 s before try_acquire_fetch_lock would hand it the
+    lock (macsetup-3dl3).
+
+    One SELECT for all four keys — the statusline asks this on every render
     where the cached row has expired.
     """
     now = time.time()
-    meta = _get_meta_many(get_connection(), (*_BACKOFF_KEYS, "fetch_lock_time"))
+    meta = _get_meta_many(
+        get_connection(),
+        (*_BACKOFF_KEYS, "fetch_lock_time", "costs_lock_time"),
+    )
     if _backoff_active(meta.get(_BACKOFF_KEYS[0]), meta.get(_BACKOFF_KEYS[1]), now):
         return True
-    locked_at_str = meta.get("fetch_lock_time")
-    if locked_at_str:
-        try:
-            if now - float(locked_at_str) < _LOCK_STALE_TIMEOUT:
-                return True
-        except ValueError:
-            pass
-    return False
+    return any(
+        _lock_is_live(meta.get(key), now, stale_timeout)
+        for key, stale_timeout in (
+            ("fetch_lock_time", FETCH_LOCK_STALE_TIMEOUT),
+            ("costs_lock_time", _LOCK_STALE_TIMEOUT),
+        )
+    )
 
 
 def write_usage_cache(data: dict[str, Any], *, snapshot_extra: bool = True) -> None:
@@ -1286,24 +1448,31 @@ def load_cost_cache(week_key: str, month_key: str) -> dict[str, dict[str, Any]]:
     """Load all file_costs entries. Truncates if week/month keys shifted.
 
     Returns dict keyed by file path with mtime_ns, size, week_cost,
-    month_cost, all_time_cost, session_cost, dedup_keys.
+    month_cost, all_time_cost, session_cost, week_model_costs, dedup_keys.
+
+    A stored entry shape older than _COST_ENTRY_SCHEMA truncates too — the
+    whole corpus re-scans once, which is what a row missing a field costs.
     """
     conn = get_connection()
 
     # Check if keys match
     stored_week = _get_meta(conn, "cost_week")
     stored_month = _get_meta(conn, "cost_month")
-    if stored_week != week_key or stored_month != month_key:
+    stored_schema = _get_meta(conn, "cost_schema")
+    if (stored_week != week_key or stored_month != month_key
+            or stored_schema != _COST_ENTRY_SCHEMA):
         # Keys shifted — invalidate all file costs
         conn.execute("DELETE FROM file_costs")
         _set_meta(conn, "cost_week", week_key)
         _set_meta(conn, "cost_month", month_key)
+        _set_meta(conn, "cost_schema", _COST_ENTRY_SCHEMA)
         conn.commit()
         return {}
 
     # Load all entries
     rows = conn.execute(
-        "SELECT path, mtime_ns, size, week_cost, month_cost, all_time_cost, session_cost FROM file_costs"
+        "SELECT path, mtime_ns, size, week_cost, month_cost, all_time_cost, session_cost, "
+        "week_model_json FROM file_costs"
     ).fetchall()
 
     # Also load dedup_keys per file. file_path leads the primary key, so the
@@ -1320,13 +1489,14 @@ def load_cost_cache(week_key: str, month_key: str) -> dict[str, dict[str, Any]]:
     }
 
     result: dict[str, dict[str, Any]] = {}
-    for path, mtime_ns, size, wc, mc, atc, sc in rows:
+    for path, mtime_ns, size, wc, mc, atc, sc, wmj in rows:
         entry: dict[str, Any] = {
             "mtime_ns": mtime_ns,
             "size": size,
             "week_cost": wc,
             "month_cost": mc,
             "all_time_cost": atc,
+            "week_model_costs": json.loads(wmj) if wmj else {},
             "dedup_keys": dk_map.get(path, []),
         }
         if sc is not None:
@@ -1346,7 +1516,7 @@ def _delete_departed_paths(conn: sqlite3.Connection, live: set[str]) -> None:
     existing = {r[0] for r in conn.execute("SELECT path FROM file_costs")}
     for chunk in _param_chunks(existing - live):
         placeholders = ",".join("?" * len(chunk))
-        conn.execute(f"DELETE FROM file_costs WHERE path IN ({placeholders})", chunk)
+        conn.execute(f"DELETE FROM file_costs WHERE path IN ({placeholders})", chunk)  # noqa: S608
 
 
 def bulk_save_file_costs(
@@ -1392,19 +1562,22 @@ def bulk_save_file_costs(
     try:
         _set_meta(conn, "cost_week", week_key)
         _set_meta(conn, "cost_month", month_key)
+        _set_meta(conn, "cost_schema", _COST_ENTRY_SCHEMA)
 
         _delete_departed_paths(conn, set(entries))
 
         if to_write:
             conn.executemany(
                 "INSERT INTO file_costs "
-                "(path, mtime_ns, size, week_cost, month_cost, all_time_cost, session_cost) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "(path, mtime_ns, size, week_cost, month_cost, all_time_cost, session_cost, "
+                " week_model_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(path) DO UPDATE SET "
                 "mtime_ns = excluded.mtime_ns, size = excluded.size, "
                 "week_cost = excluded.week_cost, month_cost = excluded.month_cost, "
                 "all_time_cost = excluded.all_time_cost, "
-                "session_cost = excluded.session_cost",
+                "session_cost = excluded.session_cost, "
+                "week_model_json = excluded.week_model_json",
                 [
                     (
                         path,
@@ -1414,6 +1587,9 @@ def bulk_save_file_costs(
                         entry.get("month_cost", 0),
                         entry.get("all_time_cost", 0),
                         entry.get("session_cost"),
+                        # NULL for a file with nothing in the week window, which
+                        # is most of the corpus.
+                        json.dumps(wm) if (wm := entry.get("week_model_costs")) else None,
                     )
                     for path, entry in to_write.items()
                 ],
@@ -1457,12 +1633,11 @@ def bulk_save_file_costs(
 def read_cache_stats(session_id: str) -> tuple[int, int, int, int] | None:
     """Read (total_in_tokens, cum_fresh, cum_create, cum_read) or None."""
     conn = get_connection()
-    row = conn.execute(
+    return conn.execute(
         "SELECT total_in_tokens, cum_fresh, cum_cache_create, cum_cache_read "
         "FROM cache_stats WHERE session_id = ?",
         (session_id,),
     ).fetchone()
-    return row
 
 
 def accumulate_cache_stats(
@@ -1562,7 +1737,7 @@ def _ccreport_readable(conn: sqlite3.Connection) -> bool:
     The salt is the only third of check_ccreport_valid a passive reader can
     evaluate: version and script_hash are ccreport.py's own parse contract, and
     the statusline knows neither. The salt is the narrower claim that matters
-    here anyway — that the columns mean what _ccr_row_to_dict assumes.
+    here anyway — that the columns mean what _group_by_file assumes.
 
     Every loader below returns an empty result when this is False, and none of
     them repairs anything. Invalidation is the writer's job (ccreport's
@@ -1582,31 +1757,62 @@ def invalidate_ccreport(live_paths: set[str]) -> None:
     their costs, because a purged file's `cost` came from costUSD in a source
     that no longer exists: NULLing it is permanent loss, not a placeholder
     the next parse refills (macsetup-qn0k, macsetup-4flx).
+
+    Many small transactions rather than one, for the reason _refresh_changed_files
+    saves in batches of _SAVE_BATCH: everything else on the machine that writes
+    this DB waits behind the lock, and the two waiters here are a render that
+    gives up after 0.25 s and the detached refresh that gives up after 10 s.
+    Each chunk is self-consistent — a file's fingerprint and its records' costs
+    are cleared together — so an interrupted run leaves whole files done and
+    whole files untouched, and the meta keys it cleared first make the next run
+    invalidate again from the top.
     """
     conn = get_connection()
-    for chunk in _param_chunks(live_paths):
+    # First, and alone: this is what marks the cache invalid, so a crash
+    # anywhere below leaves a corpus that re-invalidates rather than one that
+    # half-passes check_ccreport_valid.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "DELETE FROM meta WHERE key IN "
+            "('ccreport_version', 'ccreport_script_hash', 'ccreport_schema_salt')"
+        )
+        # The rollups froze costs the UPDATEs below NULL, so they no longer
+        # describe the corpus. Dropping the fingerprint is enough — the rebuild
+        # replaces the rows — and it keeps the stale set unreadable in the
+        # window before that rebuild runs.
+        conn.execute("DELETE FROM meta WHERE key = ?", (_ROLLUP_FP_KEY,))
+        # Unlike save_ccreport_files, this one really does invalidate every
+        # scope: the only caller invalidates on a script-hash change, and that
+        # hash covers project_identity.py — so the identity a re-parse stamps
+        # on a record, which is the input a scope is derived from, is exactly
+        # what may have changed.
+        _clear_project_scopes(conn)
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_if_open(conn)
+        raise
+    for chunk in _param_chunks(live_paths, _INVALIDATE_CHUNK):
         placeholders = ",".join("?" * len(chunk))
-        # Reset fingerprints so live files fail the mtime/size check and get
-        # re-parsed, and NULL their costs so they recompute with current
-        # pricing — the re-parse restores whatever the JSONL actually said.
-        conn.execute(
-            f"UPDATE ccreport_files SET mtime_ns = 0, size = 0 "
-            f"WHERE path IN ({placeholders})",
-            chunk,
-        )
-        conn.execute(
-            f"UPDATE ccreport_records SET cost = NULL "
-            f"WHERE file_path IN ({placeholders})",
-            chunk,
-        )
-    conn.execute("DELETE FROM meta WHERE key IN ('ccreport_version', 'ccreport_script_hash', 'ccreport_schema_salt')")
-    # The rollups froze costs the UPDATE above just NULLed, so they no longer
-    # describe the corpus. Dropping the fingerprint is enough — the rebuild
-    # replaces the rows — and it keeps the stale set unreadable in the window
-    # before that rebuild runs.
-    conn.execute("DELETE FROM meta WHERE key = ?", (_ROLLUP_FP_KEY,))
-    _clear_project_scopes(conn)
-    conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Reset fingerprints so live files fail the mtime/size check and get
+            # re-parsed, and NULL their costs so they recompute with current
+            # pricing — the re-parse restores whatever the JSONL actually said.
+            conn.execute(
+                f"UPDATE ccreport_files SET mtime_ns = 0, size = 0 "  # noqa: S608
+                f"WHERE path IN ({placeholders})",
+                chunk,
+            )
+            conn.execute(
+                f"UPDATE ccreport_records SET cost = NULL "  # noqa: S608
+                f"WHERE file_path IN ({placeholders})",
+                chunk,
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            _rollback_if_open(conn)
+            raise
 
 
 def init_ccreport_meta(version: int, script_hash: str) -> None:
@@ -1640,14 +1846,6 @@ _CCR_INSERT_COLS = ", ".join(("file_path", *_CCR_COLS))
 _CCR_INSERT_PLACEHOLDERS = ", ".join("?" * (len(_CCR_COLS) + 1))
 
 
-def _ccr_row_to_dict(row: tuple) -> dict:
-    """One ccreport_records row in the compact format ccreport.py reads."""
-    vals = dict(zip(_CCR_COLS, row, strict=True))
-    rec: dict = {name: vals[name] for name in _CCR_FIELD_COLS}
-    rec["t"] = [vals[name] for name in _CCR_TOKEN_COLS]
-    return rec
-
-
 def _ccr_record_to_row(path: str, rec: dict) -> tuple:
     """A record dict as an insert row for _CCR_INSERT_COLS."""
     return (
@@ -1658,10 +1856,25 @@ def _ccr_record_to_row(path: str, rec: dict) -> tuple:
 
 
 def _group_by_file(rows: list[tuple]) -> dict[str, list[dict]]:
-    """Rows of (file_path, *_CCR_COLS) as {path: [record dict]}, order kept."""
+    """Rows of (file_path, *_CCR_COLS) as {path: [record dict]}, order kept.
+
+    Every cached read lands here, ~98k rows on a full report and a project's
+    worth on every slow statusline render, so the record dict is built as one
+    literal indexed straight off the row. Going through _CCR_COLS by name meant
+    a slice, a zipped dict, a comprehension and a list per row — four containers
+    thrown away for one the caller reads once (macsetup-qa61).
+
+    The indices below are positions in (file_path, *_CCR_COLS) and nothing at
+    runtime ties them to that tuple; test_the_record_dict_matches_the_column_tuple
+    is what fails if a column is added there and not here.
+    """
     grouped: dict[str, list[dict]] = {}
     for row in rows:
-        grouped.setdefault(row[0], []).append(_ccr_row_to_dict(row[1:]))
+        grouped.setdefault(row[0], []).append({
+            "mid": row[1], "model": row[2], "ts": row[3], "sid": row[4],
+            "project": row[5], "cwd": row[6], "repo": row[7], "dk": row[8],
+            "cost": row[9], "t": [row[10], row[11], row[12], row[13]],
+        })
     return grouped
 
 
@@ -1695,7 +1908,7 @@ def load_ccreport_records_under(prefix: str) -> dict[str, list[dict]]:
         return {}
     lo, hi = prefix_range(prefix)
     return _group_by_file(conn.execute(
-        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records "
+        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records "  # noqa: S608
         f"WHERE file_path >= ? AND file_path < ?",
         (lo, hi),
     ).fetchall())
@@ -1743,7 +1956,7 @@ def load_ccreport_records_for_session(session_id: str) -> dict[str, list[dict]]:
     if not _ccreport_readable(conn):
         return {}
     return _group_by_file(conn.execute(
-        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records WHERE sid = ?",
+        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records WHERE sid = ?",  # noqa: S608
         (session_id,),
     ).fetchall())
 
@@ -1769,7 +1982,7 @@ def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, li
         return {}, {}
     # All records
     rec_rows = conn.execute(
-        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records"
+        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records"  # noqa: S608
     ).fetchall()
     return file_meta, _group_by_file(rec_rows)
 
@@ -1820,6 +2033,191 @@ def load_ccreport_records_since(cutoff_ts: float) -> dict[str, list[dict]]:
     ).fetchall())
 
 
+def load_ccreport_records_in_range(
+    since_ts: float | None, until_ts: float | None,
+) -> dict[str, list[dict]]:
+    """Cached records inside a timestamp window, as {path: [record]}.
+
+    The two-sided twin of load_ccreport_records_since, for a filtered report:
+    `ccreport daily --since yesterday` used to deserialize the whole corpus
+    into UsageRecords and then drop all but one day of it (macsetup-6a2f).
+    Either bound may be None, meaning open-ended on that side; both None is
+    every row, which is what bulk_load_ccreport_cache already answers more
+    cheaply when the file metadata is wanted too.
+
+    The bounds are inclusive on both ends, matching ccreport._keep, which
+    drops a record on `ts < since` or `ts > until`. Records outside the window
+    never reach the dedup there either — _keep returns before computing a key —
+    so filtering here cannot change which duplicate wins.
+
+    A full table scan on purpose, and ORDER BY id for insert order, for the
+    same reasons as load_ccreport_records_since.
+
+    Empty when the cached rows are not in this build's format; see
+    _ccreport_readable.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return {}
+    bounds = [("ts >= ?", since_ts), ("ts <= ?", until_ts)]
+    clauses = [sql for sql, value in bounds if value is not None]
+    params = tuple(value for _sql, value in bounds if value is not None)
+    where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+    return _group_by_file(conn.execute(
+        f"SELECT file_path, {_CCR_SELECT} FROM ccreport_records "  # noqa: S608
+        f"{where}ORDER BY id",
+        params,
+    ).fetchall())
+
+
+# The fingerprint the ccreport_orphan_costs rows were summed under.
+_ORPHAN_FP_KEY = "ccreport_orphan_fp"
+
+
+def load_ccreport_records_for_paths(paths: Iterable[str]) -> dict[str, list[dict]]:
+    """Cached records belonging to *paths*, as {path: [record]}.
+
+    For rebuilding the orphan all-time totals: the caller has already worked
+    out which cached files are gone from disk, and reading the rest back only
+    to drop it is the walk this exists to stop. Chunked so a path set larger
+    than SQLite's parameter limit still goes as an indexed lookup rather than
+    a table scan.
+
+    The id is selected and sorted on rather than left to the chunk order: the
+    rows come back one path range at a time, and dedup is first-occurrence-wins,
+    so handing them over grouped by path would let the alphabetically first
+    file win a duplicate that insert order gives to another. Sorting restores
+    the order an unbounded table scan would have produced.
+
+    Empty when the cached rows are not in this build's format; see
+    _ccreport_readable.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return {}
+    rows: list[tuple] = []
+    for chunk in _param_chunks(set(paths)):
+        placeholders = ",".join("?" * len(chunk))
+        rows.extend(conn.execute(
+            f"SELECT id, file_path, {_CCR_SELECT} FROM ccreport_records "  # noqa: S608
+            f"WHERE file_path IN ({placeholders})",
+            chunk,
+        ))
+    rows.sort(key=itemgetter(0))
+    return _group_by_file([row[1:] for row in rows])
+
+
+def orphan_alltime_stamp(orphan_paths: Iterable[str]) -> str:
+    """The DB-side half of the orphan all-time fingerprint.
+
+    A digest of the ccreport_files rows of the orphaned files themselves, and
+    nothing wider. Deliberately blind to the live half of the corpus: every
+    writer that can reach an orphaned record either makes it non-orphaned
+    first or bumps SCHEMA_VERSION. save_ccreport_files only ever writes files
+    it just parsed off disk, so a path it touches is live by definition, and
+    invalidate_ccreport scopes both of its UPDATEs to live paths on purpose —
+    a purged file's stored cost is the only copy there is. What is left is the
+    one-time data migrations, which the version covers.
+
+    A whole-table stamp (or a MAX(id) over the records) would be cheaper still
+    and would rebuild ~86k rows every time `ccreport` re-parsed one live
+    session log, which cannot move this total by a cent.
+
+    mtime_ns is folded modulo a prime because a bare SUM over a couple of
+    thousand nanosecond epochs is ~4e21 and SQLite answers that with "integer
+    overflow". The modulus only has to make a changed mtime change the digest.
+    """
+    conn = get_connection()
+    n = mtimes = sizes = 0
+    for chunk in _param_chunks(set(orphan_paths)):
+        placeholders = ",".join("?" * len(chunk))
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(mtime_ns % 1000000007), 0), "  # noqa: S608
+            f"COALESCE(SUM(size), 0) FROM ccreport_files WHERE path IN ({placeholders})",
+            chunk,
+        ).fetchone()
+        n += row[0]
+        mtimes += row[1]
+        sizes += row[2]
+    return f"{n}:{mtimes}:{sizes}:{SCHEMA_VERSION}:{CACHE_SCHEMA_SALT}"
+
+
+def load_orphan_alltime(fingerprint: str) -> list[tuple[str, str, str, str, float]]:
+    """Stored orphan all-time rows, or [] if they no longer describe the corpus.
+
+    [] means "rebuild", never "there is nothing" — an empty orphan set stores
+    no rows but does stamp its fingerprint, and the caller's rebuild of nothing
+    costs nothing.
+    """
+    conn = get_connection()
+    if not _ccreport_readable(conn):
+        return []
+    if _get_meta(conn, _ORPHAN_FP_KEY) != fingerprint:
+        return []
+    return conn.execute(
+        "SELECT dir_prefix, project, cwd, repo, cost FROM ccreport_orphan_costs"
+    ).fetchall()
+
+
+def save_orphan_alltime(
+    rows: list[tuple[str, str, str, str, float]], fingerprint: str,
+) -> None:
+    """Replace the orphan all-time table and stamp it with *fingerprint*.
+
+    One transaction for both, for the same reason as save_ccreport_rollups: a
+    fingerprint outliving the rows it describes reads as valid and serves a
+    short total as the whole of history.
+    """
+    conn = get_connection()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM ccreport_orphan_costs")
+        if rows:
+            conn.executemany(
+                "INSERT INTO ccreport_orphan_costs "
+                "(dir_prefix, project, cwd, repo, cost) VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+        _set_meta(conn, _ORPHAN_FP_KEY, fingerprint)
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_if_open(conn)
+        raise
+
+
+def load_file_all_time_under(prefix: str) -> dict[str, tuple[int, int, float, list[str]]]:
+    """file_costs' time-independent half for one project's files.
+
+    {path: (mtime_ns, size, all_time_cost, dedup_keys)}.
+
+    load_cost_cache is the wrong door for a reader that only wants all_time:
+    it takes the week and month keys and *truncates the table* when they have
+    moved on, which a render computing rolling costs has no business doing —
+    it does not even know which window the stored week_cost belongs to. What
+    it reads here survives that rollover by construction, since an all-time
+    total and a dedup key are both independent of where the windows sit.
+    """
+    conn = get_connection()
+    lo, hi = prefix_range(prefix)
+    rows = conn.execute(
+        "SELECT path, mtime_ns, size, all_time_cost FROM file_costs "
+        "WHERE path >= ? AND path < ?",
+        (lo, hi),
+    ).fetchall()
+    if not rows:
+        return {}
+    dk_map: dict[str, list[str]] = {}
+    for path, dk in conn.execute(
+        "SELECT file_path, dk FROM dedup_keys WHERE file_path >= ? AND file_path < ?",
+        (lo, hi),
+    ):
+        dk_map.setdefault(path, []).append(dk)
+    return {
+        path: (mtime_ns, size, atc, dk_map.get(path, []))
+        for path, mtime_ns, size, atc in rows
+    }
+
+
 def load_ccreport_file_identities() -> list[tuple[str, str | None, str | None, str]]:
     """(file_path, repo, cwd, project) for every cached file, one row each.
 
@@ -1847,6 +2245,96 @@ def load_ccreport_file_identities() -> list[tuple[str, str | None, str | None, s
     ]
 
 
+def _file_identity(records: list[dict]) -> tuple | None:
+    """The (repo, cwd, project) a file's records carry; None if it has none.
+
+    parse_jsonl_file stamps one identity onto every record of a file, so the
+    first record answers for the file — the same assumption
+    load_ccreport_file_identities makes when it lets GROUP BY pick whichever row
+    it lands on.
+    """
+    if not records:
+        return None
+    first = records[0]
+    return (first.get("repo"), first.get("cwd"), first.get("project"))
+
+
+def _stored_identities(conn: sqlite3.Connection, paths: list[str]) -> dict[str, tuple]:
+    """The identity currently cached for each of *paths* that has one."""
+    stored: dict[str, tuple] = {}
+    for chunk in _param_chunks(set(paths)):
+        placeholders = ",".join("?" * len(chunk))
+        stored.update({
+            row[0]: (row[1], row[2], row[3])
+            for row in conn.execute(
+                f"SELECT file_path, repo, cwd, project FROM ccreport_records "  # noqa: S608
+                f"WHERE file_path IN ({placeholders}) GROUP BY file_path",
+                chunk,
+            )
+        })
+    return stored
+
+
+def _identity_already_cached_before(
+    conn: sqlite3.Connection, path: str, identity: tuple,
+) -> bool:
+    """Whether a cached file sorting before *path* in its directory carries *identity*.
+
+    Both things a scope is derived from are then already settled for this
+    directory. Which project directories a scope's prefixes cover is decided per
+    directory — one file resolving to the scope's name puts the whole directory
+    in — and *identity* is what resolve() is a function of, so a second file
+    saying the same thing adds no directory. And the name itself comes from the
+    first identity in path order under the cwd's own directories, which a file
+    that sorts after an existing one cannot become.
+
+    The directory here is the file's parent, which is at or below the project
+    directory pricing groups by — narrower than it needs to be, never wider.
+    """
+    parent = path.rsplit("/", 1)[0] + "/"
+    if parent == path:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM ccreport_records "
+        "WHERE file_path >= ? AND file_path < ? "
+        "AND repo IS ? AND cwd IS ? AND project IS ? LIMIT 1",
+        (parent, path, *identity),
+    ).fetchone() is not None
+
+
+def _save_invalidates_scopes(
+    conn: sqlite3.Connection, entries: list[tuple[str, int, int, list[dict]]],
+) -> bool:
+    """Whether writing *entries* can change any cached project scope.
+
+    A scope is a pure function of project_overrides and the cached record
+    identities, so a save that leaves every identity where it was cannot move
+    one — and that is the ordinary save: ccreport re-parses a session log that
+    grew, and re-writes the same (repo, cwd, project) it wrote before. Truncating
+    the table on every batch regardless is what made an ordinary ccreport run
+    cost every open session the ~0.020 s scope derivation on its next slow
+    render (macsetup-ov32).
+
+    Reads the pre-write state, so it must run before the DELETE below. Answering
+    True clears every scope rather than a computed subset: a genuinely new
+    identity can join its directory to any name, and deciding which names it
+    joins means running the override rules over the whole corpus — the work the
+    cache exists to avoid.
+    """
+    stored = _stored_identities(conn, [path for path, _m, _s, _r in entries])
+    for path, _m, _s, records in entries:
+        identity = _file_identity(records)
+        if stored.get(path) == identity:
+            continue
+        # A file that now parses to nothing takes an identity away; only a
+        # rederivation can say what that leaves behind.
+        if identity is None:
+            return True
+        if not _identity_already_cached_before(conn, path, identity):
+            return True
+    return False
+
+
 def save_ccreport_files(entries: list[tuple[str, int, int, list[dict]]]) -> None:
     """Save/replace several (path, mtime_ns, size, records) entries at once.
 
@@ -1864,6 +2352,8 @@ def save_ccreport_files(entries: list[tuple[str, int, int, list[dict]]]) -> None
     conn = get_connection()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Before the DELETE, which is what takes the old identities away.
+        scopes_stale = _save_invalidates_scopes(conn, entries)
         # Deleting the parent cascades its old records away.
         conn.executemany(
             "DELETE FROM ccreport_files WHERE path = ?",
@@ -1884,7 +2374,8 @@ def save_ccreport_files(entries: list[tuple[str, int, int, list[dict]]]) -> None
                 f"VALUES ({_CCR_INSERT_PLACEHOLDERS})",
                 rows,
             )
-        _clear_project_scopes(conn)
+        if scopes_stale:
+            _clear_project_scopes(conn)
         conn.execute("COMMIT")
     except Exception:
         _rollback_if_open(conn)
@@ -1899,10 +2390,9 @@ def save_ccreport_file(
 
 
 def load_ccreport_file_meta_before(cutoff_ts: float) -> list[tuple[str, int, int]]:
-    """(path, mtime_ns, size) for every cached file holding a record older
-    than *cutoff_ts*, sorted by path.
+    """(path, mtime_ns, size) per cached file holding a record before *cutoff_ts*.
 
-    The half of the corpus a rollup froze, identified the same way the record
+    Sorted by path. The half of the corpus a rollup froze, identified the same way the record
     cache identifies a file. Growing, shrinking or re-parsing any of these
     changes what the rollup should have said, so this is what the rollup
     fingerprint is built over. EXISTS rather than a join so idx_ccr_file_ts
@@ -2314,7 +2804,7 @@ def record_rate_limit_snapshots(
             if (
                 prior_resets == resets_at
                 and (
-                    int(round(used_pct)) == int(round(prior_pct))
+                    round(used_pct) == round(prior_pct)
                     or now - prior_ts < _RL_SNAPSHOT_MIN_INTERVAL_S
                 )
             ):
@@ -2339,9 +2829,11 @@ def record_rate_limit_snapshots(
 # ---------------------------------------------------------------------------
 
 def _cost_summary_suffix(cwd: str | None) -> str:
-    """Project scope for the cost-summary keys. The writer and the reader must
-    agree exactly: a divergence here is a permanent silent cache miss, not an
-    error, so both read it from here."""
+    """Project scope for the cost-summary keys.
+
+    The writer and the reader must agree exactly: a divergence here is a
+    permanent silent cache miss, not an error, so both read it from here.
+    """
     return f":{project_key(cwd)}" if cwd else ""
 
 
@@ -2409,7 +2901,7 @@ def _get_meta_many(
         f"SELECT key, value FROM meta WHERE key IN ({placeholders})",  # noqa: S608
         tuple(keys),
     ).fetchall()
-    return {k: v for k, v in rows}
+    return dict(rows)
 
 
 def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:

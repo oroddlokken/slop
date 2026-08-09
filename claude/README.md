@@ -9,8 +9,8 @@ the manual version of that, and works from a clone in any directory.
 
 | Path | What it is |
 |---|---|
-| `statusline-command.py` | The status line. Every segment is toggled by a `CLAUDE_STATUSLINE_*` env var; the script's module docstring lists them with defaults. Layout adapts to terminal width at 150 columns: one or two lines wide, up to five narrow or with the battery/macmon segments on. |
-| `statusline-command_x.sh` | The wrapper `settings.json` points at. It execs the script from its own directory, so the clone can live anywhere. The exports in it are my per-machine overrides — edit them to taste; segment defaults live in the script itself. |
+| `statusline_command.py` | The status line. Every segment is toggled by a `CLAUDE_STATUSLINE_*` env var; the script's module docstring lists them with defaults. Layout adapts to terminal width at 150 columns: two lines wide, four narrow. |
+| `statusline-command_x.sh` | The wrapper `settings.json` points at. It finds the script in its own directory, so the clone can live anywhere. Its exports are my per-machine overrides, each written `${VAR:-default}` so the environment still wins; segment defaults live in the script itself. |
 | `ccu.zsh` + `get_claude_usage.py` | `ccu` — terminal dashboard for the numbers `/usage` shows, with reset countdowns. Reads the OAuth token from the macOS Keychain or `~/.claude/.credentials.json`, cached 10 minutes. |
 | `ccreport.py` | `ccreport` — token and cost report over the local JSONL logs, by day, month, project, session or account. Costs in USD and NOK (Norges Bank spot rate, 25 % MVA added unless `--no-mva`). |
 | `claudemem` | TUI for browsing the Claude Code memories belonging to the current git repo — navigate, edit, delete with undo. `--json` prints them instead. |
@@ -26,8 +26,7 @@ own dependencies through PEP 723 shebangs), a system Python 3.12+ for
 `get_claude_usage.py`, `zsh` for `ccu`, `claudem` and `cf`/`co`, and `jq` for both hooks. The git-stash
 hook also wants `perl` — without it, it falls back to substring matching and
 over-blocks. Some pieces are macOS-only: the Keychain token lookup
-(`security`), and the battery (`pmset`) and Apple Silicon power (`macmon`)
-status line segments.
+(`security`) and the battery (`pmset`) status line segment.
 
 ## Status line
 
@@ -46,7 +45,17 @@ In `~/.claude/settings.json`:
 
 Segment defaults live in the script; the wrapper is the seam where per-machine
 `CLAUDE_STATUSLINE_*` overrides go. The exports it ships with are mine — start
-by deleting them and add back what you want off or on.
+by deleting them and add back what you want off or on. Each is written
+`${VAR:-…}`, so anything already in the environment still wins.
+
+The wrapper is doing two things for render latency, and both are why the script
+is named with an underscore. It imports `statusline_command` through a one-line
+`-c` stub rather than running the file as a script: CPython writes
+`__pycache__` only for modules it imports, so run as a script the whole 80-odd
+KB is re-tokenized on every render. And it caches the path to the script env's
+interpreter under `$TMPDIR`, keyed on the mtimes of both files, because the
+`uv` shebang costs ~40 ms of resolver each time. Without `uv` it falls back to
+the shebang, which is slower but always correct.
 
 ## ccu
 
@@ -198,6 +207,34 @@ Everything logged before you installed the status line reports as `unknown`.
 backdated event; `ccreport adopt --remove` deletes that one row and nothing
 else.
 
+## Day rollups (ccreport)
+
+A bare `ccreport` used to deserialize every cached record — on my machine ~95k
+rows, more than half of them duplicates that dedup then discards — to fold them
+into five tables. Days older than 14 now come out of `ccreport_rollups`
+instead: one row per (day, Oslo date, session, project, model, account),
+holding summed tokens, the summed cost and the call count. Steady-state runtime
+drops from ~0.9 s to ~0.4 s; the run that rebuilds pays roughly what every run
+used to.
+
+Rollups serve the unfiltered report and nothing else.
+`--since/--until/--project/--account`, `--json` and `ccreport adopt` all take
+the full record path — each of them selects on something a rollup row has
+aggregated away, and `adopt` needs the record-level timestamps that split a day
+at the first captured account.
+
+The rows are only ever as good as the fingerprint stored beside them, written
+in the same transaction. It covers everything a stored row froze an answer
+about: the cache salt, a SHA256 of `pricing.py`, the override rules, the
+account change log, the local timezone, the cutoff day, and the (path, mtime,
+size) of every cached file holding a pre-cutoff record. Any mismatch rebuilds
+inline from the same post-dedup stream a report reads — not from a `GROUP BY`
+over the raw table, which would count the duplicates and freeze the project
+names and account attribution that are read-time by design.
+
+Losing the table costs one slow run: every row is derivable from
+`ccreport_records`.
+
 ## Cache DB safety
 
 The shared cache (`~/.cache/macsetup/claude/cache.db`) holds token/cost history
@@ -205,16 +242,30 @@ that can't always be reconstructed from JSONL — Claude Code purges its own
 logs, and orphaned records in the cache are the only surviving record.
 
 `cache_db.py` takes a daily online backup to
-`~/.local/share/macsetup/claude/snapshots/YYYY-MM-DD.db` (UTC) before schema
-work or migrations touch the live DB. Snapshots live outside `~/.cache` so a
-cache sweep can't take the live DB and all its backups out in one pass.
-Default retention is 14 snapshots.
+`~/.local/share/macsetup/claude/snapshots/YYYY-MM-DD.db` (UTC), and always
+takes one before schema work or migrations touch the live DB. Snapshots live
+outside `~/.cache` so a cache sweep can't take the live DB and all its backups
+out in one pass. Default retention is 14 snapshots.
 
-After a migration that actually runs this invocation, a sanity check
-compares `ccreport_records` against the most recent prior snapshot. If the
-row count drops more than 10 %, a warning is printed with the restore
-command (`cp <snapshot> <db>`). The check is gated to migration runs so
-statusline renders don't pay the cost.
+Who pays for the copy: the first process to open the DB after UTC midnight,
+except that the status line render and `ccreport` both defer
+(`CLAUDE_CACHE_SNAPSHOT_DEFER=1`) and the status line's detached refresh
+subprocess picks it up instead. A render is the most frequent first-toucher and
+has no business copying the whole DB, and a report you are waiting on is no
+better a place for it. The copy is stepped (1024 pages at a time) so a writer
+isn't starved for its duration, and the day's tmp file is claimed with an
+exclusive create so concurrent starters don't each run a full copy. The
+pre-migration snapshot ignores the deferral: whatever process is about to
+migrate takes it first, synchronously.
+
+A sanity check rides the same cadence — the run that writes the day's snapshot,
+plus any run that migrated data — so renders pay nothing. It compares
+`ccreport_records` against the most recent snapshot from a *prior* day, on both
+row count and number of rows carrying a cost, and warns with the restore
+command (`cp <snapshot> <db>`) if either drops more than 10 %. The cost
+aggregate is there because an over-broad `SET cost = NULL` leaves every row in
+place. It also reports records left with no `ccreport_files` parent, which no
+reader can reach.
 
 Overrides:
 
@@ -223,5 +274,6 @@ Overrides:
 | `CLAUDE_CACHE_SNAPSHOT_DIR`     | Override snapshot directory |
 | `CLAUDE_CACHE_SNAPSHOT_KEEP`    | Retention count (default 14) |
 | `CLAUDE_CACHE_SNAPSHOT_DISABLE` | `=1` disables snapshots |
+| `CLAUDE_CACHE_SNAPSHOT_DEFER`   | `=1` skips only the daily one (set by the status line and ccreport) |
 | `CLAUDE_CACHE_SANITY_DISABLE`   | `=1` disables the sanity check |
 | `CLAUDE_CACHE_SANITY_ABORT`     | `=1` raises instead of warning on drop |

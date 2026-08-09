@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -348,6 +348,12 @@ class TestRenameFingerprintMigration:
         assert self._flag(conn) == "1"
 
 
+def _hold_lock(conn: sqlite3.Connection, prefix: str, *, age: float) -> None:
+    """Plant a ``{prefix}_lock`` acquired *age* seconds ago."""
+    cache_db._set_meta(conn, f"{prefix}_lock_time", str(time.time() - age))
+    conn.commit()
+
+
 class TestLocks:
     def test_held_lock_blocks_a_second_acquire(self, db):
         assert try_acquire_fetch_lock() is True
@@ -366,6 +372,22 @@ class TestLocks:
         assert try_acquire_costs_lock() is True
         release_costs_lock()
         assert cache_db._get_meta(db, "fetch_lock_time") is not None
+
+    @pytest.mark.parametrize(
+        ("prefix", "acquire", "stale_timeout"),
+        [
+            ("fetch", try_acquire_fetch_lock, cache_db.FETCH_LOCK_STALE_TIMEOUT),
+            ("costs", try_acquire_costs_lock, cache_db._LOCK_STALE_TIMEOUT),
+        ],
+    )
+    def test_each_lock_is_abandoned_at_its_own_timeout(
+        self, db, prefix, acquire, stale_timeout,
+    ):
+        """One TTL cannot serve both: the fetch hold is 80 s, the costs hold 30 s."""
+        _hold_lock(db, prefix, age=stale_timeout - 1)
+        assert acquire() is False
+        _hold_lock(db, prefix, age=stale_timeout + 1)
+        assert acquire() is True
 
     @pytest.mark.parametrize(
         ("prefix", "acquire"),
@@ -402,6 +424,69 @@ class TestLocks:
         assert try_acquire_fetch_lock() is False
 
 
+class TestFetchBlockedGate:
+    """What the statusline asks before spawning any refresh at all.
+
+    Both spawns end in a _try_acquire_lock, so a lock either of them would fail
+    on has to read as blocked here. A leader holding the costs lock across a
+    multi-second compute_costs was invisible to this gate, so every slow render
+    in that window spawned a detached interpreter that acquired nothing and
+    exited (macsetup-1huq).
+    """
+
+    def test_a_held_costs_lock_blocks(self, db):
+        assert try_acquire_costs_lock() is True
+        assert cache_db.is_fetch_blocked() is True
+        release_costs_lock()
+        assert cache_db.is_fetch_blocked() is False
+
+    def test_a_held_fetch_lock_blocks(self, db):
+        assert try_acquire_fetch_lock() is True
+        assert cache_db.is_fetch_blocked() is True
+        release_fetch_lock()
+        assert cache_db.is_fetch_blocked() is False
+
+    @pytest.mark.parametrize(("prefix", "stale_timeout"), [
+        ("fetch", cache_db.FETCH_LOCK_STALE_TIMEOUT),
+        ("costs", cache_db._LOCK_STALE_TIMEOUT),
+    ])
+    def test_a_lock_the_acquire_would_take_over_does_not_block(
+        self, db, prefix, stale_timeout,
+    ):
+        """Staleness has to mean the same thing here as in _try_acquire_lock."""
+        _hold_lock(db, prefix, age=stale_timeout + 1)
+        assert cache_db.is_fetch_blocked() is False
+
+    def test_a_fetch_lock_inside_its_longer_budget_still_blocks(self, db):
+        """The holder can spend a slow keychain and a retrying API under it.
+
+        Judged by the costs lock's 30 s this reads as abandoned, and the render
+        spawns a second fetch that try_acquire_fetch_lock then refuses — the
+        duplicate this gate exists to prevent (macsetup-3dl3).
+        """
+        _hold_lock(db, "fetch", age=cache_db._LOCK_STALE_TIMEOUT + 10)
+        assert cache_db.is_fetch_blocked() is True
+        assert try_acquire_fetch_lock() is False, "the gate and the acquire agree"
+
+    def test_a_costs_lock_keeps_the_short_budget(self, db):
+        """Its hold is a JSONL rescan, so the fetch lock's 80 s is not its own."""
+        _hold_lock(db, "costs", age=cache_db._LOCK_STALE_TIMEOUT + 10)
+        assert cache_db.is_fetch_blocked() is False
+        assert try_acquire_costs_lock() is True
+
+    @pytest.mark.parametrize("prefix", ["fetch", "costs"])
+    def test_a_corrupt_lock_time_does_not_block(self, db, prefix):
+        cache_db._set_meta(db, f"{prefix}_lock_time", "not-a-number")
+        db.commit()
+        assert cache_db.is_fetch_blocked() is False
+
+    def test_the_second_lock_costs_no_second_round_trip(self, db):
+        """A render asks this every time its cached row has expired."""
+        selects = _count_statements(db, "FROM meta")
+        assert cache_db.is_fetch_blocked() is False
+        assert selects() == 1
+
+
 class TestBackoff:
     def test_no_failures_means_no_backoff(self, db):
         assert check_fetch_backoff() is False
@@ -428,10 +513,14 @@ class TestBackoff:
         assert check_fetch_backoff() is False
 
 
-def _cost_entry(mtime: int = 1, size: int = 1, dks: tuple[str, ...] = ()) -> dict:
+def _cost_entry(
+    mtime: int = 1, size: int = 1, dks: tuple[str, ...] = (),
+    week_model: dict | None = None,
+) -> dict:
     return {
         "mtime_ns": mtime, "size": size, "week_cost": 1.0, "month_cost": 2.0,
-        "all_time_cost": 3.0, "dedup_keys": list(dks),
+        "all_time_cost": 3.0, "week_model_costs": week_model or {},
+        "dedup_keys": list(dks),
     }
 
 
@@ -503,6 +592,52 @@ class TestBulkSaveFileCosts:
         monkeypatch.setattr(cache_db, "get_connection", lambda: _FailingCommit(db))
         with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
             self._save({"/a": _cost_entry()})
+
+    def test_the_per_model_week_split_round_trips(self, db):
+        split = {"fable": 1.25, "opus": 0.5}
+        self._save({"/a": _cost_entry(week_model=split)})
+        assert load_cost_cache(self.WEEK, self.MONTH)["/a"]["week_model_costs"] == split
+
+    def test_a_file_with_nothing_in_the_week_stores_no_json(self, db):
+        self._save({"/a": _cost_entry()})
+        assert db.execute(
+            "SELECT week_model_json FROM file_costs WHERE path = '/a'").fetchone()[0] is None
+        assert load_cost_cache(self.WEEK, self.MONTH)["/a"]["week_model_costs"] == {}
+
+
+class TestCostEntrySchemaGate:
+    """A stored entry shape older than the code's must re-scan, not read empty.
+
+    An entry predating a field still matches on mtime and size, so nothing else
+    would ever invalidate it and the missing field would total as zero.
+    """
+
+    WEEK = "2026-08-03T00"
+    MONTH = "2026-08"
+
+    def _seed(self, db) -> None:
+        bulk_save_file_costs(
+            {"/a": _cost_entry(week_model={"fable": 2.0})}, self.WEEK, self.MONTH)
+
+    def test_a_matching_schema_keeps_the_rows(self, db):
+        self._seed(db)
+        assert set(load_cost_cache(self.WEEK, self.MONTH)) == {"/a"}
+
+    def test_an_older_schema_truncates_the_cache(self, db):
+        self._seed(db)
+        db.execute("UPDATE meta SET value = '1' WHERE key = 'cost_schema'")
+        db.commit()
+        assert load_cost_cache(self.WEEK, self.MONTH) == {}
+
+    def test_the_truncating_load_stamps_the_current_schema(self, db):
+        self._seed(db)
+        db.execute("DELETE FROM meta WHERE key = 'cost_schema'")
+        db.commit()
+        load_cost_cache(self.WEEK, self.MONTH)
+        assert cache_db._get_meta(db, "cost_schema") == cache_db._COST_ENTRY_SCHEMA
+        # And the next load, having nothing to invalidate, keeps what it stored.
+        self._seed(db)
+        assert set(load_cost_cache(self.WEEK, self.MONTH)) == {"/a"}
 
 
 class TestDedupKeyPruning:
@@ -628,6 +763,23 @@ class TestCcreportRows:
         ).fetchone()
         assert all(v is not None for v in stored)
 
+    def test_the_record_dict_matches_the_column_tuple(self, db):
+        """_group_by_file indexes the row by position; this is what names it.
+
+        Building one dict literal instead of walking _CCR_COLS by name is the
+        whole point of macsetup-qa61 — every cached read passes ~98k rows
+        through it — so nothing at runtime ties those indices back to the
+        tuple. A column added to _CCR_COLS and not to the literal lands here.
+        """
+        row = ("/p/a.jsonl", *range(len(_CCR_COLS)))
+        record = cache_db._group_by_file([row])["/p/a.jsonl"][0]
+        expected = {name: i for i, name in enumerate(cache_db._CCR_FIELD_COLS)}
+        expected["t"] = [
+            len(cache_db._CCR_FIELD_COLS) + i
+            for i in range(len(cache_db._CCR_TOKEN_COLS))
+        ]
+        assert record == expected
+
 
 class TestScopedCcreportLoaders:
     """The scoped loaders must equal a full load filtered in Python.
@@ -716,7 +868,7 @@ class TestScopedCcreportLoaders:
         assert cache_db.load_ccreport_file_meta_under("/p/-tmp-nothing/") == {}
 
     @pytest.mark.parametrize(
-        "prefix, expected",
+        ("prefix", "expected"),
         [("/a/b/", ("/a/b/", "/a/b0")), ("xy", ("xy", "xz"))],
     )
     def test_the_upper_bound_steps_the_last_character(self, prefix, expected):
@@ -772,6 +924,9 @@ class TestCcreportSaltGate:
             pytest.param(lambda: cache_db.load_ccreport_file_meta(), id="all-meta"),
             pytest.param(
                 lambda: cache_db.load_ccreport_records_since(0.0), id="since"),
+            pytest.param(
+                lambda: cache_db.load_ccreport_records_in_range(0.0, 9e9),
+                id="ts-range"),
             pytest.param(
                 lambda: cache_db.load_ccreport_file_meta_before(9e9), id="meta-before"),
             pytest.param(lambda: cache_db.load_ccreport_rollups(), id="rollups"),
@@ -861,6 +1016,51 @@ class TestInvalidateCcreport:
         assert cache_db.check_ccreport_valid(9, "hash") is False
         assert self._cost(two_files, self.GONE) == 0.25
         assert self._cost(two_files, self.LIVE) == 0.25
+
+    @pytest.fixture
+    def many_files(self, db):
+        """Two full chunks and one row over, so the chunking is visible."""
+        paths = [
+            f"/tmp/proj/{i:04d}.jsonl"
+            for i in range(cache_db._INVALIDATE_CHUNK * 2 + 1)
+        ]
+        save_ccreport_files([(p, 1, 1, [dict(self.RECORD)]) for p in paths])
+        return set(paths)
+
+    def test_the_updates_are_chunked_into_bounded_transactions(self, db, many_files):
+        """A render gives up on the write lock in 0.25 s, the refresh in 10 s.
+
+        One transaction across the whole ~98k-row UPDATE is what they used to
+        wait behind (macsetup-48xh).
+        """
+        commits = _count_commits(db)
+        invalidate_ccreport(many_files)
+        # The meta keys go in their own transaction, then one per path chunk.
+        assert commits() == 1 + 3
+
+    def test_chunking_still_invalidates_every_file(self, db, many_files):
+        invalidate_ccreport(many_files)
+        assert db.execute(
+            "SELECT COUNT(*) FROM ccreport_records WHERE cost IS NOT NULL"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM ccreport_files WHERE mtime_ns != 0 OR size != 0"
+        ).fetchone()[0] == 0
+
+    def test_the_meta_keys_go_first(self, db, many_files):
+        """A crash mid-chunk must leave a cache that re-invalidates.
+
+        Clearing them last would leave check_ccreport_valid saying yes over a
+        corpus only half re-parsed.
+        """
+        cache_db.init_ccreport_meta(9, "hash")
+        order: list[str] = []
+        db.set_trace_callback(order.append)
+        invalidate_ccreport(many_files)
+        db.set_trace_callback(None)
+        first_update = next(i for i, s in enumerate(order) if "UPDATE" in s)
+        salt_delete = next(i for i, s in enumerate(order) if "ccreport_schema_salt" in s)
+        assert salt_delete < first_update
 
 
 class TestCcreportRollups:
@@ -958,6 +1158,60 @@ class TestCcreportRollupReadPath:
         }
 
 
+class TestCcreportRecordsInRange:
+    """The window a filtered report reads, instead of the whole corpus."""
+
+    LIVE = "/tmp/proj/live.jsonl"
+    GONE = "/tmp/proj/purged.jsonl"
+
+    def _rec(self, mid: str, ts: float) -> dict:
+        return {"mid": mid, "model": "claude-opus-5", "ts": ts, "sid": "s1",
+                "project": "proj", "cwd": "/tmp/proj", "repo": "gh/x",
+                "dk": mid, "cost": 0.25, "t": [1, 2, 3, 4]}
+
+    @pytest.fixture
+    def corpus(self, db):
+        save_ccreport_file(self.LIVE, 111, 222, [
+            self._rec("a", 100.0), self._rec("b", 200.0), self._rec("c", 300.0),
+        ])
+        save_ccreport_file(self.GONE, 333, 444, [self._rec("orphan", 250.0)])
+        return db
+
+    def _mids(self, since, until) -> list[str]:
+        by_file = cache_db.load_ccreport_records_in_range(since, until)
+        return [r["mid"] for recs in by_file.values() for r in recs]
+
+    def test_both_bounds_narrow_the_window(self, corpus):
+        assert self._mids(200.0, 250.0) == ["b", "orphan"]
+
+    def test_the_bounds_are_inclusive_as_keep_is(self, corpus):
+        """_keep drops on `ts < since` and `ts > until`, so the ends are kept."""
+        assert self._mids(100.0, 100.0) == ["a"]
+        assert self._mids(300.0, 300.0) == ["c"]
+
+    def test_either_bound_may_be_open(self, corpus):
+        assert self._mids(260.0, None) == ["c"]
+        assert self._mids(None, 150.0) == ["a"]
+
+    def test_no_bounds_is_every_row(self, corpus):
+        assert self._mids(None, None) == ["a", "b", "c", "orphan"]
+
+    def test_one_query_covers_live_and_purged_files_alike(self, corpus):
+        assert set(cache_db.load_ccreport_records_in_range(None, None)) == {
+            self.LIVE, self.GONE,
+        }
+
+    def test_the_row_order_is_insert_order(self, corpus):
+        """Dedup keeps the first occurrence, so the order decides the winner."""
+        by_file = cache_db.load_ccreport_records_in_range(None, None)
+        assert [r["mid"] for r in by_file[self.LIVE]] == ["a", "b", "c"]
+
+    def test_the_window_agrees_with_the_one_sided_loader(self, corpus):
+        assert cache_db.load_ccreport_records_in_range(200.0, None) == (
+            cache_db.load_ccreport_records_since(200.0)
+        )
+
+
 class TestProjectScopeCache:
     """A stored scope is trusted without a fingerprint, so its inputs must clear it.
 
@@ -1011,12 +1265,88 @@ class TestProjectScopeCache:
         assert cache_db.load_project_scope(self.CWD) is None
 
 
+class TestProjectScopeSurvivesAnOrdinarySave:
+    """A save that moves no identity must leave the scopes alone (macsetup-ov32).
+
+    Truncating the table on every batch made an ordinary ccreport run cost every
+    open session a full scope derivation — a quarter of a render — on its next
+    slow render, for records that said exactly what the cached ones said.
+    """
+
+    CWD = TestProjectScopeCache.CWD
+    PREFIXES = TestProjectScopeCache.PREFIXES
+    RECORD = TestProjectScopeCache.RECORD
+    DIR = "/p/-tmp-proj/"
+
+    @pytest.fixture
+    def seeded(self, db):
+        """One cached log, and a scope cached after it — the steady state."""
+        save_ccreport_files([(self.DIR + "b.jsonl", 1, 1, [dict(self.RECORD)])])
+        cache_db.save_project_scope(self.CWD, "proj", self.PREFIXES)
+        return db
+
+    def _scope(self):
+        return cache_db.load_project_scope(self.CWD)
+
+    def test_reparsing_a_log_that_grew_keeps_the_scopes(self, seeded):
+        save_ccreport_files([
+            (self.DIR + "b.jsonl", 2, 2, [dict(self.RECORD), dict(self.RECORD)]),
+        ])
+        assert self._scope() == ("proj", self.PREFIXES)
+
+    def test_a_new_log_behind_one_saying_the_same_thing_keeps_the_scopes(self, seeded):
+        """Its directory already resolves however it resolves."""
+        save_ccreport_files([(self.DIR + "c.jsonl", 1, 1, [dict(self.RECORD)])])
+        assert self._scope() == ("proj", self.PREFIXES)
+
+    def test_a_batch_of_unchanged_logs_keeps_the_scopes(self, seeded):
+        save_ccreport_files([
+            (self.DIR + "b.jsonl", 2, 2, [dict(self.RECORD)]),
+            (self.DIR + "c.jsonl", 1, 1, [dict(self.RECORD)]),
+            (self.DIR + "d.jsonl", 1, 1, [dict(self.RECORD)]),
+        ])
+        assert self._scope() == ("proj", self.PREFIXES)
+
+    @pytest.mark.parametrize("moved", [
+        {"repo": "gh/renamed"}, {"cwd": "/tmp/elsewhere"}, {"project": "other"},
+    ])
+    def test_a_changed_identity_clears_the_scopes(self, seeded, moved):
+        """Every signal resolve() reads, one at a time."""
+        save_ccreport_files([
+            (self.DIR + "b.jsonl", 2, 2, [{**self.RECORD, **moved}]),
+        ])
+        assert self._scope() is None
+
+    def test_a_log_in_a_directory_nothing_is_cached_for_clears_the_scopes(self, seeded):
+        """It can be the directory that joins another project to this one."""
+        save_ccreport_files([("/p/-tmp-new/a.jsonl", 1, 1, [dict(self.RECORD)])])
+        assert self._scope() is None
+
+    def test_a_log_sorting_before_every_sibling_clears_the_scopes(self, seeded):
+        """The scope's name is read from the first log in path order."""
+        save_ccreport_files([(self.DIR + "a.jsonl", 1, 1, [dict(self.RECORD)])])
+        assert self._scope() is None
+
+    def test_a_log_that_now_parses_to_nothing_clears_the_scopes(self, seeded):
+        """It takes an identity away; only a rederivation says what is left."""
+        save_ccreport_files([(self.DIR + "b.jsonl", 2, 2, [])])
+        assert self._scope() is None
+
+    def test_an_unchanged_save_still_writes_its_records(self, seeded):
+        """The check reads the pre-write state; it must not skip the write."""
+        grown = [dict(self.RECORD), {**self.RECORD, "mid": "m2"}]
+        save_ccreport_files([(self.DIR + "b.jsonl", 2, 2, grown)])
+        file_meta, by_file = bulk_load_ccreport_cache()
+        assert file_meta == {self.DIR + "b.jsonl": (2, 2)}
+        assert by_file == {self.DIR + "b.jsonl": grown}
+
+
 class TestFlatPricingVariantsMigration:
     """Migration 2 matched models by equality; find_pricing matches substrings."""
 
     CUTOFF = 1773424800.0  # 2026-03-13T18:00 UTC
     ROWS = [
-        # (mid, model, ts, cost)
+        # Columns: mid, model, ts, cost.
         ("bracketed", "claude-opus-4-6[1m]", CUTOFF + 1, 5.0),
         ("bracketed-old", "claude-opus-4-6[1m]", CUTOFF - 1, 5.0),
         ("dated", "claude-sonnet-4-6-20260210", CUTOFF + 1, 5.0),
@@ -1143,12 +1473,12 @@ class TestIndexShape:
         cache_db.close_connection()
 
     def test_a_fresh_db_has_the_new_indexes_and_none_of_the_dead_ones(self, db):
-        assert _WANTED_CCR_INDEXES <= _index_names(db, "ccreport_records")
+        assert _index_names(db, "ccreport_records") >= _WANTED_CCR_INDEXES
         assert _index_names(db, "ccreport_records") & _DEAD_INDEXES == set()
         assert _index_names(db, "dedup_keys") & _DEAD_INDEXES == set()
 
     def test_migration_brings_an_old_db_to_the_same_shape(self, old_shaped):
-        assert _WANTED_CCR_INDEXES <= _index_names(old_shaped, "ccreport_records")
+        assert _index_names(old_shaped, "ccreport_records") >= _WANTED_CCR_INDEXES
         assert _index_names(old_shaped, "ccreport_records") & _DEAD_INDEXES == set()
         assert _index_names(old_shaped, "dedup_keys") & _DEAD_INDEXES == set()
 
@@ -1302,7 +1632,7 @@ class TestSanityCheck:
         monkeypatch.setattr(cache_db, "_conn", None)
         conn = cache_db.get_connection()
         _seed_ccreport(conn, [(f"m{i}", "claude-opus-5", 1.0, 1.0) for i in range(200)])
-        yesterday = (datetime.now(tz=timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(tz=UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
         dst = sqlite3.connect(str(snaps / f"{yesterday}.db"))
         conn.backup(dst)
         dst.close()
@@ -1398,8 +1728,28 @@ class _BackupRecorder:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def backup(self, dst, **kwargs) -> None:  # noqa: ANN001
+    def backup(self, dst, **kwargs) -> None:
         self.calls.append(kwargs)
+
+
+class _SteppedBackup:
+    """Stands in for a connection, driving the progress callback as SQLite does.
+
+    *remaining* is the remaining-page count each step reports. A value that goes
+    back up is what a restart looks like from the callback's side — SQLite hands
+    the copy the whole page count again and returns SQLITE_OK, which is why the
+    callback is the only place a restart can be seen at all.
+    """
+
+    def __init__(self, remaining: list[int]) -> None:
+        self.remaining = remaining
+        self.steps = 0
+
+    def backup(self, dst, *, pages=None, sleep=None, progress=None) -> None:
+        for rem in self.remaining:
+            self.steps += 1
+            if progress is not None:
+                progress(0, rem, 100)
 
 
 class TestDailySnapshot:
@@ -1432,7 +1782,7 @@ class TestDailySnapshot:
 
     @staticmethod
     def _today(snaps):
-        return snaps / f"{datetime.now(tz=timezone.utc).strftime('%Y-%m-%d')}.db"
+        return snaps / f"{datetime.now(tz=UTC).strftime('%Y-%m-%d')}.db"
 
     @staticmethod
     def _open() -> None:
@@ -1473,6 +1823,44 @@ class TestDailySnapshot:
         assert fresh
         assert recorder.calls[0]["pages"] > 0
         assert recorder.calls[0]["sleep"] > 0
+        # Stepping alone bounds nothing: the loop inside backup() has no cap.
+        assert callable(recorder.calls[0]["progress"])
+
+    def test_a_copy_the_source_keeps_restarting_is_abandoned(self, snaps, capsys):
+        """A restart returns SQLITE_OK, so nothing downstream would ever see it.
+
+        Every statusline render writes cache.db, and each write restarts the
+        copy from page 1 — with no cap the detached refresh that owns the daily
+        snapshot can sit there for the rest of the run (macsetup-66ic).
+        """
+        stepped = _SteppedBackup([100, 90] * 8)
+        assert cache_db._maybe_snapshot(stepped) == (None, False)
+        assert stepped.steps == 2 * cache_db._SNAPSHOT_MAX_RESTARTS + 3
+        assert not self._today(snaps).exists()
+        assert not self._today(snaps).with_suffix(".db.tmp").exists()
+        assert "restarts" in capsys.readouterr().err
+
+    def test_a_copy_past_its_deadline_is_abandoned(self, snaps, monkeypatch, capsys):
+        monkeypatch.setattr(cache_db, "_SNAPSHOT_DEADLINE_S", 0.0)
+        stepped = _SteppedBackup([100, 90, 80])
+        assert cache_db._maybe_snapshot(stepped) == (None, False)
+        assert stepped.steps == 1, "the bound is checked every step, not at the end"
+        assert not self._today(snaps).exists()
+        assert "deadline" in capsys.readouterr().err
+
+    def test_a_copy_inside_its_bounds_is_kept(self, snaps):
+        """Progress that only ever goes forward is not a restart."""
+        stepped = _SteppedBackup([100, 50, 0])
+        assert cache_db._maybe_snapshot(stepped) == (self._today(snaps), True)
+
+    def test_giving_up_leaves_yesterdays_snapshot_alone(self, snaps, monkeypatch):
+        """A skipped day costs a day of history, not the history."""
+        snaps.mkdir(parents=True)
+        older = snaps / "2020-01-01.db"
+        older.write_bytes(b"old")
+        monkeypatch.setattr(cache_db, "_SNAPSHOT_DEADLINE_S", 0.0)
+        cache_db._maybe_snapshot(_SteppedBackup([100]))
+        assert older.exists()
 
     def test_a_copy_already_under_way_is_not_repeated(self, snaps):
         """target.exists() is checked before a copy that takes seconds."""
@@ -1791,3 +2179,138 @@ class TestRateLimitSnapshots:
         assert "USING PRIMARY KEY" in detail
         assert "SCAN" not in detail
         assert "TEMP B-TREE" not in detail
+
+
+# ---------------------------------------------------------------------------
+# Reads bounded to what the caller asked for (macsetup-3rm3)
+# ---------------------------------------------------------------------------
+
+class TestRecordsForPaths:
+    """The rebuild of the orphan totals reads the orphaned files and no others."""
+
+    @staticmethod
+    def _rec(**kw):
+        return {
+            "mid": "m", "model": "claude-opus-5", "ts": 1.5, "sid": "s1",
+            "project": "proj", "cwd": "/tmp/proj", "repo": None,
+            "dk": None, "cost": 0.25, "t": [1, 2, 3, 4], **kw,
+        }
+
+    def test_only_the_named_paths_come_back(self, db):
+        save_ccreport_file("/p/a.jsonl", 1, 1, [self._rec(dk="a")])
+        save_ccreport_file("/p/b.jsonl", 1, 1, [self._rec(dk="b")])
+        got = cache_db.load_ccreport_records_for_paths(["/p/a.jsonl"])
+        assert set(got) == {"/p/a.jsonl"}
+        assert [r["dk"] for r in got["/p/a.jsonl"]] == ["a"]
+
+    def test_an_empty_path_set_reads_nothing(self, db):
+        save_ccreport_file("/p/a.jsonl", 1, 1, [self._rec(dk="a")])
+        assert cache_db.load_ccreport_records_for_paths([]) == {}
+
+    def test_insert_order_survives_the_chunking(self, db, monkeypatch):
+        """Dedup is first-occurrence-wins, so the order is part of the answer.
+
+        Chunked into one path per statement, which is what a real orphan set
+        larger than SQLite's parameter limit does — the file written second
+        must still come back second, not first by alphabet. The chunker itself
+        is replaced rather than its size constant, which _param_chunks bound as
+        a default argument at definition time.
+        """
+        monkeypatch.setattr(
+            cache_db, "_param_chunks", lambda paths, size=1: [[p] for p in sorted(paths)],
+        )
+        save_ccreport_file("/p/z.jsonl", 1, 1, [self._rec(dk="z")])
+        save_ccreport_file("/p/a.jsonl", 1, 1, [self._rec(dk="a")])
+        got = cache_db.load_ccreport_records_for_paths(["/p/a.jsonl", "/p/z.jsonl"])
+        assert list(got) == ["/p/z.jsonl", "/p/a.jsonl"]
+
+    def test_a_mismatched_salt_reads_nothing(self, db):
+        save_ccreport_file("/p/a.jsonl", 1, 1, [self._rec()])
+        cache_db._set_meta(db, "ccreport_schema_salt", "not-the-salt")
+        db.commit()
+        assert cache_db.load_ccreport_records_for_paths(["/p/a.jsonl"]) == {}
+
+
+class TestOrphanAllTimeRows:
+    ROWS = [("/p/-tmp-proj/", "proj", "/tmp/proj", "", 4.5)]
+
+    def test_the_rows_come_back_under_their_own_fingerprint(self, db):
+        cache_db.save_orphan_alltime(self.ROWS, "fp-1")
+        assert cache_db.load_orphan_alltime("fp-1") == self.ROWS
+
+    def test_a_moved_fingerprint_reads_as_a_rebuild(self, db):
+        cache_db.save_orphan_alltime(self.ROWS, "fp-1")
+        assert cache_db.load_orphan_alltime("fp-2") == []
+
+    def test_a_save_replaces_the_previous_set(self, db):
+        cache_db.save_orphan_alltime(self.ROWS, "fp-1")
+        cache_db.save_orphan_alltime([], "fp-2")
+        assert cache_db.load_orphan_alltime("fp-2") == []
+        assert db.execute("SELECT COUNT(*) FROM ccreport_orphan_costs").fetchone() == (0,)
+
+    def test_a_mismatched_salt_reads_as_a_rebuild(self, db):
+        cache_db.save_orphan_alltime(self.ROWS, "fp-1")
+        cache_db._set_meta(db, "ccreport_schema_salt", "not-the-salt")
+        db.commit()
+        assert cache_db.load_orphan_alltime("fp-1") == []
+
+    def test_the_stamp_ignores_files_outside_the_orphan_set(self, db):
+        """A live session log being re-parsed must not re-sum the purged ones."""
+        rec = TestRecordsForPaths._rec()
+        save_ccreport_file("/p/gone.jsonl", 1, 1, [rec])
+        save_ccreport_file("/p/live.jsonl", 1, 1, [rec])
+        before = cache_db.orphan_alltime_stamp(["/p/gone.jsonl"])
+
+        save_ccreport_file("/p/live.jsonl", 2, 2, [rec, dict(rec, dk="second")])
+        assert cache_db.orphan_alltime_stamp(["/p/gone.jsonl"]) == before
+
+    def test_the_stamp_moves_when_an_orphans_own_row_does(self, db):
+        rec = TestRecordsForPaths._rec()
+        save_ccreport_file("/p/gone.jsonl", 1, 1, [rec])
+        before = cache_db.orphan_alltime_stamp(["/p/gone.jsonl"])
+        save_ccreport_file("/p/gone.jsonl", 2, 9, [rec])
+        assert cache_db.orphan_alltime_stamp(["/p/gone.jsonl"]) != before
+
+    def test_the_stamp_survives_a_corpus_of_realistic_mtimes(self, db):
+        """SUM(mtime_ns) over a few thousand files overflows SQLite's integers."""
+        rec = TestRecordsForPaths._rec()
+        base = 1_786_000_000_000_000_000
+        paths = [f"/p/f{i}.jsonl" for i in range(300)]
+        for i, path in enumerate(paths):
+            save_ccreport_file(path, base + i, 10, [rec])
+        assert cache_db.orphan_alltime_stamp(paths)
+
+
+class TestFileAllTimeUnder:
+    """all_time is window-independent, so reading it must not touch the windows."""
+
+    ENTRY = {
+        "mtime_ns": 111, "size": 222, "week_cost": 1.0, "month_cost": 2.0,
+        "all_time_cost": 3.0, "week_model_costs": {}, "dedup_keys": ["k1", "k2"],
+    }
+
+    def _seed(self):
+        bulk_save_file_costs(
+            {"/p/-tmp-proj/a.jsonl": dict(self.ENTRY)}, "w1", "m1",
+            changed={"/p/-tmp-proj/a.jsonl"},
+        )
+
+    def test_the_stored_all_time_and_keys_come_back(self, db):
+        self._seed()
+        got = cache_db.load_file_all_time_under("/p/-tmp-proj/")
+        assert got == {"/p/-tmp-proj/a.jsonl": (111, 222, 3.0, ["k1", "k2"])}
+
+    def test_another_projects_files_stay_out(self, db):
+        self._seed()
+        assert cache_db.load_file_all_time_under("/p/-tmp-other/") == {}
+
+    def test_a_rolled_over_week_neither_empties_nor_truncates(self, db):
+        """load_cost_cache would DELETE the table here; this reader may not."""
+        self._seed()
+        got = cache_db.load_file_all_time_under("/p/-tmp-proj/")
+        assert got["/p/-tmp-proj/a.jsonl"][2] == 3.0
+        assert db.execute("SELECT COUNT(*) FROM file_costs").fetchone() == (1,)
+        # The contrast: the same read through load_cost_cache, with the same
+        # moved-on keys, takes the row with it.
+        assert load_cost_cache("w2", "m2") == {}
+        assert db.execute("SELECT COUNT(*) FROM file_costs").fetchone() == (0,)

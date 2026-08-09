@@ -2,34 +2,33 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from pricing import (
+    MODEL_ALIASES,
+    OTHER_FAMILY,
     PRICING_HISTORY,
     ROLLING_WINDOWS,
     SESSION_WINDOW_S,
     TIER_THRESHOLD,
     WEEK_WINDOW_S,
-    MODEL_ALIASES,
     _bucket_rolling_cost,
-    _CacheResult,
     _FileContext,
-    _ScanResult,
     _parse_effective,
+    _parse_window_starts,
+    _rec_cost,
     _rolling_thresholds,
     _scan_jsonl_file,
     _try_cached_file,
     calc_cost,
     extract_assistant_fields,
     find_pricing,
+    model_family,
     tiered_cost,
     window_start_epoch,
-    _parse_window_starts,
-    _rec_cost,
 )
-
 
 # ---------------------------------------------------------------------------
 # _parse_effective
@@ -38,15 +37,15 @@ from pricing import (
 class TestParseEffective:
     def test_date_only(self):
         dt = _parse_effective("2025-01-01")
-        assert dt == datetime(2025, 1, 1, tzinfo=timezone.utc)
+        assert dt == datetime(2025, 1, 1, tzinfo=UTC)
 
     def test_date_with_hour(self):
         dt = _parse_effective("2026-03-13T18")
-        assert dt == datetime(2026, 3, 13, 18, tzinfo=timezone.utc)
+        assert dt == datetime(2026, 3, 13, 18, tzinfo=UTC)
 
     def test_returns_utc(self):
         dt = _parse_effective("2025-06-15")
-        assert dt.tzinfo == timezone.utc
+        assert dt.tzinfo == UTC
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +60,7 @@ class TestFindPricing:
         assert "output" in prices
 
     def test_alias_resolution(self):
-        for alias, canonical in MODEL_ALIASES.items():
+        for alias in MODEL_ALIASES:
             prices = find_pricing(alias)
             assert prices is not None, f"Alias {alias!r} returned None"
 
@@ -69,19 +68,19 @@ class TestFindPricing:
         assert find_pricing("nonexistent-model-xyz") is None
 
     def test_historical_lookup_before_first_period(self):
-        very_old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        very_old = datetime(2020, 1, 1, tzinfo=UTC)
         assert find_pricing("claude-sonnet-4-20250514", ts=very_old) is None
 
     def test_historical_lookup_in_first_period(self):
-        ts = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        ts = datetime(2025, 6, 1, tzinfo=UTC)
         prices = find_pricing("claude-sonnet-4-20250514", ts=ts)
         assert prices is not None
         assert prices["input"] == 3e-06
 
     def test_pricing_period_transition(self):
         """Opus 4.6 had 200k tier before 2026-03-13T18, flat after."""
-        before = datetime(2026, 3, 13, 17, tzinfo=timezone.utc)
-        after = datetime(2026, 3, 13, 19, tzinfo=timezone.utc)
+        before = datetime(2026, 3, 13, 17, tzinfo=UTC)
+        after = datetime(2026, 3, 13, 19, tzinfo=UTC)
 
         prices_before = find_pricing("claude-opus-4-6", ts=before)
         prices_after = find_pricing("claude-opus-4-6", ts=after)
@@ -144,7 +143,7 @@ class TestCalcCost:
 
     def test_basic_cost_calculation(self):
         """Verify cost with known Sonnet 4 pricing (first period)."""
-        ts = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        ts = datetime(2025, 6, 1, tzinfo=UTC)
         cost = calc_cost(
             input_tokens=10_000,
             output_tokens=5_000,
@@ -157,7 +156,7 @@ class TestCalcCost:
         assert cost == pytest.approx(0.105)
 
     def test_all_token_types(self):
-        ts = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        ts = datetime(2025, 6, 1, tzinfo=UTC)
         cost = calc_cost(
             input_tokens=1000,
             output_tokens=1000,
@@ -176,7 +175,7 @@ class TestCalcCost:
 
     def test_tiered_pricing_kicks_in(self):
         """With 250K input tokens on Sonnet 4, tiered rate should apply."""
-        ts = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        ts = datetime(2025, 6, 1, tzinfo=UTC)
         cost = calc_cost(
             input_tokens=250_000,
             output_tokens=0,
@@ -190,7 +189,7 @@ class TestCalcCost:
 
     def test_no_tiered_rate_uses_flat(self):
         """Haiku has no 200k tier — flat rate for all tokens."""
-        ts = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        ts = datetime(2025, 6, 1, tzinfo=UTC)
         cost = calc_cost(
             input_tokens=250_000,
             output_tokens=0,
@@ -206,7 +205,7 @@ class TestCalcCost:
 
     def test_flat_pricing_after_transition(self):
         """After 2026-03-13T18, Opus 4.6 uses flat pricing."""
-        ts = datetime(2026, 4, 1, tzinfo=timezone.utc)
+        ts = datetime(2026, 4, 1, tzinfo=UTC)
         cost = calc_cost(
             input_tokens=250_000,
             output_tokens=0,
@@ -227,11 +226,11 @@ class TestWindowStartEpoch:
     NOW = 1_700_000_000.0
 
     def test_past_reset_is_the_window_start(self):
-        past = datetime.fromtimestamp(self.NOW - 600, tz=timezone.utc).isoformat()
+        past = datetime.fromtimestamp(self.NOW - 600, tz=UTC).isoformat()
         assert window_start_epoch(past, SESSION_WINDOW_S, self.NOW) == self.NOW - 600
 
     def test_future_reset_subtracts_the_window(self):
-        future = datetime.fromtimestamp(self.NOW + 3600, tz=timezone.utc).isoformat()
+        future = datetime.fromtimestamp(self.NOW + 3600, tz=UTC).isoformat()
         assert window_start_epoch(future, SESSION_WINDOW_S, self.NOW) == (
             self.NOW + 3600 - SESSION_WINDOW_S
         )
@@ -309,20 +308,20 @@ class TestParseWindowStarts:
 
 class TestRollingHelpers:
     def test_thresholds_has_all_window_names(self):
-        now = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
         t = _rolling_thresholds(now)
         for w in ROLLING_WINDOWS:
             assert w.name in t
 
     def test_thresholds_are_ordered_oldest_first(self):
-        now = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
         t = _rolling_thresholds(now)
         values = [t[w.name] for w in ROLLING_WINDOWS]
         # ROLLING_WINDOWS is longest→shortest, so thresholds should be ascending
         assert values == sorted(values)
 
     def test_bucket_accumulates_into_all_matching_windows(self):
-        now = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
         t = _rolling_thresholds(now)
         totals: dict[str, float] = {}
         # Timestamp = now (within all windows)
@@ -331,7 +330,7 @@ class TestRollingHelpers:
             assert totals[w.name] == 1.0
 
     def test_bucket_skips_windows_outside_range(self):
-        now = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
         t = _rolling_thresholds(now)
         totals: dict[str, float] = {}
         # Timestamp = 20 days ago (only in thirty_day and seven_day? No, 20 > 7)
@@ -342,7 +341,7 @@ class TestRollingHelpers:
         assert totals.get("six_hour") is None
 
     def test_bucket_with_project(self):
-        now = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
         t = _rolling_thresholds(now)
         totals: dict[str, float] = {}
         proj: dict[str, float] = {}
@@ -351,7 +350,7 @@ class TestRollingHelpers:
         assert proj["six_hour"] == 2.5
 
     def test_bucket_no_project_when_false(self):
-        now = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
         t = _rolling_thresholds(now)
         totals: dict[str, float] = {}
         proj: dict[str, float] = {}
@@ -374,7 +373,7 @@ class TestRecCost:
             "cost": 0,
             "t": [10_000, 5_000, 0, 0],
             "model": "claude-sonnet-4-20250514",
-            "ts": datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp(),
+            "ts": datetime(2025, 6, 1, tzinfo=UTC).timestamp(),
         }
         result = _rec_cost(rec)
         assert result > 0
@@ -385,7 +384,7 @@ class TestRecCost:
             "cost": None,
             "t": [1000, 0, 0, 0],
             "model": "claude-sonnet-4-20250514",
-            "ts": datetime(2025, 6, 1, tzinfo=timezone.utc).timestamp(),
+            "ts": datetime(2025, 6, 1, tzinfo=UTC).timestamp(),
         }
         assert _rec_cost(rec) == pytest.approx(1000 * 3e-06)
 
@@ -468,7 +467,7 @@ class TestExtractAssistantFields:
     def test_valid_record(self):
         result = extract_assistant_fields(self._make_rec())
         assert result is not None
-        msg, usage, mid, rid, dk, ts = result
+        _msg, usage, mid, rid, dk, ts = result
         assert mid == "msg-1"
         assert rid == "req-1"
         assert dk == "msg-1:req-1"
@@ -512,26 +511,26 @@ class TestExtractAssistantFields:
 class TestTryCachedFile:
     """Tests for the cache-hit helper extracted from compute_costs."""
 
-    NOW = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+    NOW = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
 
-    @pytest.fixture()
+    @pytest.fixture
     def thresholds(self):
         return _rolling_thresholds(self.NOW)
 
-    @pytest.fixture()
+    @pytest.fixture
     def accumulators(self):
         return {"rolling": {}, "proj": {}, "seen": set()}
 
     def _make_ctx(self, **overrides) -> _FileContext:
-        defaults = dict(
-            key="/tmp/test.jsonl",
-            is_session_file=False,
-            is_project_file=False,
-            in_session_window=False,
-            in_rolling_window=False,
-            file_unchanged=True,
-            ccr_fresh=False,
-        )
+        defaults = {
+            "key": "/tmp/test.jsonl",
+            "is_session_file": False,
+            "is_project_file": False,
+            "in_session_window": False,
+            "in_rolling_window": False,
+            "file_unchanged": True,
+            "ccr_fresh": False,
+        }
         defaults.update(overrides)
         return _FileContext(**defaults)
 
@@ -658,9 +657,9 @@ class TestTryCachedFile:
 class TestScanJsonlFile:
     """Tests for the JSONL scanning helper extracted from compute_costs."""
 
-    NOW = datetime(2025, 6, 15, 12, 0, tzinfo=timezone.utc)
+    NOW = datetime(2025, 6, 15, 12, 0, tzinfo=UTC)
 
-    @pytest.fixture()
+    @pytest.fixture
     def thresholds(self):
         return _rolling_thresholds(self.NOW)
 
@@ -698,7 +697,7 @@ class TestComputeCostsSessionWindowKey:
     overwrite a real total computed by a caller that had the reset (macsetup-4uja).
     """
 
-    @pytest.fixture()
+    @pytest.fixture
     def isolated(self, monkeypatch, tmp_path):
         import cache_db
         import pricing
@@ -722,12 +721,13 @@ class TestComputeCostsSessionWindowKey:
         result = compute_costs()
         assert "session_window_cost" not in result
         assert "week_cost" in result
-        assert isolated and "session_window_cost" not in isolated[-1]
+        assert isolated
+        assert "session_window_cost" not in isolated[-1]
 
     def test_present_with_reset(self, isolated):
         from pricing import compute_costs
 
-        reset = (datetime.now(tz=timezone.utc) + timedelta(hours=2)).isoformat()
+        reset = (datetime.now(tz=UTC) + timedelta(hours=2)).isoformat()
         result = compute_costs(session_reset_iso=reset)
         assert result["session_window_cost"] == 0.0
         assert "session_window_cost" in isolated[-1]
@@ -740,7 +740,7 @@ class TestComputeCostsSessionWindowKey:
 class TestComputeCostsSavesOnlyChangedFiles:
     """One appended line must not rewrite the whole cost cache (macsetup-5vsf)."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def projects(self, monkeypatch, tmp_path):
         import pricing
 
@@ -755,7 +755,7 @@ class TestComputeCostsSavesOnlyChangedFiles:
         with open(path, "a") as fh:
             fh.write(json.dumps({
                 "type": "assistant",
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "timestamp": datetime.now(tz=UTC).isoformat(),
                 "requestId": f"req-{mid}", "sessionId": "s1", "cwd": "/tmp/proj",
                 "message": {"id": mid, "model": "claude-opus-5",
                             "usage": {"input_tokens": 10, "output_tokens": 5}},
@@ -834,7 +834,7 @@ class TestPerRenderScoping:
     # directory has the target's directory name as a string prefix.
     SIBLING_CWD = "/tmp/proj-other"
 
-    @pytest.fixture()
+    @pytest.fixture
     def projects_dir(self, monkeypatch, tmp_path):
         import cache_db
         import pricing
@@ -852,7 +852,7 @@ class TestPerRenderScoping:
 
         cache_db.save_ccreport_file(path, 1, 1, [{
             "mid": "m", "model": "claude-opus-5",
-            "ts": ts if ts is not None else datetime.now(tz=timezone.utc).timestamp(),
+            "ts": ts if ts is not None else datetime.now(tz=UTC).timestamp(),
             "sid": sid, "project": "proj", "cwd": self.CWD, "repo": None,
             "dk": None, "cost": cost, "t": [1, 1, 0, 0],
         }])
@@ -883,7 +883,7 @@ class TestPerRenderScoping:
         live = projects_dir / "-tmp-proj" / "live.jsonl"
         live.write_text(json.dumps({
             "type": "assistant",
-            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
             "requestId": "r1", "sessionId": "s1", "cwd": self.CWD,
             "message": {"id": "msg-1", "model": "claude-opus-5",
                         "usage": {"input_tokens": 10, "output_tokens": 5}},
@@ -988,7 +988,7 @@ class TestMergedProjectsShareTheirCostWindows:
     CWD = "/tmp/proj"
     OTHER_CWD = "/tmp/other"
 
-    @pytest.fixture()
+    @pytest.fixture
     def projects_dir(self, monkeypatch, tmp_path):
         import cache_db
         import pricing
@@ -1014,7 +1014,7 @@ class TestMergedProjectsShareTheirCostWindows:
 
         cache_db.save_ccreport_file(path, 1, 1, [{
             "mid": "m", "model": "claude-opus-5",
-            "ts": datetime.now(tz=timezone.utc).timestamp(),
+            "ts": datetime.now(tz=UTC).timestamp(),
             "sid": "s1", "project": project, "cwd": cwd, "repo": None,
             # Distinct per project: dedup is global, so a shared key would
             # drop the second record and hide whether the scope found it.
@@ -1051,7 +1051,7 @@ class TestMergedProjectsShareTheirCostWindows:
         from pricing import compute_project_rolling_costs
 
         self._both_projects(projects_dir)
-        monkeypatch.setattr(cache_db, "get_project_overrides", lambda: [])
+        monkeypatch.setattr(cache_db, "get_project_overrides", list)
         assert compute_project_rolling_costs(
             self.CWD)["all_time_project_cost"] == 3.0
         assert compute_project_rolling_costs(
@@ -1118,7 +1118,7 @@ class TestTheResolvedScopeIsCachedPerCwd:
 
     CWD = "/tmp/proj"
 
-    @pytest.fixture()
+    @pytest.fixture
     def merged(self, monkeypatch, tmp_path):
         """One record in a second project, merged into the cwd's by name."""
         import cache_db
@@ -1244,7 +1244,7 @@ class TestFallbackDedupIdentity:
 
     CWD = "/tmp/proj"
 
-    @pytest.fixture()
+    @pytest.fixture
     def projects_dir(self, monkeypatch, tmp_path):
         import cache_db
         import pricing
@@ -1252,14 +1252,14 @@ class TestFallbackDedupIdentity:
         d = tmp_path / "projects"
         (d / "-tmp-proj").mkdir(parents=True)
         monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
-        monkeypatch.setattr(cache_db, "get_project_overrides", lambda: [])
+        monkeypatch.setattr(cache_db, "get_project_overrides", list)
         cache_db.init_ccreport_meta(1, "test-hash")
         return d
 
     def _rows(self, projects_dir, *rows: dict) -> None:
         import cache_db
 
-        ts = datetime.now(tz=timezone.utc).timestamp()
+        ts = datetime.now(tz=UTC).timestamp()
         cache_db.save_ccreport_file(
             str(projects_dir / "-tmp-proj" / "gone.jsonl"), 1, 1,
             [{"mid": "m", "model": "claude-opus-5", "ts": ts, "sid": "s1",
@@ -1316,7 +1316,7 @@ class TestFallbackDedupIdentity:
 
         line = json.dumps({
             "type": "assistant",
-            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
             "sessionId": "s1", "cwd": self.CWD,
             "message": {"id": "msg-1", "model": "claude-opus-5",
                         "usage": {"input_tokens": 1000, "output_tokens": 0}},
@@ -1345,7 +1345,7 @@ class TestLiveFilesPricedFromTheCcreportCache:
 
     CWD = "/tmp/proj"
 
-    @pytest.fixture()
+    @pytest.fixture
     def projects_dir(self, monkeypatch, tmp_path):
         import cache_db
         import pricing
@@ -1353,7 +1353,7 @@ class TestLiveFilesPricedFromTheCcreportCache:
         d = tmp_path / "projects"
         (d / "-tmp-proj").mkdir(parents=True)
         monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
-        monkeypatch.setattr(cache_db, "get_project_overrides", lambda: [])
+        monkeypatch.setattr(cache_db, "get_project_overrides", list)
         cache_db.init_ccreport_meta(1, "test-hash")
         return d
 
@@ -1362,7 +1362,7 @@ class TestLiveFilesPricedFromTheCcreportCache:
         """One cached record, in the shape cache_db stores and pricing reads."""
         return {
             "mid": mid, "model": "claude-opus-5",
-            "ts": datetime.now(tz=timezone.utc).timestamp(), "sid": "s1",
+            "ts": datetime.now(tz=UTC).timestamp(), "sid": "s1",
             "project": "proj", "cwd": "/tmp/proj", "repo": None,
             "dk": f"{mid}:req-1", "cost": 0.5, "t": [1000, 500, 0, 0], **kw,
         }
@@ -1375,7 +1375,7 @@ class TestLiveFilesPricedFromTheCcreportCache:
         line: dict = {
             "type": "assistant",
             "timestamp": datetime.fromtimestamp(
-                rec["ts"], tz=timezone.utc).isoformat(),
+                rec["ts"], tz=UTC).isoformat(),
             "sessionId": rec["sid"], "cwd": rec["cwd"],
             "message": {
                 "id": rec["mid"], "model": rec["model"],
@@ -1555,3 +1555,796 @@ class TestLiveFilesPricedFromTheCcreportCache:
             parsed.append(Path(p).name) or real(p, seen)))
         pricing.compute_project_rolling_costs(self.CWD)
         assert parsed == ["b.jsonl", "c.jsonl"]
+
+
+# ---------------------------------------------------------------------------
+# Per-model week split — the cost beside the scoped rate-limit segment
+# ---------------------------------------------------------------------------
+
+class TestModelFamily:
+    """One derivation for both sides: the record's model ID, the quota's name."""
+
+    @pytest.mark.parametrize(("model", "family"), [
+        ("claude-fable-5", "fable"),
+        ("Fable", "fable"),
+        ("claude-opus-5[1m]", "opus"),
+        ("claude-sonnet-4-5-20250929", "sonnet"),
+        ("claude-haiku-4-5", "haiku"),
+    ])
+    def test_ids_and_display_names_land_on_one_key(self, model, family):
+        assert model_family(model) == family
+
+    @pytest.mark.parametrize("model", ["", "qwen3:32b", "some-other-model"])
+    def test_anything_unrecognized_shares_the_fallback(self, model):
+        assert model_family(model) == OTHER_FAMILY
+
+
+class TestWeekCostByModel:
+    """week_cost split by model family, for the per-model weekly quota.
+
+    Every path that can produce a file's week_cost owes the split too: a file
+    served from the cost cache contributes a total the scan never sees, and a
+    record whose JSONL is gone contributes one no file carries at all.
+    """
+
+    CWD = "/tmp/proj"
+
+    @pytest.fixture
+    def projects_dir(self, monkeypatch, tmp_path):
+        import cache_db
+        import pricing
+
+        d = tmp_path / "projects"
+        (d / "-tmp-proj").mkdir(parents=True)
+        monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
+        monkeypatch.setattr(cache_db, "get_project_overrides", list)
+        cache_db.init_ccreport_meta(1, "test-hash")
+        return d
+
+    NOW = datetime.now(tz=UTC)
+    # Window start lands 4 days back, so "now" is inside it and 30 days is not.
+    WEEK_RESET = (NOW + timedelta(days=3)).isoformat()
+    TOKENS = (1000, 1000, 0, 0)
+
+    def _cost(self, model: str) -> float:
+        return calc_cost(*self.TOKENS, model, self.NOW)
+
+    def _write(self, path, *records: tuple[str, str, datetime]) -> None:
+        import json
+
+        path.write_text("".join(
+            json.dumps({
+                "type": "assistant", "timestamp": ts.isoformat(),
+                "requestId": f"req-{mid}", "sessionId": "s1", "cwd": self.CWD,
+                "message": {
+                    "id": mid, "model": model,
+                    "usage": {"input_tokens": self.TOKENS[0],
+                              "output_tokens": self.TOKENS[1]},
+                },
+            }) + "\n"
+            for mid, model, ts in records
+        ))
+
+    def _corpus(self, projects_dir):
+        self._write(
+            projects_dir / "-tmp-proj" / "a.jsonl",
+            ("m1", "claude-fable-5", self.NOW - timedelta(hours=1)),
+            ("m2", "claude-opus-5", self.NOW - timedelta(hours=2)),
+            ("m3", "claude-fable-5", self.NOW - timedelta(days=30)),
+        )
+
+    def _costs(self):
+        from pricing import compute_costs
+
+        return compute_costs(cwd=self.CWD, week_reset_iso=self.WEEK_RESET)
+
+    def test_a_scan_splits_the_window_by_family(self, projects_dir):
+        self._corpus(projects_dir)
+        result = self._costs()
+        assert result["week_model_costs"] == {
+            "fable": pytest.approx(self._cost("claude-fable-5")),
+            "opus": pytest.approx(self._cost("claude-opus-5")),
+        }
+
+    def test_the_split_adds_up_to_the_week_total(self, projects_dir):
+        self._corpus(projects_dir)
+        result = self._costs()
+        assert sum(result["week_model_costs"].values()) == pytest.approx(
+            result["week_cost"])
+
+    def test_a_record_outside_the_window_is_left_out(self, projects_dir):
+        """The third fable record is 30 days old — only the in-window one counts."""
+        self._corpus(projects_dir)
+        result = self._costs()
+        assert result["week_model_costs"]["fable"] < result["all_time_cost"]
+
+    def test_a_fully_cached_file_still_reports_its_split(
+        self, projects_dir, monkeypatch,
+    ):
+        """A file too old to re-scan answers from the cost cache alone.
+
+        Its mtime puts it outside every rolling window, so the second run takes
+        the branch that returns cached totals without opening the file.
+        """
+        import os
+
+        import pricing
+
+        path = projects_dir / "-tmp-proj" / "a.jsonl"
+        self._corpus(projects_dir)
+        aged = (self.NOW - timedelta(days=40)).timestamp()
+        os.utime(path, (aged, aged))
+
+        first = self._costs()
+        opened: list[str] = []
+        real = pricing._iter_jsonl_costs
+        monkeypatch.setattr(pricing, "_iter_jsonl_costs", lambda p, seen: (
+            opened.append(str(p)) or real(p, seen)))
+        second = self._costs()
+
+        assert opened == [], "the file was re-parsed, so the cache is not what answered"
+        assert second["week_model_costs"] == first["week_model_costs"]
+
+    def test_an_orphaned_record_reaches_the_split(self, projects_dir):
+        """The JSONL is gone; the cached record is the only thing left of it."""
+        import cache_db
+
+        cache_db.save_ccreport_file(
+            str(projects_dir / "-tmp-proj" / "gone.jsonl"), 1, 1,
+            [{"mid": "m9", "model": "claude-fable-5",
+              "ts": (self.NOW - timedelta(hours=3)).timestamp(), "sid": "s9",
+              "project": "proj", "cwd": self.CWD, "repo": None, "dk": "m9:r9",
+              "cost": 2.5, "t": list(self.TOKENS)}],
+        )
+        assert self._costs()["week_model_costs"] == {"fable": pytest.approx(2.5)}
+
+
+# ---------------------------------------------------------------------------
+# The bisected pricing-period index (macsetup-16c7)
+# ---------------------------------------------------------------------------
+
+class TestPricingPeriodIndex:
+    """The bisect must answer exactly what the reverse walk it replaced did."""
+
+    MODELS = (
+        *sorted({m for p in PRICING_HISTORY for m in p["models"]}),
+        *sorted(MODEL_ALIASES),
+        "claude-opus-4-6",
+        "claude-sonnet-5-20260601",
+        "nonexistent-model-xyz",
+        "llama3:8b",
+        "",
+    )
+
+    @staticmethod
+    def _walk(model, ts):
+        """find_pricing as it was before the index: newest matching period wins."""
+        from pricing import _FREE_PRICING
+
+        resolved = MODEL_ALIASES.get(model, model)
+        if ":" in resolved:
+            return _FREE_PRICING
+        for period in reversed(PRICING_HISTORY):
+            if ts is not None and _parse_effective(period["effective"]) > ts:
+                continue
+            models = period["models"]
+            if resolved in models:
+                return models[resolved]
+            for key, prices in models.items():
+                if key in resolved or resolved in key:
+                    return prices
+        return None
+
+    @staticmethod
+    def _stamps():
+        """None, plus the microsecond either side of every period boundary."""
+        stamps = [None]
+        for period in PRICING_HISTORY:
+            eff = _parse_effective(period["effective"])
+            stamps += [eff - timedelta(microseconds=1), eff,
+                       eff + timedelta(microseconds=1)]
+        return stamps
+
+    def test_every_model_at_every_boundary_matches_the_walk(self):
+        for model in self.MODELS:
+            for ts in self._stamps():
+                assert find_pricing(model, ts) == self._walk(model, ts), (
+                    f"{model!r} at {ts}")
+
+    def test_a_period_takes_effect_at_its_own_timestamp_not_after(self):
+        """bisect_right, not bisect_left: the effective instant is inside."""
+        flat = _parse_effective("2026-03-13T18")
+        assert "input_200k" in find_pricing("claude-opus-4-6", flat - timedelta(microseconds=1))
+        assert "input_200k" not in find_pricing("claude-opus-4-6", flat)
+
+    def test_a_table_out_of_chronological_order_still_prices_by_date(self, monkeypatch):
+        """The index sorts, so an appended back-dated period cannot mislead it."""
+        import pricing
+
+        monkeypatch.setattr(pricing, "PRICING_HISTORY", [
+            {"effective": "2026-05-01", "models": {"m-x": {"input": 2e-06}}},
+            {"effective": "2025-01-01", "models": {"m-x": {"input": 1e-06}}},
+        ])
+        monkeypatch.setattr(pricing, "_PERIOD_INDEX", None)
+        pricing._pricing_in_effect.cache_clear()
+        try:
+            old = pricing.find_pricing("m-x", datetime(2025, 6, 1, tzinfo=UTC))
+            new = pricing.find_pricing("m-x", datetime(2026, 6, 1, tzinfo=UTC))
+            assert old["input"] == 1e-06
+            assert new["input"] == 2e-06
+        finally:
+            pricing._pricing_in_effect.cache_clear()
+
+    def test_the_resolution_is_cached_per_model_and_period(self):
+        import pricing
+
+        pricing._pricing_in_effect.cache_clear()
+        ts = datetime(2026, 8, 1, tzinfo=UTC)
+        for _ in range(50):
+            find_pricing("claude-opus-5", ts)
+            find_pricing("claude-opus-5", ts + timedelta(seconds=1))
+        info = pricing._pricing_in_effect.cache_info()
+        assert info.currsize == 1, "distinct timestamps in one period must share an entry"
+        assert info.misses == 1
+
+
+# ---------------------------------------------------------------------------
+# Incremental session cost (macsetup-31g6)
+# ---------------------------------------------------------------------------
+
+class TestIncrementalSessionCost:
+    """A growing session log is parsed once, not once per render per line."""
+
+    CWD = "/tmp/proj"
+    TS = datetime(2026, 8, 1, 12, tzinfo=UTC)
+    ONE = 1000 * 5e-06  # 1000 input tokens of claude-opus-5
+
+    @pytest.fixture
+    def proj(self, monkeypatch, tmp_path):
+        import pricing
+
+        d = tmp_path / "projects" / "-tmp-proj"
+        d.mkdir(parents=True)
+        monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d.parent])
+        return d
+
+    def _line(self, mid: str, rid: str, tokens: int = 1000, sid: str = "s1") -> str:
+        import json
+
+        return json.dumps({
+            "type": "assistant",
+            "timestamp": self.TS.isoformat(),
+            "requestId": rid,
+            "sessionId": sid,
+            "cwd": self.CWD,
+            "message": {"id": mid, "model": "claude-opus-5",
+                        "usage": {"input_tokens": tokens}},
+        }) + "\n"
+
+    def _cost(self, sid: str = "s1") -> float:
+        from pricing import compute_session_cost
+
+        return compute_session_cost(sid, self.CWD)
+
+    def _parsed(self, monkeypatch) -> list[bytes]:
+        """Every line handed to the record parser from here on."""
+        import pricing
+
+        lines: list[bytes] = []
+        real = pricing._line_cost
+
+        def counting(line, seen_keys):
+            lines.append(line)
+            return real(line, seen_keys)
+
+        monkeypatch.setattr(pricing, "_line_cost", counting)
+        return lines
+
+    def test_an_append_parses_only_the_appended_bytes(self, proj, monkeypatch):
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1") + self._line("m2", "r2"))
+        assert self._cost() == pytest.approx(2 * self.ONE)
+
+        parsed = self._parsed(monkeypatch)
+        with f.open("a") as fh:
+            fh.write(self._line("m3", "r3"))
+        assert self._cost() == pytest.approx(3 * self.ONE)
+        assert len(parsed) == 1, "the whole file was re-read, not just the append"
+
+    def test_an_unchanged_session_is_not_opened_at_all(self, proj, monkeypatch):
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1"))
+        assert self._cost() == pytest.approx(self.ONE)
+
+        parsed = self._parsed(monkeypatch)
+        assert self._cost() == pytest.approx(self.ONE)
+        assert parsed == []
+
+    def test_a_key_repeated_in_an_append_still_counts_once(self, proj):
+        """The dedup set has to survive between renders, not just within one."""
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1"))
+        assert self._cost() == pytest.approx(self.ONE)
+
+        with f.open("a") as fh:
+            fh.write(self._line("m1", "r1"))
+        assert self._cost() == pytest.approx(self.ONE)
+
+    def test_a_rewritten_file_is_counted_from_the_start(self, proj, monkeypatch):
+        """Same byte length, different content: only the tail digest catches it."""
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1") + self._line("m2", "r2"))
+        assert self._cost() == pytest.approx(2 * self.ONE)
+
+        parsed = self._parsed(monkeypatch)
+        rewritten = self._line("m3", "r3", tokens=2000) + self._line("m4", "r4", tokens=2000)
+        assert len(rewritten) == len(self._line("m1", "r1") + self._line("m2", "r2"))
+        f.write_text(rewritten)
+
+        assert self._cost() == pytest.approx(4 * self.ONE)
+        assert len(parsed) == 2, "the rewritten file was resumed instead of recounted"
+
+    def test_a_truncated_file_is_counted_from_the_start(self, proj):
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1") + self._line("m2", "r2"))
+        assert self._cost() == pytest.approx(2 * self.ONE)
+
+        f.write_text(self._line("m1", "r1"))
+        assert self._cost() == pytest.approx(self.ONE)
+
+    def test_a_file_that_disappears_leaves_the_total(self, proj):
+        """Its share is not separable from the accumulated number, so: recount."""
+        (proj / "s1.jsonl").write_text(self._line("m1", "r1"))
+        sub = proj / "s1"
+        sub.mkdir()
+        (sub / "side.jsonl").write_text(self._line("m2", "r2"))
+        assert self._cost() == pytest.approx(2 * self.ONE)
+
+        (sub / "side.jsonl").unlink()
+        assert self._cost() == pytest.approx(self.ONE)
+
+    def test_a_file_appearing_later_is_added(self, proj):
+        (proj / "s1.jsonl").write_text(self._line("m1", "r1"))
+        assert self._cost() == pytest.approx(self.ONE)
+
+        sub = proj / "s1"
+        sub.mkdir()
+        (sub / "side.jsonl").write_text(self._line("m2", "r2"))
+        assert self._cost() == pytest.approx(2 * self.ONE)
+
+    def test_a_partial_trailing_line_waits_for_its_newline(self, proj):
+        """A writer caught mid-append must not have its half-record counted."""
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1") + self._line("m2", "r2").rstrip("\n"))
+        assert self._cost() == pytest.approx(self.ONE)
+
+        with f.open("a") as fh:
+            fh.write("\n")
+        assert self._cost() == pytest.approx(2 * self.ONE)
+
+    def test_a_legacy_fingerprint_reparses_once_then_migrates(self, proj, monkeypatch):
+        import json
+
+        import cache_db
+
+        f = proj / "s1.jsonl"
+        f.write_text(self._line("m1", "r1") + self._line("m2", "r2"))
+        # What the pre-incremental cache wrote: an md5 hexdigest and a total.
+        cache_db.write_session_cost("s1", "d41d8cd98f00b204e9800998ecf8427e", 99.0)
+
+        assert self._cost() == pytest.approx(2 * self.ONE)
+        stored = cache_db.read_session_cost("s1")
+        assert json.loads(stored[0])["v"] == 2
+
+        parsed = self._parsed(monkeypatch)
+        with f.open("a") as fh:
+            fh.write(self._line("m3", "r3"))
+        assert self._cost() == pytest.approx(3 * self.ONE)
+        assert len(parsed) == 1, "the migrated state was not usable"
+
+    def test_a_corrupt_fingerprint_reparses_rather_than_raises(self, proj):
+        import cache_db
+
+        (proj / "s1.jsonl").write_text(self._line("m1", "r1"))
+        cache_db.write_session_cost("s1", '{"v":2,"f":{"/x":[1]},"k":[]}', 99.0)
+        assert self._cost() == pytest.approx(self.ONE)
+
+    def test_the_stored_state_carries_one_key_per_message(self, proj):
+        import json
+
+        import cache_db
+
+        (proj / "s1.jsonl").write_text(
+            self._line("m1", "r1") + self._line("m2", "r2"))
+        self._cost()
+        keys = json.loads(cache_db.read_session_cost("s1")[0])["k"]
+        assert len(keys) == 2
+        assert all(len(k) == 16 for k in keys), "keys are stored digested, not raw"
+
+
+# ---------------------------------------------------------------------------
+# Slow-path-only imports and lazy module state (macsetup-3jqw)
+# ---------------------------------------------------------------------------
+
+class TestDeferredImports:
+    def test_importing_pricing_touches_neither_zoneinfo_nor_the_repo_roots_config(self):
+        """A fast render imports this module and needs none of it."""
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        claude_dir = Path(__file__).resolve().parent.parent
+        probe = (
+            "import sys, pricing, project_identity as pi;"
+            "assert 'zoneinfo' not in sys.modules, 'zoneinfo';"
+            "assert 'tomllib' not in sys.modules, 'tomllib';"
+            "assert 'hashlib' not in sys.modules, 'hashlib';"
+            "assert pricing._PERIOD_INDEX is None, 'pricing period index';"
+            "assert pi.repo_roots.cache_info().currsize == 0, 'repo roots'"
+        )
+        subprocess.run([sys.executable, "-c", probe], cwd=claude_dir, check=True)
+
+    def test_the_local_zone_still_follows_the_tz_env_var(self, monkeypatch):
+        """ccreport's rollup fingerprint holds the zone; caching must not freeze it."""
+        from pricing import _local_tz
+
+        monkeypatch.setenv("TZ", "Pacific/Kiritimati")
+        assert str(_local_tz()) == "Pacific/Kiritimati"
+        monkeypatch.setenv("TZ", "Europe/Oslo")
+        assert str(_local_tz()) == "Europe/Oslo"
+
+    def test_an_unknown_zone_falls_back_to_utc(self, monkeypatch):
+        from pricing import _local_tz
+
+        monkeypatch.setenv("TZ", "Mars/Olympus_Mons")
+        assert str(_local_tz()) == "UTC"
+
+    def test_the_repo_roots_constant_still_resolves(self):
+        """REPO_ROOTS was a module attribute before repo_roots() replaced it."""
+        import project_identity
+
+        assert project_identity.repo_roots() == project_identity.REPO_ROOTS
+
+    def test_an_unknown_module_attribute_still_raises(self):
+        import project_identity
+
+        with pytest.raises(AttributeError):
+            _ = project_identity.NO_SUCH_NAME
+
+
+# ---------------------------------------------------------------------------
+# Cost computation bounded to a window, all_time excepted (macsetup-3rm3)
+# ---------------------------------------------------------------------------
+
+# Priced since 2025-01-01, so a record 200 days old still has a price to
+# look up — the newest models are only priced from their release on.
+OLD_MODEL = "claude-sonnet-4-20250514"
+
+
+class TestBoundedCostWindows:
+    """A render reads one window's records, never the whole logged history.
+
+    all_time is the bucket with no window to be bounded by, so it is answered
+    from pre-summed rows instead: file_costs for the files still on disk,
+    ccreport_orphan_costs for the ones Claude Code has purged. The tests here
+    pin what those rows have to keep getting right — an orphan counted at all,
+    a row whose stored cost is NULL priced from its tokens, a duplicate counted
+    once — because a sum that is wrong is indistinguishable from one that is
+    right until somebody re-derives it.
+    """
+
+    CWD = "/tmp/proj"
+    OLD_TS = 200 * 86400  # comfortably outside every window, including month
+
+    @pytest.fixture
+    def projects_dir(self, monkeypatch, tmp_path):
+        import cache_db
+        import pricing
+
+        d = tmp_path / "projects"
+        (d / "-tmp-proj").mkdir(parents=True)
+        monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
+        cache_db.init_ccreport_meta(1, "test-hash")
+        return d
+
+    def _orphan(
+        self, path, *, dk=None, cost=None, age_s=OLD_TS, tokens=(1000, 1000, 0, 0),
+        project="proj", cwd=CWD,
+    ) -> None:
+        """Cache one record under *path*, with no file on disk behind it."""
+        import cache_db
+
+        cache_db.save_ccreport_file(str(path), 1, 1, [{
+            "mid": "m", "model": OLD_MODEL,
+            "ts": datetime.now(tz=UTC).timestamp() - age_s,
+            "sid": "s1", "project": project, "cwd": cwd, "repo": None,
+            "dk": dk, "cost": cost, "t": list(tokens),
+        }])
+
+    def _live(self, path, mid: str, *, age_s: float = 0.0) -> None:
+        import json
+
+        ts = datetime.now(tz=UTC) - timedelta(seconds=age_s)
+        with open(path, "a") as fh:
+            fh.write(json.dumps({
+                "type": "assistant", "timestamp": ts.isoformat(),
+                "requestId": f"req-{mid}", "sessionId": "s1", "cwd": self.CWD,
+                "message": {"id": mid, "model": OLD_MODEL,
+                            "usage": {"input_tokens": 1000, "output_tokens": 1000}},
+            }) + "\n")
+
+    def _cache_live(self, path) -> None:
+        """Cache *path*'s record under its real fingerprint, as ccreport would.
+
+        A file ccreport never saw does not join the orphan set when it is
+        deleted — there is nothing cached to orphan.
+        """
+        import cache_db
+
+        st = path.stat()
+        cache_db.save_ccreport_file(str(path), st.st_mtime_ns, st.st_size, [{
+            "mid": "msg-live", "model": OLD_MODEL,
+            "ts": datetime.now(tz=UTC).timestamp(), "sid": "s1",
+            "project": "proj", "cwd": self.CWD, "repo": None,
+            "dk": "msg-live:req-msg-live", "cost": None, "t": [1000, 1000, 0, 0],
+        }])
+
+    def test_a_purged_records_all_time_survives_the_window_bound(self, projects_dir):
+        from pricing import compute_costs
+
+        self._orphan(projects_dir / "-tmp-proj" / "gone.jsonl", cost=3.0)
+        result = compute_costs(cwd=self.CWD)
+        assert result["all_time_cost"] == 3.0
+        assert result["all_time_project_cost"] == 3.0
+        # Old enough that no bounded window may claim it — which is exactly why
+        # a bounded read cannot be where all_time comes from.
+        assert result["thirty_day_cost"] == 0.0
+        assert result["month_cost"] == 0.0
+
+    def test_a_null_cost_row_is_priced_from_its_tokens(self, projects_dir):
+        """invalidate_ccreport NULLs a live file's costs; a SUM(cost) reads 0."""
+        import cache_db
+        from pricing import _rec_cost_from_tokens, compute_costs
+
+        self._orphan(projects_dir / "-tmp-proj" / "gone.jsonl", cost=None)
+        conn = cache_db.get_connection()
+        assert conn.execute("SELECT cost FROM ccreport_records").fetchone()[0] is None
+
+        expected = _rec_cost_from_tokens({
+            "t": [1000, 1000, 0, 0], "model": OLD_MODEL,
+            "ts": datetime.now(tz=UTC).timestamp() - self.OLD_TS,
+        })
+        assert expected > 0
+        assert compute_costs(cwd=self.CWD)["all_time_cost"] == pytest.approx(expected)
+
+    def test_a_duplicated_purged_record_counts_once(self, projects_dir):
+        from pricing import compute_costs
+
+        # One message id in two purged logs — a resumed or copied transcript.
+        self._orphan(projects_dir / "-tmp-proj" / "a.jsonl", dk="msg-1:req-1", cost=5.0)
+        self._orphan(projects_dir / "-tmp-proj" / "b.jsonl", dk="msg-1:req-1", cost=5.0)
+        assert compute_costs(cwd=self.CWD)["all_time_cost"] == 5.0
+
+    def test_the_bounded_read_agrees_with_an_unbounded_derivation(self, projects_dir):
+        """The whole point, stated once: same numbers, less read.
+
+        The reference sums every cached record and every live line by hand,
+        with no window bound and no stored aggregate anywhere in it.
+        """
+        from pricing import _rec_cost, compute_costs
+
+        d = projects_dir / "-tmp-proj"
+        for i, age in enumerate((self.OLD_TS, 40 * 86400, 3 * 86400, 60.0)):
+            self._orphan(d / f"gone-{i}.jsonl", dk=f"m{i}:r{i}", cost=None, age_s=age)
+        live = d / "live.jsonl"
+        self._live(live, "msg-live-old", age_s=45 * 86400)
+        self._live(live, "msg-live-new")
+
+        import cache_db
+
+        expected = sum(
+            _rec_cost(rec)
+            for recs in cache_db.bulk_load_ccreport_cache()[1].values()
+            for rec in recs
+        )
+        expected += sum(cost for cost, _ts, _dk, _m in _iter_live(live))
+
+        result = compute_costs(cwd=self.CWD)
+        assert result["all_time_cost"] == pytest.approx(round(expected, 4), abs=1e-4)
+        assert result["all_time_project_cost"] == pytest.approx(
+            round(expected, 4), abs=1e-4)
+
+    def test_the_stored_total_is_reused_until_the_orphan_set_moves(
+        self, projects_dir, monkeypatch,
+    ):
+        import cache_db
+        from pricing import compute_costs
+
+        d = projects_dir / "-tmp-proj"
+        self._orphan(d / "gone.jsonl", cost=3.0)
+        live = d / "live.jsonl"
+        self._live(live, "msg-live")
+        self._cache_live(live)
+        assert compute_costs(cwd=self.CWD)["all_time_cost"] > 3.0
+
+        rebuilds = []
+        real = cache_db.load_ccreport_records_for_paths
+
+        def spy(paths):
+            rebuilds.append(set(paths))
+            return real(paths)
+
+        monkeypatch.setattr(cache_db, "load_ccreport_records_for_paths", spy)
+
+        compute_costs(cwd=self.CWD)
+        assert rebuilds == [], "an unchanged orphan set must not be re-summed"
+
+        live.unlink()
+        compute_costs(cwd=self.CWD)
+        assert rebuilds == [{str(d / "gone.jsonl"), str(live)}]
+
+    def test_re_parsing_a_live_file_does_not_re_sum_the_purged_ones(
+        self, projects_dir, monkeypatch,
+    ):
+        """The common write, and the one a whole-table stamp would trip on."""
+        import cache_db
+        from pricing import compute_costs
+
+        d = projects_dir / "-tmp-proj"
+        self._orphan(d / "gone.jsonl", cost=3.0)
+        live = d / "live.jsonl"
+        self._live(live, "msg-live")
+        compute_costs(cwd=self.CWD)
+
+        rebuilds = []
+        monkeypatch.setattr(
+            cache_db, "load_ccreport_records_for_paths",
+            lambda paths: rebuilds.append(set(paths)) or {},
+        )
+        # What `ccreport` does to a session log that grew: delete, re-insert.
+        st = live.stat()
+        cache_db.save_ccreport_file(str(live), st.st_mtime_ns, st.st_size, [{
+            "mid": "m2", "model": "claude-opus-5",
+            "ts": datetime.now(tz=UTC).timestamp(), "sid": "s1",
+            "project": "proj", "cwd": self.CWD, "repo": None,
+            "dk": "m2:r2", "cost": 1.0, "t": [1, 1, 0, 0],
+        }])
+        assert compute_costs(cwd=self.CWD)["all_time_cost"] > 3.0
+        assert rebuilds == []
+
+    def test_a_render_never_loads_the_whole_record_table(self, projects_dir, monkeypatch):
+        import cache_db
+        from pricing import compute_costs
+
+        self._orphan(projects_dir / "-tmp-proj" / "gone.jsonl", cost=3.0)
+
+        def no_full_scans():
+            raise AssertionError("a render must not load the whole table")
+
+        monkeypatch.setattr(cache_db, "bulk_load_ccreport_cache", no_full_scans)
+        assert compute_costs(cwd=self.CWD)["all_time_cost"] == 3.0
+
+    def test_a_merge_regroups_the_stored_totals_with_no_re_sum(
+        self, projects_dir, monkeypatch,
+    ):
+        """The rows keep the raw identity, so a rule change costs no rebuild."""
+        import cache_db
+        from pricing import compute_costs
+
+        # Another project's directory, so only the stored identity can hand it
+        # to this cwd — the path prefix never will.
+        self._orphan(
+            projects_dir / "-tmp-other" / "gone.jsonl",
+            cost=4.0, project="other", cwd="/tmp/other",
+        )
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 0.0
+
+        rebuilds = []
+        real = cache_db.load_ccreport_records_for_paths
+        monkeypatch.setattr(
+            cache_db, "load_ccreport_records_for_paths",
+            lambda paths: rebuilds.append(1) or real(paths),
+        )
+        cache_db.add_project_override("name", "other", "proj")
+        cache_db.add_project_override("name", "proj", "proj")
+        assert compute_costs(cwd=self.CWD)["all_time_project_cost"] == 4.0
+        assert rebuilds == []
+
+
+class TestProjectRollingStaleFileBound:
+    """A project file too old to reach a window need not be re-read for all_time."""
+
+    CWD = "/tmp/proj"
+
+    @pytest.fixture
+    def projects_dir(self, monkeypatch, tmp_path):
+        import cache_db
+        import pricing
+
+        d = tmp_path / "projects"
+        (d / "-tmp-proj").mkdir(parents=True)
+        monkeypatch.setattr(pricing, "_get_projects_dirs", lambda: [d])
+        cache_db.init_ccreport_meta(1, "test-hash")
+        return d
+
+    def _write(self, path, mid: str, *, age_s: float) -> None:
+        import json
+        import os
+
+        ts = datetime.now(tz=UTC) - timedelta(seconds=age_s)
+        path.write_text(json.dumps({
+            "type": "assistant", "timestamp": ts.isoformat(),
+            "requestId": f"req-{mid}", "sessionId": "s1", "cwd": self.CWD,
+            "message": {"id": mid, "model": OLD_MODEL,
+                        "usage": {"input_tokens": 1000, "output_tokens": 1000}},
+        }) + "\n")
+        # mtime is what the bound is read off, so it has to match the record.
+        os.utime(path, (ts.timestamp(), ts.timestamp()))
+
+    def _parses(self, monkeypatch) -> list:
+        import pricing
+
+        seen: list = []
+        real = pricing._iter_jsonl_costs
+
+        def spy(path, seen_keys):
+            seen.append(str(path))
+            yield from real(path, seen_keys)
+
+        monkeypatch.setattr(pricing, "_iter_jsonl_costs", spy)
+        return seen
+
+    def test_an_out_of_window_file_comes_from_the_stored_all_time(
+        self, projects_dir, monkeypatch,
+    ):
+        from pricing import compute_costs, compute_project_rolling_costs
+
+        old = projects_dir / "-tmp-proj" / "old.jsonl"
+        self._write(old, "msg-old", age_s=90 * 86400)
+        # compute_costs is what fills file_costs; ccreport never ran, so the
+        # record cache has nothing for this file and the fingerprint misses.
+        expected = compute_costs(cwd=self.CWD)["all_time_project_cost"]
+        assert expected > 0
+
+        parsed = self._parses(monkeypatch)
+        totals = compute_project_rolling_costs(self.CWD)
+        assert totals["all_time_project_cost"] == expected
+        assert totals["thirty_day_project_cost"] == 0.0
+        assert parsed == [], "the stored all_time is the whole answer here"
+
+    def test_an_in_window_file_is_still_parsed(self, projects_dir, monkeypatch):
+        from pricing import compute_costs, compute_project_rolling_costs
+
+        recent = projects_dir / "-tmp-proj" / "recent.jsonl"
+        self._write(recent, "msg-recent", age_s=3600)
+        expected = compute_costs(cwd=self.CWD)["all_time_project_cost"]
+
+        parsed = self._parses(monkeypatch)
+        totals = compute_project_rolling_costs(self.CWD)
+        assert totals["all_time_project_cost"] == expected
+        # The stored all_time cannot answer a rolling window, so the file is read.
+        assert totals["six_hour_project_cost"] == expected
+        assert parsed == [str(recent)]
+
+    def test_a_changed_file_is_parsed_however_old_it_looks(
+        self, projects_dir, monkeypatch,
+    ):
+        from pricing import compute_costs, compute_project_rolling_costs
+
+        old = projects_dir / "-tmp-proj" / "old.jsonl"
+        self._write(old, "msg-old", age_s=90 * 86400)
+        compute_costs(cwd=self.CWD)
+        # Rewritten behind file_costs' back: same age, different bytes, so the
+        # stored (mtime_ns, size) must stop answering for it.
+        self._write(old, "msg-old-two", age_s=91 * 86400)
+
+        parsed = self._parses(monkeypatch)
+        compute_project_rolling_costs(self.CWD)
+        assert parsed == [str(old)]
+
+
+def _iter_live(path):
+    """pricing._iter_jsonl_costs over a file, with a dedup set of its own."""
+    from pricing import _iter_jsonl_costs
+
+    return list(_iter_jsonl_costs(path, set()))

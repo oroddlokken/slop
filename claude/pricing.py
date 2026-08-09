@@ -1,7 +1,7 @@
 """Shared Claude model pricing data, cost calculation, and cost aggregation.
 
 Single source of truth for pricing tables, model aliases, cost formulas,
-and cost aggregation. get_claude_usage.py, statusline-command.py, and
+and cost aggregation. get_claude_usage.py, statusline_command.py, and
 ccreport.py all import from this module.
 
 AUDIT: All calculations are documented in claude/CLAUDE.md.
@@ -12,20 +12,22 @@ from __future__ import annotations
 
 import json
 import sys
+from bisect import bisect_right
 from collections.abc import Iterator, Mapping, Sequence
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from datetime import UTC, datetime, timedelta
+from functools import cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple, TypedDict
-from zoneinfo import ZoneInfo
+from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple, TypedDict
 
-from project_identity import (
-    Resolver,
-    build_override_fn,
-    name_for_cwd,
-    record_project,
-)
+if TYPE_CHECKING:
+    # Both are slow-path only: zoneinfo's package init resolves TZPATH through
+    # sysconfig, and project_identity reads the repo-roots config. A fast render
+    # imports this module and needs neither, so their call sites import them
+    # (macsetup-3jqw).
+    from zoneinfo import ZoneInfo
+
+    from project_identity import Resolver
 
 
 class UsageData(TypedDict, total=False):
@@ -56,6 +58,7 @@ class UsageData(TypedDict, total=False):
     # Cost windows (from compute_costs)
     session_window_cost: float
     week_cost: float
+    week_model_costs: dict[str, float]
     session_cost: float
     six_hour_cost: float
     six_hour_project_cost: float
@@ -74,10 +77,24 @@ class UsageData(TypedDict, total=False):
 
 
 def _local_tz() -> ZoneInfo:
-    """Return the system's local timezone using full zone rules (DST-aware)."""
+    """Return the system's local timezone using full zone rules (DST-aware).
+
+    Reading $TZ every call and caching on it: the resolution below is a symlink
+    read and a zone-file parse, but $TZ is the one input that moves within a
+    process — ccreport's rollup fingerprint covers the zone, and its tests
+    change it to prove a zone change rebuilds.
+    """
+    import os
+
+    return _tz_from_env(os.environ.get("TZ"))
+
+
+@cache
+def _tz_from_env(tz_env: str | None) -> ZoneInfo:
+    """Resolve the zone $TZ names, or the system's own when it names none."""
+    from zoneinfo import ZoneInfo
+
     try:
-        import os
-        tz_env = os.environ.get("TZ")
         if tz_env:
             return ZoneInfo(tz_env)
         # On macOS/Linux, read /etc/localtime symlink target
@@ -241,6 +258,26 @@ MODEL_ALIASES: dict[str, str] = {
 
 TIER_THRESHOLD = 200_000
 
+# Families the per-model week split buckets by, matched as substrings so a
+# model ID ("claude-fable-5"), an API display name ("Fable") and a statusline
+# label all land on the same key.
+MODEL_FAMILIES = ("haiku", "sonnet", "opus", "fable")
+OTHER_FAMILY = "other"
+
+
+def model_family(model: str) -> str:
+    """Family bucket for *model*, or OTHER_FAMILY for anything unrecognized.
+
+    Both sides of the per-model week lookup go through this: the accumulation
+    keys on the record's model ID, the render on the quota's display name.
+    Anything outside MODEL_FAMILIES — a local model, a name released after this
+    list — shares one bucket, so a scoped quota named after such a model reads
+    a total that may include others.
+    """
+    m = (model or "").lower()
+    return next((f for f in MODEL_FAMILIES if f in m), OTHER_FAMILY)
+
+
 # Local models (Ollama et al.) use "name:tag" identifiers and have no
 # per-token cost. Claude model IDs never contain a colon — if a paid model
 # ever adopts colon-form IDs, this heuristic must be revisited.
@@ -249,7 +286,7 @@ _FREE_PRICING: Mapping[str, float] = MappingProxyType({
 })
 
 
-@lru_cache(maxsize=None)
+@cache
 def _parse_effective(date_str: str) -> datetime:
     """Parse an effective date string to a timezone-aware datetime.
 
@@ -260,26 +297,64 @@ def _parse_effective(date_str: str) -> datetime:
     seconds in strptime re-parsing the same dozen strings.
     """
     if "T" in date_str:
-        return datetime.strptime(date_str, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
-    return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return datetime.strptime(date_str, "%Y-%m-%dT%H").replace(tzinfo=UTC)
+    return datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC)
+
+
+_PERIOD_INDEX: tuple[tuple[datetime, ...], tuple[int, ...]] | None = None
+
+
+def _period_index() -> tuple[tuple[datetime, ...], tuple[int, ...]]:
+    """PRICING_HISTORY's effective dates in order, and the periods they belong to.
+
+    Built on first pricing lookup rather than at import: a fast render imports
+    this module and prices nothing.
+
+    Sorted rather than assumed sorted — the table is maintained in chronological
+    order, but bisecting one that an edit left out of order would price against
+    the wrong period silently, where the old reverse walk only ever picked a
+    later match.
+    """
+    global _PERIOD_INDEX
+    if _PERIOD_INDEX is None:
+        order = sorted(
+            range(len(PRICING_HISTORY)),
+            key=lambda i: _parse_effective(PRICING_HISTORY[i]["effective"]),
+        )
+        starts = tuple(_parse_effective(PRICING_HISTORY[i]["effective"]) for i in order)
+        _PERIOD_INDEX = (starts, tuple(order))
+    return _PERIOD_INDEX
 
 
 def find_pricing(model: str, ts: datetime | None = None) -> Mapping[str, float] | None:
     """Find pricing for a model at a given timestamp.
 
-    Walks PRICING_HISTORY in reverse chronological order, returning the first
-    match for a period whose effective date is <= *ts*.
+    Bisects the effective dates for how many periods were in effect at *ts*,
+    then resolves the model against that prefix — a lookup cached on the pair,
+    since a corpus of records prices against a handful of models and eleven
+    periods however many records it holds (macsetup-16c7).
     """
     resolved = MODEL_ALIASES.get(model, model)
 
     if ":" in resolved:
         return _FREE_PRICING
 
-    for period in reversed(PRICING_HISTORY):
-        effective = _parse_effective(period["effective"])
-        if ts is not None and effective > ts:
-            continue
-        models = period["models"]
+    starts, _ = _period_index()
+    periods = len(starts) if ts is None else bisect_right(starts, ts)
+    return _pricing_in_effect(resolved, periods)
+
+
+@cache
+def _pricing_in_effect(resolved: str, periods: int) -> Mapping[str, float] | None:
+    """Prices from the newest of the first *periods* pricing periods naming *resolved*.
+
+    Matched exactly, then as a substring either way: the table keys some models
+    by dated ID and some by family, and a record's model ID carries whichever
+    suffix the API sent.
+    """
+    _, order = _period_index()
+    for i in reversed(order[:periods]):
+        models = PRICING_HISTORY[i]["models"]
         if resolved in models:
             return models[resolved]
         for key, prices in models.items():
@@ -394,6 +469,12 @@ def _bucket_rolling_cost(
                 proj_totals[w.name] = proj_totals.get(w.name, 0.0) + cost
 
 
+def _add_model_costs(totals: dict[str, float], part: Mapping[str, float]) -> None:
+    """Fold one file's or one record set's per-family week costs into *totals*."""
+    for fam, cost in part.items():
+        totals[fam] = totals.get(fam, 0.0) + cost
+
+
 def extract_assistant_fields(
     rec: dict,
 ) -> tuple[dict, dict, str, str, str | None, datetime] | None:
@@ -423,7 +504,7 @@ def extract_assistant_fields(
     try:
         ts = datetime.fromisoformat(ts_str)
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.replace(tzinfo=UTC)
     except (ValueError, TypeError):
         return None
 
@@ -565,6 +646,8 @@ def project_scope(cwd: str, projects_dirs: list[Path]) -> ProjectScope:
     cache that cannot be read degrades to the unmerged scope, which is what
     every render did before merges existed.
     """
+    from project_identity import build_override_fn, name_for_cwd
+
     own = project_path_prefixes(cwd, projects_dirs)
     unmerged = ProjectScope(name_for_cwd(cwd), own)
     try:
@@ -627,7 +710,7 @@ def _cache_scope(cwd: str, name: str, prefixes: list[str]) -> None:
         from cache_db import save_project_scope
 
         save_project_scope(cwd, name, prefixes)
-    except Exception:  # noqa: BLE001, S110
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -653,124 +736,356 @@ def _find_session_files(
     return files
 
 
+def _line_cost(
+    line: bytes,
+    seen_keys: set[str],
+) -> tuple[float, datetime, str | None, str] | None:
+    """(cost, timestamp, dedup_key, model) for one JSONL line, or None to skip it.
+
+    Skipped: anything that is not a well-formed assistant record, and any record
+    whose dedup_identity is already in *seen_keys* — which this adds to, so one
+    logged message counts once however many files or appended chunks carry it.
+
+    Only the log's own dedup key is returned: the fallback identity is a
+    read-time device, and callers persist what they get as durable dedup keys.
+    """
+    if b'"assistant"' not in line:
+        return None
+    try:
+        rec = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+    fields = extract_assistant_fields(rec)
+    if fields is None:
+        return None
+    msg, usage, mid, _rid, dk, ts = fields
+
+    tokens = (
+        usage.get("input_tokens") or 0,
+        usage.get("output_tokens") or 0,
+        usage.get("cache_creation_input_tokens") or 0,
+        usage.get("cache_read_input_tokens") or 0,
+    )
+    model = msg.get("model") or ""
+    key = dedup_identity(
+        dk, mid, rec.get("sessionId") or "", ts.timestamp(), model, tokens,
+    )
+    if key is not None:
+        if key in seen_keys:
+            return None
+        seen_keys.add(key)
+
+    return calc_cost(*tokens, model, ts), ts, dk, model
+
+
 def _iter_jsonl_costs(
     path: str | Path,
     seen_keys: set[str],
-) -> Iterator[tuple[float, datetime, str | None]]:
-    """Yield (cost, timestamp, dedup_key) for each unique assistant record.
+) -> Iterator[tuple[float, datetime, str | None, str]]:
+    """Yield (cost, timestamp, dedup_key, model) for each unique assistant record.
 
     Deduplicates via *seen_keys* (modified in-place), by dedup_identity — so a
     record whose log carried no message id or requestId is still matched
     against its twin, on tokens and timestamp.
 
-    Only the log's own dedup key is yielded: the fallback identity is a
-    read-time device, and the caller persists what it gets as the file's
-    durable dedup keys.
+    Read as bytes so this and the session scanner, which needs byte offsets to
+    resume at, split lines identically.
     """
     try:
-        with open(path) as f:
+        with open(path, "rb") as f:
             for line in f:
-                if '"assistant"' not in line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                fields = extract_assistant_fields(rec)
-                if fields is None:
-                    continue
-                msg, usage, mid, _rid, dk, ts = fields
-
-                tokens = (
-                    usage.get("input_tokens") or 0,
-                    usage.get("output_tokens") or 0,
-                    usage.get("cache_creation_input_tokens") or 0,
-                    usage.get("cache_read_input_tokens") or 0,
-                )
-                model = msg.get("model") or ""
-                key = dedup_identity(
-                    dk, mid, rec.get("sessionId") or "",
-                    ts.timestamp(), model, tokens,
-                )
-                if key is not None:
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-
-                cost = calc_cost(*tokens, model, ts)
-                yield cost, ts, dk
-    except (OSError, UnicodeDecodeError):
+                got = _line_cost(line, seen_keys)
+                if got is not None:
+                    yield got
+    except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Session cost — incremental over appended bytes (macsetup-31g6)
+# ---------------------------------------------------------------------------
+
+# How much of the already-counted bytes is re-read to prove a file was appended
+# to rather than rewritten in place. Enough to span the end of the last record
+# counted, which is the part a rewrite changes first.
+_TAIL_BYTES = 256
+
+_SESSION_STATE_VERSION = 2
+
+
+def _digest(data: bytes) -> str:
+    """A short stable digest. Neither caller is a security boundary.
+
+    hashlib is imported here rather than at module scope: it pulls in OpenSSL
+    bindings, and a render that reads a cached session cost hashes nothing.
+    """
+    from hashlib import blake2b
+
+    return blake2b(data, digest_size=8).hexdigest()
+
+
+class _DigestKeys(set):
+    """A dedup-key set holding an 8-byte digest of every key put into it.
+
+    The session cache persists this set between renders — one entry per logged
+    message — so it stores what is only ever compared for equality at its
+    smallest: 16 hex characters against the ~60 bytes of a message-id/request-id
+    pair, or rather more for a content fallback key. Iteration yields the
+    digests, which is what the stored blob holds and what `load` takes back.
+    """
+
+    @classmethod
+    def load(cls, digests: list[str]) -> _DigestKeys:
+        keys = cls()
+        set.update(keys, digests)
+        return keys
+
+    def add(self, key: str) -> None:
+        super().add(_digest(key.encode()))
+
+    def __contains__(self, key: object) -> bool:
+        return super().__contains__(_digest(str(key).encode()))
+
+
+class _FileCursor(NamedTuple):
+    """How much of one session file the stored session cost already accounts for.
+
+    *tail* digests the last _TAIL_BYTES before *offset*; *mtime_ns* and *size*
+    are the cheap "nothing moved" test that avoids opening the file at all.
+    """
+
+    mtime_ns: int
+    size: int
+    offset: int
+    tail: str
+
+
+class _SessionCostState(NamedTuple):
+    """A session's accumulated cost and everything needed to extend it."""
+
+    files: dict[str, _FileCursor]
+    cost: float
+    keys: _DigestKeys
+
+
+def _encode_session_state(state: _SessionCostState) -> str:
+    """Serialise the cursors and dedup keys into the fingerprint column.
+
+    The column is opaque TEXT to cache_db, so the state rides in it as one JSON
+    blob rather than needing a schema of its own. The cost is not in here — it
+    has a column already, and one home keeps the two from disagreeing.
+
+    The keys go out in set order. Sorting them would make the blob reproducible
+    and nothing reads it that way, at a per-render cost that grows with the
+    session.
+    """
+    return json.dumps(
+        {
+            "v": _SESSION_STATE_VERSION,
+            "f": {p: list(c) for p, c in state.files.items()},
+            "k": list(state.keys),
+        },
+        separators=(",", ":"),
+    )
+
+
+def _decode_session_state(blob: str, cost: float) -> _SessionCostState | None:
+    """Parse a stored fingerprint, or None for one this build cannot extend.
+
+    None covers the pre-incremental md5 fingerprint as much as a truncated or
+    future-version blob: the caller then reparses in full and stores the current
+    format, so a migration costs one render.
+    """
+    try:
+        data = json.loads(blob)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("v") != _SESSION_STATE_VERSION:
+        return None
+    try:
+        files = {
+            str(path): _FileCursor(int(c[0]), int(c[1]), int(c[2]), str(c[3]))
+            for path, c in data["f"].items()
+        }
+        keys = _DigestKeys.load([str(k) for k in data["k"]])
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+    return _SessionCostState(files, cost, keys)
+
+
+def _tail_digest(f: BinaryIO, offset: int) -> str:
+    """Digest the bytes just before *offset*, empty for the start of a file."""
+    if not offset:
+        return ""
+    start = max(0, offset - _TAIL_BYTES)
+    f.seek(start)
+    return _digest(f.read(offset - start))
+
+
+def _scan_session_file(
+    path: str,
+    seen_keys: set[str],
+    cursor: _FileCursor | None,
+) -> tuple[float, int, str] | None:
+    """Cost of the records after *cursor*, with the offset and tail it reached.
+
+    None when the file cannot be read, or cannot be resumed: the bytes before
+    the cursor's offset are re-digested first, so a log rewritten in place fails
+    the check and has to be counted from the start again. That check covers the
+    last record only — an edit further back in a file whose size never changed
+    would be missed, which no Claude Code writer does.
+
+    Only whole lines move the offset. A writer caught mid-append leaves a
+    partial last line, and the next render sees it complete.
+    """
+    offset = cursor.offset if cursor else 0
+    try:
+        with open(path, "rb") as f:
+            if offset:
+                if _tail_digest(f, offset) != cursor.tail:  # type: ignore[union-attr]
+                    return None
+                f.seek(offset)
+            total = 0.0
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break
+                offset += len(raw)
+                got = _line_cost(raw, seen_keys)
+                if got is not None:
+                    total += got[0]
+            return total, offset, _tail_digest(f, offset)
+    except OSError:
+        return None
+
+
+def _resume_session_cost(
+    stats: dict[str, tuple[int, int]],
+    state: _SessionCostState,
+) -> _SessionCostState | None:
+    """Extend *state* with what has been appended to the session since it was written.
+
+    Returns *state* itself when no file moved. Returns None when the stored
+    total cannot be extended — a counted file gone, truncated, or rewritten —
+    because one file's share of a single accumulated number is not separable
+    from it. A file that has appeared since is only added, so it needs none of
+    that.
+    """
+    if set(state.files) - set(stats):
+        return None
+
+    files = dict(state.files)
+    total = state.cost
+    changed = False
+    for path, (mtime_ns, size) in stats.items():
+        cursor = files.get(path)
+        if cursor is not None:
+            if cursor.mtime_ns == mtime_ns and cursor.size == size:
+                continue
+            if size < cursor.offset:
+                return None
+        scanned = _scan_session_file(path, state.keys, cursor)
+        if scanned is None:
+            if cursor is not None:
+                return None
+            # A file that has never been counted and cannot be read now: leave
+            # it out and let a later render pick it up whole.
+            continue
+        cost, offset, tail = scanned
+        total += cost
+        files[path] = _FileCursor(mtime_ns, size, offset, tail)
+        changed = True
+
+    return _SessionCostState(files, total, state.keys) if changed else state
+
+
+def _reparse_session_cost(stats: dict[str, tuple[int, int]]) -> _SessionCostState:
+    """Count every session file from its first byte, discarding any subtotal."""
+    files: dict[str, _FileCursor] = {}
+    keys = _DigestKeys()
+    total = 0.0
+    for path, (mtime_ns, size) in stats.items():
+        scanned = _scan_session_file(path, keys, None)
+        if scanned is None:
+            continue
+        cost, offset, tail = scanned
+        total += cost
+        files[path] = _FileCursor(mtime_ns, size, offset, tail)
+    return _SessionCostState(files, total, keys)
+
+
+def _purged_session_cost(session_id: str, cwd: str) -> float:
+    """Cost of a session whose JSONL files are gone, from cached records.
+
+    Scoped by project path: the loader's predicate is the session id alone, and
+    two projects' sessions can share one (macsetup-2wsk).
+    """
+    try:
+        from cache_db import load_ccreport_records_for_session
+
+        ccr_records_by_file = load_ccreport_records_for_session(session_id)
+        project_prefixes = project_path_prefixes(cwd, _get_projects_dirs())
+        total = 0.0
+        seen: set[str] = set()
+        for fp, recs in ccr_records_by_file.items():
+            if not path_in_project(fp, project_prefixes):
+                continue
+            for rec in recs:
+                if record_is_duplicate(rec, seen):
+                    continue
+                cost = _rec_cost(rec)
+                if cost:
+                    total += cost
+        return total
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def compute_session_cost(session_id: str, cwd: str) -> float:
     """Compute total cost for a single session from its JSONL files.
 
-    Uses a fingerprint-based cache (path+mtime+size) in SQLite to avoid
-    re-parsing unchanged files. Falls back to cached ccreport_records
-    when JSONL files have been purged.
+    Incremental: the cache stores how far into each of the session's files the
+    stored total has counted, so an appended log costs a parse of the appended
+    bytes. Fingerprinting the whole file made every render of a live session
+    reparse it from line 1, and a session's own growth then made that
+    quadratic in its length (macsetup-31g6).
+
+    Falls back to a full reparse whenever the stored total can no longer be
+    trusted as a subtotal, and to cached ccreport_records when the JSONL files
+    have been purged.
     """
-    import hashlib
-
-    from cache_db import read_session_cost, write_session_cost
-
     if not session_id or not cwd:
         return 0.0
 
     files = _find_session_files(session_id, cwd)
     if not files:
-        # JSONL files gone — fall back to cached ccreport records (macsetup-2wsk)
-        # Scope by project path to avoid cross-project misattribution
-        try:
-            from cache_db import load_ccreport_records_for_session
-            # The sid predicate is the loader's, so only the project scoping is
-            # left to do here.
-            ccr_records_by_file = load_ccreport_records_for_session(session_id)
-            project_prefixes = project_path_prefixes(cwd, _get_projects_dirs())
-            total = 0.0
-            seen: set[str] = set()
-            for fp, recs in ccr_records_by_file.items():
-                if not path_in_project(fp, project_prefixes):
-                    continue
-                for rec in recs:
-                    if record_is_duplicate(rec, seen):
-                        continue
-                    cost = _rec_cost(rec)
-                    if cost:
-                        total += cost
-            return total
-        except Exception:  # noqa: BLE001
-            return 0.0
+        return _purged_session_cost(session_id, cwd)
 
-    # Build fingerprint from sorted (path, mtime_ns, size) tuples
-    file_stats: list[tuple[str, int, int]] = []
-    for f in sorted(files):
+    # Sorted, so the dedup order a full reparse applies is the order the
+    # incremental passes built up in.
+    stats: dict[str, tuple[int, int]] = {}
+    for path in sorted(files):
         try:
-            st = Path(f).stat()
-            file_stats.append((f, st.st_mtime_ns, st.st_size))
+            st = Path(path).stat()
         except OSError:
             continue
+        stats[path] = (st.st_mtime_ns, st.st_size)
 
-    if not file_stats:
+    if not stats:
         return 0.0
 
-    fingerprint = hashlib.md5(
-        str(file_stats).encode(), usedforsecurity=False,
-    ).hexdigest()
+    from cache_db import read_session_cost, write_session_cost
 
-    cached = read_session_cost(session_id)
-    if cached is not None and cached[0] == fingerprint:
-        return cached[1]
+    stored = read_session_cost(session_id)
+    state = _decode_session_state(*stored) if stored is not None else None
+    updated = _resume_session_cost(stats, state) if state is not None else None
+    if updated is None:
+        updated = _reparse_session_cost(stats)
+    elif updated is state:
+        return state.cost
 
-    seen_keys: set[str] = set()
-    total_cost = 0.0
-    for path in sorted(files):
-        for cost, _ts, _dk in _iter_jsonl_costs(path, seen_keys):
-            total_cost += cost
-
-    write_session_cost(session_id, fingerprint, total_cost)
-    return total_cost
+    write_session_cost(session_id, _encode_session_state(updated), updated.cost)
+    return updated.cost
 
 
 def _accumulate_orphaned_costs(
@@ -784,18 +1099,30 @@ def _accumulate_orphaned_costs(
     path_prefixes: list[str] | None = None,
     extra_thresholds: dict[str, float] | None = None,
     extra_totals: dict[str, float] | None = None,
+    week_model_totals: dict[str, float] | None = None,
     resolve: Resolver | None = None,
+    all_time: bool = True,
 ) -> None:
     """Accumulate costs from orphaned ccreport records (deleted JSONL files).
 
-    Mutates *totals*, *proj_totals*, and *extra_totals* in place.
-    *extra_thresholds*/*extra_totals* handle non-rolling windows (week, month, session).
+    Mutates *totals*, *proj_totals*, *extra_totals* and *week_model_totals* in
+    place. *extra_thresholds*/*extra_totals* handle non-rolling windows (week,
+    month, session); *week_model_totals* splits the week window by model family.
 
     A record counts toward the project either by the directory it was cached
     under or by *project_name*, which is the cwd's project with any merge rule
     already applied — *resolve* puts the record through the same rules, so both
     sides of the comparison land on the merge target before it is made.
+
+    *all_time* off leaves the untimed bucket alone, for a caller handed only
+    the records inside its widest window: those records' all-time share is in
+    the stored orphan totals (_orphan_alltime_totals), which cover every
+    orphaned record rather than the recent ones, so adding it here too would
+    count it twice.
     """
+    from project_identity import record_project
+
+    week_ts = (extra_thresholds or {}).get("week")
     for fp, recs in ccr_records_by_file.items():
         if fp in live_paths:
             continue
@@ -807,13 +1134,14 @@ def _accumulate_orphaned_costs(
             if not cost:
                 continue
             ts_epoch = rec.get("ts", 0)
-            totals["all_time"] = totals.get("all_time", 0.0) + cost
+            if all_time:
+                totals["all_time"] = totals.get("all_time", 0.0) + cost
             # The path test is what places a record from a project-scoped read;
             # the name is the only handle left on one whose directory is gone.
             is_project = is_ours or bool(
                 project_name and record_project(rec, resolve) == project_name
             )
-            if is_project and proj_totals is not None:
+            if all_time and is_project and proj_totals is not None:
                 proj_totals["all_time"] = proj_totals.get("all_time", 0.0) + cost
             if ts_epoch:
                 _bucket_rolling_cost(cost, ts_epoch, thresholds, totals,
@@ -822,6 +1150,135 @@ def _accumulate_orphaned_costs(
                     for key, thresh in extra_thresholds.items():
                         if ts_epoch >= thresh:
                             extra_totals[key] = extra_totals.get(key, 0.0) + cost
+                if week_model_totals is not None and week_ts and ts_epoch >= week_ts:
+                    fam = model_family(rec.get("model", ""))
+                    week_model_totals[fam] = week_model_totals.get(fam, 0.0) + cost
+
+
+def _orphan_alltime_fingerprint(orphan_paths: set[str]) -> str:
+    """Digest of every input the stored orphan all-time rows froze an answer to.
+
+    Any mismatch rebuilds them, so a part missing here is silently wrong
+    numbers — the same contract as ccreport's rollup fingerprint, and the same
+    two halves: what the DB holds (cache_db.orphan_alltime_stamp) and what
+    prices it. pricing.py is hashed because the rows store a cost, and all but
+    two of ~105k cached records on a real machine carry no stored cost at all
+    — they are priced from their tokens on every read, so a price edit moves
+    the total with no record change to notice.
+
+    The orphan set itself is the third part: a file being purged moves its
+    records from the live half of the corpus to this one, and moves them to
+    the back of the dedup order with it.
+
+    Not in it, deliberately: the override rules. The rows store the raw
+    (project, cwd, repo) identity and _apply_orphan_alltime resolves it per
+    call, so a `ccreport merge` re-groups the same totals without a rebuild.
+    """
+    # hashlib at call time, not import time: this runs at most once per render
+    # and test_importing_pricing_touches_neither_zoneinfo_nor_the_repo_roots_config
+    # holds the module's import cost to what every render actually needs.
+    from hashlib import sha256
+
+    from cache_db import orphan_alltime_stamp
+
+    h = sha256()
+    h.update(orphan_alltime_stamp(orphan_paths).encode())
+    h.update(b"\n")
+    try:
+        h.update(Path(__file__).read_bytes())
+    except OSError:
+        pass  # unreadable source is not a reason to serve a stale total
+    for path in sorted(orphan_paths):
+        h.update(path.encode())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _build_orphan_alltime(
+    orphan_paths: set[str], projects_dirs: list[Path],
+) -> list[tuple[str, str, str, str, float]]:
+    """Sum every orphaned record's cost into (dir_prefix, identity) buckets.
+
+    The one full pass over the orphaned corpus, run only when the fingerprint
+    says the last one no longer describes it. Deliberately self-contained: it
+    dedups the orphaned records against each other and against nothing else,
+    where the live pass that precedes it in compute_costs would have had the
+    first claim on a shared key. Nothing on a real machine is in that state —
+    a message id belongs to one session log — and a stored total cannot depend
+    on which files happened to be on disk the day it was built.
+    """
+    from cache_db import load_ccreport_records_for_paths
+
+    buckets: dict[tuple[str, str, str, str], float] = {}
+    seen_keys: set[str] = set()
+    for fp, recs in load_ccreport_records_for_paths(orphan_paths).items():
+        prefix = _project_dir_prefix(fp, projects_dirs) or ""
+        for rec in recs:
+            if record_is_duplicate(rec, seen_keys):
+                continue
+            cost = _rec_cost(rec)
+            if not cost:
+                continue
+            key = (prefix, rec.get("project") or "",
+                   rec.get("cwd") or "", rec.get("repo") or "")
+            buckets[key] = buckets.get(key, 0.0) + cost
+    return [(*key, cost) for key, cost in buckets.items()]
+
+
+def _orphan_alltime_totals(
+    orphan_paths: set[str], projects_dirs: list[Path],
+) -> list[tuple[str, str, str, str, float]]:
+    """The orphan all-time buckets, from the cache when it still applies.
+
+    Best-effort throughout: every failure returns the empty aggregate, which
+    is what an unreadable record cache already degraded compute_costs to
+    before any of this existed — an all_time total missing its purged history
+    rather than a render that raises.
+    """
+    from cache_db import load_orphan_alltime, save_orphan_alltime
+
+    try:
+        fingerprint = _orphan_alltime_fingerprint(orphan_paths)
+        rows = load_orphan_alltime(fingerprint)
+        if rows:
+            return rows
+        rows = _build_orphan_alltime(orphan_paths, projects_dirs)
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        save_orphan_alltime(rows, fingerprint)
+    except Exception:  # noqa: BLE001
+        pass  # a busy DB costs the next render the same rebuild, not the total
+    return rows
+
+
+def _apply_orphan_alltime(
+    rows: list[tuple[str, str, str, str, float]],
+    totals: dict[str, float],
+    proj_totals: dict[str, float] | None,
+    project_name: str,
+    path_prefixes: list[str] | None,
+    resolve: Resolver | None,
+) -> None:
+    """Fold the stored orphan buckets into the untimed totals.
+
+    The two project tests _accumulate_orphaned_costs runs per record, run here
+    per bucket: the directory prefix a bucket was summed under is exactly what
+    path_in_project compares, and the identity is what record_project resolves.
+    """
+    from project_identity import record_project
+
+    prefixes = path_prefixes or []
+    for dir_prefix, project, cwd, repo, cost in rows:
+        totals["all_time"] = totals.get("all_time", 0.0) + cost
+        if proj_totals is None:
+            continue
+        rec = {"project": project, "cwd": cwd or None, "repo": repo or None}
+        is_project = (bool(dir_prefix) and dir_prefix in prefixes) or bool(
+            project_name and record_project(rec, resolve) == project_name
+        )
+        if is_project:
+            proj_totals["all_time"] = proj_totals.get("all_time", 0.0) + cost
 
 
 def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
@@ -844,9 +1301,11 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
     are computed from.
 
     Records are read-only by design: files written since the last `ccreport`
-    run miss and raw-parse. Making a render write those back would put a second
-    writer on the WAL for a latency win it does not need. The one row a render
-    does write is the resolved scope, once per rule or record change.
+    run miss and raw-parse — bar the one case where somebody else's cache
+    already holds the answer, below. Making a render write records back would
+    put a second writer on the WAL for a latency win it does not need. The one
+    row a render does write is the resolved scope, once per rule or record
+    change.
     """
     if not cwd:
         return {}
@@ -877,28 +1336,50 @@ def compute_project_rolling_costs(cwd: str) -> dict[str, float]:
     # the full raw parse this used to do unconditionally.
     project_ccr: dict[str, list[dict]] = {}
     cached_meta: dict[str, tuple[int, int]] = {}
+    # compute_costs' own per-file totals, for the files this one would
+    # otherwise have to open. Same scoping, same failure posture.
+    file_alltime: dict[str, tuple[int, int, float, list[str]]] = {}
     try:
         from cache_db import (
             load_ccreport_file_meta_under,
             load_ccreport_records_under,
+            load_file_all_time_under,
         )
         for prefix in scope.prefixes:
             project_ccr.update(load_ccreport_records_under(prefix))
             cached_meta.update(load_ccreport_file_meta_under(prefix))
+            file_alltime.update(load_file_all_time_under(prefix))
     except Exception:  # noqa: BLE001
-        project_ccr, cached_meta = {}, {}
+        project_ccr, cached_meta, file_alltime = {}, {}, {}
+
+    oldest_threshold = min(thresholds.values())
 
     for jsonl_path in project_files:
         try:
             st = jsonl_path.stat()
         except OSError:
             continue
-        if cached_meta.get(str(jsonl_path)) != (st.st_mtime_ns, st.st_size):
-            for cost, ts, _dk in _iter_jsonl_costs(jsonl_path, seen_keys):
+        key = str(jsonl_path)
+        if cached_meta.get(key) != (st.st_mtime_ns, st.st_size):
+            # No cached records for this file, so all_time would cost a full
+            # re-read of it — and with the ccreport cache unreadable that is
+            # every file in the project, however far back it goes. A file last
+            # written before the widest window opened can only reach all_time,
+            # which compute_costs has already summed per file and keyed by the
+            # same (mtime_ns, size) (macsetup-3rm3). A record cannot postdate
+            # the write that appended it, which is the same reading of mtime
+            # compute_costs' own in_rolling_window test makes.
+            stored = file_alltime.get(key)
+            if (st.st_mtime < oldest_threshold and stored is not None
+                    and stored[:2] == (st.st_mtime_ns, st.st_size)):
+                totals["all_time"] = totals.get("all_time", 0.0) + stored[2]
+                seen_keys.update(stored[3])
+                continue
+            for cost, ts, _dk, _model in _iter_jsonl_costs(jsonl_path, seen_keys):
                 totals["all_time"] = totals.get("all_time", 0.0) + cost
                 _bucket_rolling_cost(cost, ts.timestamp(), thresholds, totals)
             continue
-        for rec in project_ccr.get(str(jsonl_path), ()):
+        for rec in project_ccr.get(key, ()):
             if record_is_duplicate(rec, seen_keys):
                 continue
             # Recomputed from the record's own tokens, never its stored cost:
@@ -993,7 +1474,7 @@ def _rec_cost_from_tokens(rec: dict) -> float:
     ts_dt = None
     if ts_epoch:
         try:
-            ts_dt = datetime.fromtimestamp(ts_epoch, tz=timezone.utc)
+            ts_dt = datetime.fromtimestamp(ts_epoch, tz=UTC)
         except (ValueError, OSError):
             pass
     return calc_cost(t[0], t[1], t[2], t[3], rec.get("model", ""), ts_dt)
@@ -1009,6 +1490,7 @@ def _rec_cost(rec: dict) -> float:
 
 class _FileContext(NamedTuple):
     """Immutable per-file facts used by compute_costs helpers."""
+
     key: str
     is_session_file: bool
     is_project_file: bool
@@ -1020,20 +1502,24 @@ class _FileContext(NamedTuple):
 
 class _CacheResult(NamedTuple):
     """Return type for _try_cached_file — contributions from a cache hit."""
+
     week: float
     month: float
     session: float
     session_window: float
+    week_model: dict[str, float]
     entry: dict[str, Any]
 
 
 class _ScanResult(NamedTuple):
     """Return type for _scan_jsonl_file — raw totals from parsing JSONL."""
+
     week_cost: float
     month_cost: float
     session_cost: float
     sw_cost: float
     all_time_cost: float
+    week_model_costs: dict[str, float]
     file_rolling: dict[str, float]
     dedup_keys: list[str]
 
@@ -1069,6 +1555,7 @@ def _try_cached_file(
             month=cached_entry.get("month_cost", 0.0),
             session=cached_entry.get("session_cost", 0.0) if ctx.is_session_file else 0.0,
             session_window=0.0,
+            week_model=cached_entry.get("week_model_costs", {}),
             entry=cached_entry,
         )
 
@@ -1105,6 +1592,7 @@ def _try_cached_file(
         month=cached_entry.get("month_cost", 0.0),
         session=session,
         session_window=sw,
+        week_model=cached_entry.get("week_model_costs", {}),
         entry=cached_entry,
     )
 
@@ -1127,10 +1615,11 @@ def _scan_jsonl_file(
     sw_cost = 0.0
     m_cost = 0.0
     a_cost = 0.0
+    w_by_model: dict[str, float] = {}
     file_rolling: dict[str, float] = {}
     file_dedup_keys: list[str] = []
 
-    for cost, ts, dk in _iter_jsonl_costs(jsonl_path, seen_keys):
+    for cost, ts, dk, model in _iter_jsonl_costs(jsonl_path, seen_keys):
         if dk:
             file_dedup_keys.append(dk)
         a_cost += cost
@@ -1138,6 +1627,8 @@ def _scan_jsonl_file(
             m_cost += cost
         if ts >= week_window_start:
             w_cost += cost
+            fam = model_family(model)
+            w_by_model[fam] = w_by_model.get(fam, 0.0) + cost
         _bucket_rolling_cost(cost, ts.timestamp(), thresholds, file_rolling)
         if is_session_file:
             s_cost += cost
@@ -1150,6 +1641,7 @@ def _scan_jsonl_file(
         session_cost=s_cost,
         sw_cost=sw_cost,
         all_time_cost=a_cost,
+        week_model_costs=w_by_model,
         file_rolling=file_rolling,
         dedup_keys=file_dedup_keys,
     )
@@ -1160,7 +1652,7 @@ def compute_costs(
     cwd: str | None = None,
     session_reset_iso: str | None = None,
     week_reset_iso: str | None = None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """Compute per-chat, session-window, week-window, and rolling costs.
 
     Uses ccreport_records cache when available (fast path, ~0.7s) with
@@ -1173,6 +1665,8 @@ def compute_costs(
                               rate-limit session window (~5 h)
       week_cost             – cost across ALL chats within the current
                               rate-limit week window
+      week_model_costs      – that week total split by model family, which is
+                              what a per-model weekly quota is spent against
       month_cost            – cost since first of current calendar month
       six_hour_cost         – rolling 6-hour cost
       twelve_hour_cost      – rolling 12-hour cost
@@ -1183,10 +1677,18 @@ def compute_costs(
 
     session_cost, week_cost, and month_cost use per-file caching (mtime/size).
     session_window_cost and rolling costs are computed fresh.
+
+    Every window above is bounded, so the cached records this reads are too:
+    one window's worth, not the whole table. all_time is the exception it is
+    worth reading the rest of this function for — it has no cutoff to be
+    bounded by, and its two halves are pre-summed elsewhere instead. Live
+    files' shares sit in file_costs, keyed by (mtime_ns, size); purged files'
+    in ccreport_orphan_costs, keyed by a fingerprint over the orphan set.
     """
     from cache_db import (
-        bulk_load_ccreport_cache,
         bulk_save_file_costs,
+        load_ccreport_file_meta,
+        load_ccreport_records_since,
         load_cost_cache,
     )
 
@@ -1216,13 +1718,11 @@ def compute_costs(
     if cwd:
         scope = project_scope(cwd, projects_dirs)
 
-    # Bulk-load ccreport cache for fast rolling cost computation
-    ccr_file_meta, ccr_records_by_file = bulk_load_ccreport_cache()
-
     week_total = 0.0
     session_total = 0.0
     sw_total = 0.0
     month_total = 0.0
+    week_model_totals: dict[str, float] = {}
     rolling_totals: dict[str, float] = {}
     rolling_proj: dict[str, float] = {}
     seen_keys: set[str] = set()
@@ -1236,6 +1736,21 @@ def compute_costs(
     mw_ts = month_window_start.timestamp()
     ww_ts = week_window_start.timestamp()
     td_ts = thresholds["thirty_day"]
+
+    # The start of the widest window any bucket below is filled from. Every
+    # cached record older than this reaches exactly one total, all_time, and
+    # that one is answered per file (file_costs.all_time_cost) or per orphan
+    # bucket (ccreport_orphan_costs) — so reading those rows back would be
+    # ~86k of the ~105k on a real machine deserialized to be skipped
+    # (macsetup-3rm3). Not simply thirty_day: the month window is the wider of
+    # the two for the last day of a 31-day month, since it starts at midnight
+    # and the rolling one trails `now` by the time of day.
+    record_cutoff = min(td_ts, mw_ts, ww_ts, sw_ts if sw_ts is not None else td_ts)
+
+    # Both halves of the ccreport cache, each read at its own grain: the
+    # fingerprints for every cached file, the records for one window's worth.
+    ccr_file_meta = load_ccreport_file_meta()
+    ccr_records_by_file = load_ccreport_records_since(record_cutoff)
 
     # Every JSONL still on disk, across all projects: this function owes a
     # global total as well as the project's, so its walk is the whole corpus.
@@ -1283,6 +1798,7 @@ def compute_costs(
                 month_total += hit.month
                 session_total += hit.session
                 sw_total += hit.session_window
+                _add_model_costs(week_model_totals, hit.week_model)
                 new_entries[key] = hit.entry
                 continue
 
@@ -1293,10 +1809,12 @@ def compute_costs(
             )
 
             if ctx.file_unchanged:
-                assert cached_entry is not None  # file_unchanged implies cache hit
+                assert cached_entry is not None  # noqa: S101 - file_unchanged implies cache hit
                 # Reuse cached summary for week/month/all_time/session
                 week_total += cached_entry.get("week_cost", 0.0)
                 month_total += cached_entry.get("month_cost", 0.0)
+                _add_model_costs(
+                    week_model_totals, cached_entry.get("week_model_costs", {}))
                 c = cached_entry.get("all_time_cost", 0.0)
                 rolling_totals["all_time"] = rolling_totals.get("all_time", 0.0) + c
                 if ctx.is_project_file:
@@ -1311,6 +1829,9 @@ def compute_costs(
                     "week_cost": round(scan.week_cost, 6),
                     "month_cost": round(scan.month_cost, 6),
                     "all_time_cost": round(scan.all_time_cost, 6),
+                    "week_model_costs": {
+                        fam: round(c, 6) for fam, c in scan.week_model_costs.items()
+                    },
                     "dedup_keys": scan.dedup_keys,
                 }
                 if ctx.is_session_file:
@@ -1318,6 +1839,7 @@ def compute_costs(
                 new_entries[key] = entry
                 week_total += scan.week_cost
                 month_total += scan.month_cost
+                _add_model_costs(week_model_totals, scan.week_model_costs)
                 rolling_totals["all_time"] = rolling_totals.get("all_time", 0.0) + scan.all_time_cost
                 if ctx.is_project_file:
                     rolling_proj["all_time"] = rolling_proj.get("all_time", 0.0) + scan.all_time_cost
@@ -1343,7 +1865,11 @@ def compute_costs(
         except OSError:
             pass
 
-    # Include orphaned records (from deleted JSONL files cached by ccreport)
+    # Include orphaned records (from deleted JSONL files cached by ccreport).
+    # In two parts, because the two halves of an orphaned record's contribution
+    # are bounded differently: the windowed buckets come from the records this
+    # call actually read, and all_time from a stored sum over every orphaned
+    # record there has ever been.
     extra_thresholds = {"month": mw_ts, "week": ww_ts}
     if sw_ts:
         extra_thresholds["session_window"] = sw_ts
@@ -1353,16 +1879,25 @@ def compute_costs(
         rolling_totals, rolling_proj, scope.name,
         path_prefixes=scope.prefixes,
         extra_thresholds=extra_thresholds, extra_totals=extra_totals,
+        week_model_totals=week_model_totals,
         resolve=scope.resolve,
+        all_time=False,
+    )
+    _apply_orphan_alltime(
+        _orphan_alltime_totals(set(ccr_file_meta) - corpus_live_paths, projects_dirs),
+        rolling_totals, rolling_proj, scope.name, scope.prefixes, scope.resolve,
     )
     month_total += extra_totals.get("month", 0.0)
     week_total += extra_totals.get("week", 0.0)
     sw_total += extra_totals.get("session_window", 0.0)
 
-    result = {
+    result: dict[str, Any] = {
         "session_cost": round(session_total, 4),
         "week_cost": round(week_total, 4),
         "month_cost": round(month_total, 4),
+        "week_model_costs": {
+            fam: round(c, 4) for fam, c in week_model_totals.items()
+        },
     }
     if session_window_start is not None:
         # Omitted, not zeroed, without a reset time: callers merge this dict over

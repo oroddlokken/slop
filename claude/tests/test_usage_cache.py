@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -17,11 +17,11 @@ import cache_db
 
 def _iso(offset_s: float = 0.0) -> str:
     return datetime.fromtimestamp(
-        time.time() + offset_s, tz=timezone.utc,
+        time.time() + offset_s, tz=UTC,
     ).astimezone().isoformat()
 
 
-@pytest.fixture()
+@pytest.fixture
 def blocking_writer():
     """A second connection holding the one WAL writer slot via BEGIN IMMEDIATE."""
     cache_db.get_connection()  # create and bootstrap the file first

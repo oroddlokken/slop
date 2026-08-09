@@ -29,7 +29,7 @@ This skill reviews the *rendered layer*. Every heading, hint, tooltip, button la
 
 ## Rules
 
-- **Ask the user for launch strategy** (Sequential or 1+Parallel). Default to Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
+- **Ask the user for mode (Step 1) and launch strategy** (Sequential or 1+Parallel). Recommend Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
 - **The orchestrator extracts the string inventory once and passes it to all agents** — agents do NOT scan independently. The inventory reproduces strings verbatim with file:line; it does not reproduce whole templates.
 - **Agents inherit the default model** — do not override with a specific model.
 - **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
@@ -45,7 +45,7 @@ Ask the user which mode they want:
 - **Quick** — Run 5 high-signal reviewers (contradicts-view, reassurance, self-justification, widget-narration, scaffold-filler), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
-If the user does not specify a mode, run Full mode automatically.
+Skip the question only when the user's invocation already named a mode (e.g. "run string-cop quick" → Quick). A bare `/string-cop` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
 
 ### Severity Definitions (all reviewers)
 
@@ -180,7 +180,7 @@ Use the agent template (`agent.md`). The template places shared content (string 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. Spreads token spend across the run instead of bursting it against the 5-hour quota. Slowest.
 - **1+Parallel** — Launch one agent, then the remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Same cost as Sequential, much faster.
 
-If the user doesn't specify, use **Sequential**.
+Skip the question only when the user's invocation already named a strategy; otherwise ask and wait for the answer, recommending **Sequential**.
 
 **Prompt caching** — Agents do not share cached prompt content with each other. Measured over a 16-agent run (2026-08-04): every agent read back the same ~7K tokens of system prompt and tool definitions, then created everything else fresh — including a byte-identical 11K-token snapshot, once per agent.
 

@@ -25,19 +25,25 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
   CLAUDE_STATUSLINE_HOSTNAME                — green hostname (default 0)
   CLAUDE_STATUSLINE_DIR                     — blue project directory
   CLAUDE_STATUSLINE_SANDBOX                 — sbx/!sbx badge from merged Claude settings
-  CLAUDE_STATUSLINE_DSP                     — orange DSP marker when started with --dangerously-skip-permissions
+  CLAUDE_STATUSLINE_DSP                     — orange DSP marker when started with
+                                              --dangerously-skip-permissions
   CLAUDE_STATUSLINE_GIT                     — branch + indicators
     CLAUDE_STATUSLINE_GIT_DIFFSTAT          — working-tree +N-N inside the git indicators
   CLAUDE_STATUSLINE_DOGCAT                  — dcat issue tracker counts
   CLAUDE_STATUSLINE_CHANGES                 — cumulative lines added/removed (entire invocation) (default 0)
-  CLAUDE_STATUSLINE_RENDER_TIME             — how long this render took (0.235s) (default 0)
+  CLAUDE_STATUSLINE_RENDER_TIME             — how long this render took, in-process
+                                              and, when the wrapper exports
+                                              CLAUDE_STATUSLINE_TOTAL_TOKEN, the whole
+                                              Python invocation as timed by bash
+                                              (0.001s/0.046s) (default 0)
   CLAUDE_STATUSLINE_SESSION                 — model, context window %
     CLAUDE_STATUSLINE_COST                  — session cost
     CLAUDE_STATUSLINE_CACHE_HIT             — cache hit rate % (default 0)
-    CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as (xhigh); folded into MODEL_BANNER when that is on
+    CLAUDE_STATUSLINE_EFFORT                — reasoning effort level, as (xhigh); folded
+                                              into MODEL_BANNER when that is on
     CLAUDE_STATUSLINE_THINKING              — nothink marker when thinking is off
-  CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on the usable window (nominal minus the ~33k auto-compact reserve)
-  CLAUDE_STATUSLINE_APPLE_SILICON            — macmon temps/power (requires macmon) (default 0)
+  CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on the usable window (nominal
+                                               minus the ~33k auto-compact reserve)
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset) (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min (default 0)
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
@@ -65,7 +71,9 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
 
 Other environment variables:
   CLAUDE_CODE_PACE_DAYS                     — pace window in days (1-7, default 7)
-  CF_BADGE                                  — badge text after the model name, rendered cyan (set to CF/CO by the cf/co wrappers; legacy "1" reads as CF)
+  CF_BADGE                                  — badge text after the model name, rendered cyan
+                                              (set to CF/CO by the cf/co wrappers; legacy
+                                              "1" reads as CF)
 """
 
 from __future__ import annotations
@@ -74,30 +82,28 @@ import json
 import math
 import os
 import re
-import socket
-import sqlite3
-import subprocess
 import sys
 import time
-from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
-# pricing.py and cache_db.py live in the same directory
+if TYPE_CHECKING:
+    import subprocess
+
+    from cache_db import RateLimitSample
+
+# socket, sqlite3 and subprocess are imported inside the functions that use
+# them, for the same reason cache_db is below: none of them is reachable from a
+# fast-path render, and `import sqlite3` alone dlopens _sqlite3 and executes
+# dbapi2 — which would defeat the lazy cache_db import outright.
+
+# pricing.py and cache_db.py live in the same directory. cache_db (and with it
+# sqlite3's machinery) is imported lazily, inside the functions that touch the
+# database: a fast-path render (_load_fetched hit) reads no database at all,
+# and the import is a measurable slice of its runtime. pricing stays eager —
+# rendering the usage line needs it on every path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cache_db import (
-    RateLimitSample,
-    accumulate_cache_stats,
-    check_fetch_backoff,
-    compute_extra_window_deltas,
-    is_fetch_blocked,
-    read_cost_summary,
-    read_usage_stale,
-    record_account_event,
-    record_rate_limit_snapshots,
-    usage_is_fresh,
-)
 from pricing import (
     ROLLING_WINDOWS,
     SESSION_WINDOW_S,
@@ -105,6 +111,7 @@ from pricing import (
     compute_costs,
     compute_project_rolling_costs,
     compute_session_cost,
+    model_family,
     rolling_cost_keys,
     window_start_epoch,
 )
@@ -112,8 +119,6 @@ from pricing import (
 # --- Config ---
 
 # Thresholds and layout constants
-TEMP_WARN_C = 75           # °C — yellow warning for CPU/GPU temp
-TEMP_CRIT_C = 90           # °C — red alert for CPU/GPU temp
 BATT_WARN_PCT = 40         # % — yellow warning when discharging
 BATT_CRIT_PCT = 20         # % — red alert when discharging
 STALE_THRESHOLD_S = 3600   # seconds before usage data is considered too old
@@ -122,6 +127,7 @@ USAGE_FETCH_INTERVAL_S = 600    # normal cadence when the API is actually needed
 USAGE_HEARTBEAT_S = 3600   # ceiling on API staleness when nothing needs it now
 NEAR_THRESHOLD_MARGIN = 10  # % below a display threshold that still warrants fetching
 COST_SUMMARY_MAX_AGE = 900  # seconds the cached compute_costs() result stays usable
+FAST_TTL_S = 15            # seconds a render may reuse the previous render's fetch results
 EXTRA_ACCRUAL_PCT = 90     # session % from which extra credits could start accruing
 LAYOUT_WIDE_COLS = 150     # terminal columns threshold for 2-line layout
 SESSION_WINDOW_MS = 900_000  # 15 min — active sessions lookback
@@ -263,6 +269,8 @@ def _parse_iso_epoch(iso: str) -> float | None:
 
 def _start_git(cwd: str) -> dict[str, subprocess.Popen[bytes]]:
     """Start git commands as non-blocking subprocesses."""
+    import subprocess
+
     procs: dict[str, subprocess.Popen[bytes]] = {}
     if not _on("GIT"):
         return procs
@@ -271,7 +279,13 @@ def _start_git(cwd: str) -> dict[str, subprocess.Popen[bytes]]:
     try:
         procs["status"] = subprocess.Popen([*base, "status", "--porcelain=v1", "-b"], **kw)
         procs["stash"] = subprocess.Popen([*base, "stash", "list"], **kw)
-        procs["diffstat"] = subprocess.Popen([*base, "diff", "--shortstat", "HEAD", "--", ":(top,exclude).dogcats"], **kw)
+        if _on("GIT_DIFFSTAT"):
+            # The costliest of the four — it refreshes the index and diffs every
+            # tracked path — and _render_git drops the result unless this same
+            # toggle is on, so it is spawned only when something will read it.
+            procs["diffstat"] = subprocess.Popen(
+                [*base, "diff", "--shortstat", "HEAD", "--", ":(top,exclude).dogcats"], **kw
+            )
         # rev-parse doesn't need --no-optional-locks
         procs["toplevel"] = subprocess.Popen(
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"], **kw
@@ -297,15 +311,20 @@ def _collect_git(
     procs: dict[str, subprocess.Popen[bytes]],
 ) -> GitInfo:
     """Collect git results into a GitInfo NamedTuple."""
+    import subprocess
+
     if not procs:
         return _EMPTY_GIT
     GIT_TIMEOUT = 5
 
     def _read(name: str) -> str:
+        proc = procs.get(name)
+        if proc is None:
+            return ""
         try:
-            return (procs[name].communicate(timeout=GIT_TIMEOUT)[0] or b"").decode()
+            return (proc.communicate(timeout=GIT_TIMEOUT)[0] or b"").decode()
         except subprocess.TimeoutExpired:
-            procs[name].kill()
+            proc.kill()
             return ""
 
     status_out = _read("status")
@@ -328,93 +347,13 @@ def _collect_git(
     return GitInfo(status_out, stash_out, toplevel, branch, insertions, deletions)
 
 
-# --- Apple Silicon stats (macmon) ---
-
-
-def _start_macmon() -> subprocess.Popen[bytes] | None:
-    """Start macmon pipe as a non-blocking subprocess."""
-    if not _on("APPLE_SILICON", default=False):
-        return None
-    try:
-        return subprocess.Popen(
-            ["macmon", "pipe", "-s", "1"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        return None
-
-
-def _collect_macmon(proc: subprocess.Popen[bytes] | None) -> dict:
-    """Collect macmon JSON output."""
-    if proc is None:
-        return {}
-    try:
-        out, _ = proc.communicate(timeout=5)
-        if out:
-            return json.loads(out.strip())
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
-        proc.kill()
-    return {}
-
-
-def _render_macmon(data: dict) -> str:
-    """Render Apple Silicon temps and power: CPU:53°C/0.8W GPU:49°C/0.1W ANE:0W"""
-    if not data:
-        return ""
-    temp = data.get("temp", {})
-    cpu_t = temp.get("cpu_temp_avg")
-    gpu_t = temp.get("gpu_temp_avg")
-    cpu_w = data.get("cpu_power")
-    gpu_w = data.get("gpu_power")
-    ane_w = data.get("ane_power")
-
-    parts: list[str] = []
-
-    if cpu_t is not None:
-        t = int(cpu_t)
-        # Alert colors only for hot temps; otherwise subdued
-        if t >= TEMP_CRIT_C:
-            val_col = "\033[0;31m"
-        elif t >= TEMP_WARN_C:
-            val_col = "\033[0;33m"
-        else:
-            val_col = SUBDUED
-        w_str = f"/{cpu_w:.1f}W" if cpu_w is not None else ""
-        parts.append(f"{SUBDUED}CPU:{val_col}{t}°C{w_str}{RST}")
-
-    mem = data.get("memory", {})
-    ram_usage = mem.get("ram_usage")
-    ram_total = mem.get("ram_total")
-    if ram_usage is not None and ram_total is not None:
-        used_gb = ram_usage / (1024 ** 3)
-        total_gb = ram_total / (1024 ** 3)
-        parts.append(f"{SUBDUED}RAM:{used_gb:.0f}GB/{total_gb:.0f}GB{RST}")
-
-    if gpu_t is not None:
-        t = int(gpu_t)
-        if t >= TEMP_CRIT_C:
-            val_col = "\033[0;31m"
-        elif t >= TEMP_WARN_C:
-            val_col = "\033[0;33m"
-        else:
-            val_col = SUBDUED
-        w_str = f"/{gpu_w:.1f}W" if gpu_w is not None else ""
-        parts.append(f"{SUBDUED}GPU:{val_col}{t}°C{w_str}{RST}")
-
-    if ane_w is not None and ane_w > 0.05:
-        parts.append(f"{SUBDUED}ANE:{ane_w:.1f}W{RST}")
-
-    if not parts:
-        return ""
-    return " ".join(parts)
-
-
 # --- Battery (pmset) ---
 
 
 def _start_battery() -> subprocess.Popen[bytes] | None:
     """Start pmset battery query as a non-blocking subprocess."""
+    import subprocess
+
     if not _on("BATTERY", default=False):
         return None
     try:
@@ -432,6 +371,8 @@ _BATT_RE = re.compile(r"(\d+)%;\s*([\w ]+?);(?:\s*(\d+:\d+)\s+remaining)?")
 
 def _collect_battery(proc: subprocess.Popen[bytes] | None) -> dict:
     """Parse pmset -g batt output into {pct, state, time}."""
+    import subprocess
+
     if proc is None:
         return {}
     try:
@@ -470,14 +411,20 @@ def _render_battery(batt: dict) -> str:
 # --- Permission mode ---
 
 
-def _start_dsp_check() -> subprocess.Popen[bytes] | None:
+def _start_dsp_check(memoized: bool | None = None) -> subprocess.Popen[bytes] | None:
     """Start ps to walk the ancestor chain for --dangerously-skip-permissions.
 
     Claude Code may spawn the statusline through one or more shells, so the
     immediate parent isn't necessarily the claude binary. ps -Aww gives us
     untruncated args for every process; we walk pid→ppid until we hit init.
+
+    The answer is fixed for the session's lifetime — the ancestor claude's argv
+    was decided at launch — so _fetch_all memoizes it and passes *memoized* on
+    every later render, which is what keeps this off the slow path entirely.
     """
-    if not _on("DSP"):
+    import subprocess
+
+    if memoized is not None or not _on("DSP"):
         return None
     try:
         return subprocess.Popen(
@@ -487,6 +434,9 @@ def _start_dsp_check() -> subprocess.Popen[bytes] | None:
         )
     except (OSError, FileNotFoundError):
         return None
+
+
+DSP_FLAG = "--dangerously-skip-permissions"
 
 
 def _kill(proc: subprocess.Popen[bytes] | None) -> None:
@@ -499,9 +449,16 @@ def _kill(proc: subprocess.Popen[bytes] | None) -> None:
         pass
 
 
-def _collect_dsp(proc: subprocess.Popen[bytes] | None) -> bool:
+def _collect_dsp(proc: subprocess.Popen[bytes] | None) -> bool | None:
+    """Whether an ancestor carries the DSP flag, or None when ps said nothing.
+
+    None is not False: it is what stops _fetch_all memoizing a verdict the walk
+    never actually reached, which would otherwise stick for the whole session.
+    """
+    import subprocess
+
     if proc is None:
-        return False
+        return None
     try:
         out, _ = proc.communicate(timeout=2)
     except (subprocess.TimeoutExpired, OSError):
@@ -509,10 +466,13 @@ def _collect_dsp(proc: subprocess.Popen[bytes] | None) -> bool:
             proc.kill()
         except OSError:
             pass
-        return False
+        return None
     if not out:
-        return False
-    procs: dict[int, tuple[int, str]] = {}
+        return None
+    # Only the flag's presence is kept, not the argv it was found in: the walk
+    # inspects some five of these entries and every retained string is a full
+    # untruncated command line of a process nobody will ask about.
+    procs: dict[int, tuple[int, bool]] = {}
     for line in out.decode("utf-8", errors="replace").splitlines():
         parts = line.strip().split(None, 2)
         if len(parts) < 2:
@@ -522,14 +482,14 @@ def _collect_dsp(proc: subprocess.Popen[bytes] | None) -> bool:
             ppid = int(parts[1])
         except ValueError:
             continue
-        procs[pid] = (ppid, parts[2] if len(parts) > 2 else "")
+        procs[pid] = (ppid, len(parts) > 2 and DSP_FLAG in parts[2])
     cur = os.getppid()
     while cur > 1:
         entry = procs.get(cur)
         if not entry:
             break
-        ppid, args = entry
-        if "--dangerously-skip-permissions" in args:
+        ppid, has_flag = entry
+        if has_flag:
             return True
         cur = ppid
     return False
@@ -586,7 +546,7 @@ def _native_rate_limits(data: dict) -> dict:
             pct = w.get("used_percentage")
             if pct is None:
                 continue
-            out[pct_key] = int(round(float(pct)))
+            out[pct_key] = round(float(pct))
         except (TypeError, ValueError):
             continue
         resets = w.get("resets_at")
@@ -674,22 +634,35 @@ def _refresh_env() -> dict[str, str]:
     return env
 
 
-def _spawn_usage_refresh(session_id: str, cwd: str, usage: dict, *, costs_only: bool) -> None:
-    """Spawn the detached refresh subprocess (survives parent kill)."""
+def _spawn_usage_refresh(
+    session_id: str, cwd: str, usage: dict, *, costs_only: bool,
+    native_rl: dict | None = None,
+) -> None:
+    """Spawn the detached refresh subprocess (survives parent kill).
+
+    Both spawns carry the window bounds, native stdin readings first. The
+    cached row's session_reset can be null right after a rollover — an API
+    response that omits resets_at writes the column as an explicit null — and
+    compute_costs omits session_window_cost when it has no bound, so a refresh
+    told only the cached value re-persists the previous window's total
+    (macsetup-x2aq). A native reset that has already passed is harmless:
+    window_start_epoch reads it as the start of the current window.
+    """
+    import subprocess
+
     script = Path(__file__).resolve().parent / "get_claude_usage.py"
     if not script.exists():
         return
     cmd = [sys.executable, str(script), "--session", session_id, "--cwd", cwd]
     if costs_only:
-        # Pass the native window bounds so session_window_cost is computed
-        # against the real window rather than the cached reset times.
         cmd.append("--costs-only")
-        for flag, key in (("--session-reset", "session_reset"), ("--week-reset", "week_reset")):
-            val = _ustr(usage, key)
-            if val:
-                cmd += [flag, val]
     else:
         cmd += ["--wait-timeout", "4"]
+    rl = native_rl or {}
+    for flag, key in (("--session-reset", "session_reset"), ("--week-reset", "week_reset")):
+        val = _ustr(rl, key) or _ustr(usage, key)
+        if val:
+            cmd += [flag, val]
     try:
         subprocess.Popen(
             cmd,
@@ -726,10 +699,14 @@ def _fetch_usage(
             return _adjust_passed_resets(json.loads(pre), now)
         except json.JSONDecodeError:
             return {}
+    import sqlite3
+
     try:
-        row = read_usage_stale() or {}
-        fresh = usage_is_fresh(row, USAGE_FETCH_INTERVAL_S)
-        blocked = not fresh and is_fetch_blocked()
+        import cache_db
+
+        row = cache_db.read_usage_stale() or {}
+        fresh = cache_db.usage_is_fresh(row, USAGE_FETCH_INTERVAL_S)
+        blocked = not fresh and cache_db.is_fetch_blocked()
     except sqlite3.OperationalError:
         # Only the first-touch schema bootstrap takes a write lock on this
         # path — WAL readers do not block — but a render with no usage data
@@ -744,13 +721,25 @@ def _fetch_usage(
             row["_stale"] = True
         return _adjust_passed_resets(row, now)
     if _api_fetch_needed(row, native_rl, now):
-        _spawn_usage_refresh(session_id, cwd, row, costs_only=False)
+        _spawn_usage_refresh(session_id, cwd, row, costs_only=False, native_rl=native_rl)
     elif cost_summary is None:
         # API data is deliberately left to age; only refresh costs, and only
         # when the summary the render reads has actually expired.
-        _spawn_usage_refresh(session_id, cwd, row, costs_only=True)
+        _spawn_usage_refresh(session_id, cwd, row, costs_only=True, native_rl=native_rl)
     # Return stale data for this render; fresh data will be in cache next call
     return _adjust_passed_resets(row, now)
+
+
+def _check_fetch_backoff() -> bool:
+    """cache_db.check_fetch_backoff behind the lazy import.
+
+    Two render-side call sites consult it, both only on already-degraded lines
+    (stale data, no native S/W) — so the healthy fast path never pays the
+    cache_db import for it.
+    """
+    import cache_db
+
+    return cache_db.check_fetch_backoff()
 
 
 # --- Dcat status ---
@@ -817,7 +806,9 @@ def _accumulate_cache_stats(
     """
     if not session_id:
         return 0, 0, 0
-    return accumulate_cache_stats(
+    import cache_db
+
+    return cache_db.accumulate_cache_stats(
         session_id, total_in_tokens, input_fresh, cache_create, cache_read,
     )
 
@@ -829,7 +820,7 @@ def _accumulate_cache_stats(
 CLAUDE_CONFIG_JSON = Path.home() / ".claude.json"
 
 
-def _capture_account() -> None:
+def _capture_account(memo: dict | None = None) -> None:
     """Note the signed-in account when it differs from the last one recorded.
 
     The render is the capture point because it is the only thing that runs
@@ -838,15 +829,33 @@ def _capture_account() -> None:
     unrecorded here is a switch ccreport can never attribute. cache_db only
     writes on an actual change, so the usual render pays a read and a SELECT.
 
+    ~/.claude.json is a quarter of a megabyte and holds one key this cares
+    about, so *memo* carries the (mtime_ns, size) the last parse saw and an
+    unchanged stamp skips the parse: an account cannot have switched in a file
+    that was not rewritten. The cadence is unchanged, so a /login is still
+    caught within FAST_TTL_S. Pass no memo to force the parse.
+
     Best-effort throughout, like every other bookkeeping write in the render: a
     config that is missing, unreadable, half-written or carrying no
     oauthAccount, and a database held by another writer, all cost the change
     log one sample rather than costing the user their status line.
     """
     try:
+        stamp = None
+        if memo is not None:
+            st = CLAUDE_CONFIG_JSON.stat()
+            stamp = [st.st_mtime_ns, st.st_size]
+            if memo.get("account") == stamp:
+                return
         oauth = json.loads(CLAUDE_CONFIG_JSON.read_bytes()).get("oauthAccount")
         if isinstance(oauth, dict):
-            record_account_event(oauth)
+            import cache_db
+
+            cache_db.record_account_event(oauth)
+        # Only a parse that got all the way through earns the skip; a torn read
+        # or a database held by another writer has to be retried next render.
+        if stamp is not None:
+            memo["account"] = stamp  # type: ignore[index]
     except Exception:  # noqa: BLE001
         pass
 
@@ -877,7 +886,9 @@ def _rl_sample(
         return None
     if resets <= now:
         return None
-    return RateLimitSample(window, used, resets, model, source)
+    import cache_db
+
+    return cache_db.RateLimitSample(window, used, resets, model, source)
 
 
 def _rl_samples(data: dict, usage_data: dict, now: float) -> list[RateLimitSample]:
@@ -940,7 +951,9 @@ def _snapshot_rate_limits(
     try:
         samples = _rl_samples(data, usage_data, now)
         if samples:
-            record_rate_limit_snapshots(samples, now)
+            import cache_db
+
+            cache_db.record_rate_limit_snapshots(samples, now)
     except Exception:  # noqa: BLE001
         pass
 
@@ -971,6 +984,8 @@ def _render_session_id(session_id: str) -> str:
 def _render_hostname() -> str:
     if not _on("HOSTNAME", default=False):
         return ""
+    import socket
+
     return _c("0;32", socket.gethostname().split(".")[0])
 
 
@@ -989,6 +1004,10 @@ def _render_sandbox(cwd: str, toplevel: str) -> str:
 
     Walks local → project → user settings; first file with sandbox.enabled wins.
     Empty when unset everywhere.
+
+    Up to three opens and parses for a value that changes when the user edits a
+    settings file, so it is resolved on the slow path and cached in _Fetched:
+    an edit shows up within FAST_TTL_S rather than on the very next render.
     """
     if not _on("SANDBOX"):
         return ""
@@ -1019,11 +1038,24 @@ def _render_git(
     branch_line = lines[0] if lines else ""
     files = lines[1:] if len(lines) > 1 else []
 
+    # One pass over the porcelain lines for every indicator; each flag below
+    # used to be its own any() over the same list.
+    conflict = staged = renamed = deleted = unstaged = untracked = False
+    for f in files:
+        if not f:
+            continue
+        x, y = f[0], f[1] if len(f) >= 2 else ""
+        if y:
+            # Merge conflicts (UU, AA, DD, AU, UA, DU, UD)
+            conflict = conflict or "U" in (x + y) or (x + y) in ("DD", "AA")
+            unstaged = unstaged or y in "MD"
+        staged = staged or x in "MARCD"
+        renamed = renamed or x == "R"
+        deleted = deleted or x == "D"
+        untracked = untracked or f.startswith("??")
+
     ind = ""
-    # Merge conflicts (UU, AA, DD, AU, UA, DU, UD)
-    if any(
-        len(f) >= 2 and ("U" in f[:2] or f[:2] in ("DD", "AA")) for f in files
-    ):
+    if conflict:
         ind += _c("0;31", "=")
     # Ahead / behind
     ahead = behind = 0
@@ -1042,15 +1074,15 @@ def _render_git(
         ind += _c("0;31", f"⇣{behind}")
     if stash_out:
         ind += _c("0;35", "$")
-    if any(f and f[0] in "MARCD" for f in files):
+    if staged:
         ind += _c("0;32", "+")
-    if any(f and f[0] == "R" for f in files):
+    if renamed:
         ind += _c("0;33", "»")
-    if any(f and f[0] == "D" for f in files):
+    if deleted:
         ind += _c("0;31", "✘")
-    if any(f and len(f) >= 2 and f[1] in "MD" for f in files):
+    if unstaged:
         ind += _c("0;31", "!")
-    if any(f.startswith("??") for f in files):
+    if untracked:
         ind += _c("0;37", "?")
     if (insertions or deletions) and _on("GIT_DIFFSTAT"):
         ind += f'{_c("0;32", f"+{insertions}")}{_c("0;31", f"-{deletions}")}'
@@ -1270,26 +1302,38 @@ def _fmt_money(v: str) -> str:
     return re.sub(r"(\.[^0])0$", r"\1", f)
 
 
+SESSIONS_TAIL_LINES = 100   # history entries the 15-minute window can span
+SESSIONS_TAIL_BYTES = 96 * 1024  # tail read that comfortably holds that many
+
+
 def _render_sessions(cwd: str, now: float) -> str:
-    """Active sessions: distinct projects from history in last 15 min."""
+    """Active sessions: distinct projects from history in last 15 min.
+
+    history.jsonl is append-only and never pruned, so it is seeked into rather
+    than iterated: only the last SESSIONS_TAIL_BYTES are read, and the first
+    line of that read is dropped because a byte offset lands mid-record.
+    """
     if not _on("SESSIONS", default=False):
         return ""
     history = Path.home() / ".claude" / "history.jsonl"
-    if not history.exists():
-        return ""
     try:
         cutoff_ms = int(now * 1000) - SESSION_WINDOW_MS
         projects: set[str] = set()
-        with open(history) as f:
-            for line in deque(f, maxlen=100):
-                try:
-                    entry = json.loads(line)
-                    if entry.get("timestamp", 0) >= cutoff_ms:
-                        proj = entry.get("project", "")
-                        if proj and proj != cwd:
-                            projects.add(proj)
-                except json.JSONDecodeError:
-                    continue
+        with open(history, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - SESSIONS_TAIL_BYTES))
+            lines = f.read().split(b"\n")
+        if size > SESSIONS_TAIL_BYTES:
+            del lines[0]
+        for line in lines[-SESSIONS_TAIL_LINES:]:
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if entry.get("timestamp", 0) >= cutoff_ms:
+                proj = entry.get("project", "")
+                if proj and proj != cwd:
+                    projects.add(proj)
         count = len(projects)
         if count > 0:
             col = "31" if count >= 4 else "33" if count >= 2 else ""
@@ -1303,7 +1347,9 @@ def _render_sessions(cwd: str, now: float) -> str:
 
 def _extra_deltas(current_spent: float, usage: dict, now: float) -> dict[str, float | None]:
     """Compute extra usage deltas for session window (5h) and week (7d)."""
-    return compute_extra_window_deltas(
+    import cache_db
+
+    return cache_db.compute_extra_window_deltas(
         current_spent,
         window_start_epoch(usage.get("session_reset", ""), SESSION_WINDOW_S, now),
         window_start_epoch(usage.get("week_reset", ""), WEEK_WINDOW_S, now),
@@ -1368,6 +1414,20 @@ def _fetch_ttl(usage: dict, now: float) -> str:
     if ttl_s <= 0:
         return ""
     return f"{SUBDUED}TTL:{ttl_s // 60}m{ttl_s % 60}s{RST}"
+
+
+def _scoped_week_cost(usage: dict, scoped_model: str) -> str:
+    """What the model-scoped quota's window has cost, from the week breakdown.
+
+    The scoped limit is a weekly one, so its cost is week_cost narrowed to the
+    family it caps. Empty when the breakdown is missing — a cost summary
+    written before it existed — or carries no such family, and the segment then
+    renders as it did before, percentage and pace alone.
+    """
+    by_family = usage.get("week_model_costs")
+    if not isinstance(by_family, dict):
+        return ""
+    return _ustr(by_family, model_family(scoped_model))
 
 
 def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]:
@@ -1442,7 +1502,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]
                     )
                     scoped_line = _usage_combined(
                         sc_model[:2].title(), sc_pct,
-                        sc_reset, "", now,
+                        sc_reset, _scoped_week_cost(usage, sc_model), now,
                         pace=sc_pace, countdown=not dup_cd,
                     )
                     if scoped_line:
@@ -1467,7 +1527,7 @@ def _render_rate_limits(usage: dict, now: float) -> tuple[list[str], bool, bool]
             elif age_s >= STALE_THRESHOLD_S:
                 rl_inners.clear()
                 have_rate_limits = False
-            elif age_s >= STALE_GRACE_S or check_fetch_backoff():
+            elif age_s >= STALE_GRACE_S or _check_fetch_backoff():
                 # Past the fetch interval is not yet worth a warning here: the
                 # session's first render has no native S/W either, and the
                 # refresh it spawns lands on the next one. Wait for the grace
@@ -1695,17 +1755,27 @@ def _merge_cost_data(
     if usage_data and cost_summary and _on("HISTORIC_COST"):
         for k in (
             # The S/W window costs come from here too, not just the usage
-            # row, so they stay current when the API fetch is skipped.
-            "session_window_cost", "week_cost", *rolling_cost_keys(),
+            # row, so they stay current when the API fetch is skipped. The
+            # per-model week split has no usage column at all — a dict does not
+            # fit one — so this is its only route to the render.
+            "session_window_cost", "week_cost", "week_model_costs",
+            *rolling_cost_keys(),
         ):
             if k in cost_summary:
                 usage_data[k] = cost_summary[k]
-    if cwd and _on("HISTORIC_COST") and usage_data:
+    if cwd and _on("HISTORIC_COST") and usage_data and not any(
+        "project_cost" in k for k in usage_data
+    ):
+        # compute_costs writes the *_project_cost keys, so a cost summary that
+        # already carried them was just merged above and this would be a full
+        # unbounded rescan producing the same numbers. Only a summary that
+        # predates those keys (or a cold start with none) still needs the walk.
         usage_data.update(compute_project_rolling_costs(cwd))
 
 
 class _InputData(NamedTuple):
     """Parsed input fields from Claude status JSON."""
+
     cwd: str
     model: str
     effort: str
@@ -1755,6 +1825,24 @@ def _parse_input(data: dict) -> _InputData:
     )
 
 
+def _render_elapsed(t_start: float) -> str:
+    """The render-time segment: 0.001s in-process / 0.046s measured by bash.
+
+    The second figure is not computed here — no in-process clock can see its
+    own interpreter startup, imports, or exit. Instead the wrapper times the
+    whole Python invocation itself and substitutes the result over a
+    placeholder token. It exports the token via CLAUDE_STATUSLINE_TOTAL_TOKEN,
+    which is also the signal that something downstream will substitute it:
+    unset (direct invocation, old bash) means emitting it would print a
+    literal token, so the segment shows the in-process time alone.
+    """
+    elapsed = f"{time.monotonic() - t_start:.3f}s"
+    token = os.environ.get("CLAUDE_STATUSLINE_TOTAL_TOKEN", "")
+    if token:
+        elapsed += f"/{token}"
+    return f"{SUBDUED}{elapsed}{RST}"
+
+
 def _layout_and_print(
     top: list[str],
     session: str,
@@ -1762,7 +1850,6 @@ def _layout_and_print(
     usage_rl: str,
     usage_cost: str,
     usage_data: dict,
-    macmon_str: str,
     battery_str: str,
     sessions: str,
     now_epoch: float,
@@ -1780,11 +1867,14 @@ def _layout_and_print(
     # the stale:Nm marker inside the line covers the fetched fields instead.
     if usage_data.get("_native_rl"):
         pass
-    elif usage_stale_1h or (not usage_session_rl and (check_fetch_backoff() or usage_data.get("session_percent") is None)):
+    elif usage_stale_1h or (
+        not usage_session_rl
+        and (_check_fetch_backoff() or usage_data.get("session_percent") is None)
+    ):
         if usage_data and usage_data.get("_stale"):
-            usage_session_rl = f"\033[0;33musage stale\033[0m"
+            usage_session_rl = "\033[0;33musage stale\033[0m"
         else:
-            usage_session_rl = f"\033[0;31musage fetch failed\033[0m"
+            usage_session_rl = "\033[0;31musage fetch failed\033[0m"
 
     DOT = f"{SUBDUED} · {RST}"
 
@@ -1793,7 +1883,7 @@ def _layout_and_print(
     # it trails the session segment instead, after ctx. Active session count
     # trails the top line either way.
     if _on("RENDER_TIME", default=False):
-        elapsed = f"{SUBDUED}{time.monotonic() - _t_start:.3f}s{RST}"
+        elapsed = _render_elapsed(_t_start)
         if usage_cost:
             usage_cost = f"{usage_cost}{DOT}{elapsed}"
         elif session:
@@ -1836,12 +1926,304 @@ def _layout_and_print(
         if rest:
             lines.append(DOT.join(rest))
 
-    last_parts = [s for s in (macmon_str, battery_str) if s]
+    last_parts = [battery_str] if battery_str else []
     if last_parts:
         lines.append(DOT.join(last_parts))
     if force_red:
         lines = [_force_red(line) for line in lines]
     print("\n".join(lines))
+
+
+class _Fetched(NamedTuple):
+    """Everything a render obtains from outside the process.
+
+    The split is fetch vs render: fetching (subprocess spawns, sqlite reads,
+    file scans) is what costs time and energy; rendering is pure in-process
+    work over these values plus stdin. Renders within FAST_TTL_S of each other
+    reuse the previous render's _Fetched from a per-session temp file, so the
+    clock, ctx%, countdowns and native S/W stay live while only these slow
+    values age — by at most the TTL.
+    """
+
+    git: GitInfo
+    battery: dict
+    dsp: bool
+    dcat: dict
+    usage: dict            # post cost-merge, pre native-S/W merge — native comes from stdin
+    chat_cost: float
+    cums: tuple[int, int, int]
+    total_in: int          # the change key fetched.cums was accumulated at
+    sandbox: str           # rendered badge — three settings files to resolve it
+    sessions: str          # rendered badge — a tail of ~/.claude/history.jsonl
+
+# Cache-file layout guard: bump when _Fetched gains, loses or retypes a field,
+# so a render never rebuilds a NamedTuple from a stale shape.
+_FAST_CACHE_SCHEMA = 3
+
+
+def _session_state_path(session_id: str, suffix: str = "") -> Path:
+    """Per-session scratch file in TMPDIR.
+
+    session_id keys it, per the statusline docs: stable for the session's
+    lifetime, unique across concurrent sessions — unlike a pid, which changes
+    every invocation and would never hit. The uid is in the name for the /tmp
+    fallback, which is world-writable where macOS's TMPDIR is per-user.
+    """
+    sid = re.sub(r"[^A-Za-z0-9-]", "_", session_id)[:64]
+    tmp = os.environ.get("TMPDIR") or "/tmp"  # noqa: S108 — uid-suffixed filename below
+    return Path(tmp) / f"claude-statusline-{os.getuid()}-{sid}{suffix}.json"
+
+
+def _fast_cache_path(session_id: str) -> Path:
+    """The previous render's _Fetched, good for FAST_TTL_S."""
+    return _session_state_path(session_id)
+
+
+def _memo_path(session_id: str) -> Path:
+    """What a slow render learned that no later render need learn again.
+
+    Separate from the fetch cache because nothing in it expires on FAST_TTL_S:
+    the DSP verdict is fixed once the session's claude was launched, and the
+    ~/.claude.json stamp is invalidated by the file itself, not by a clock.
+    """
+    return _session_state_path(session_id, ".memo")
+
+
+def _load_memo(session_id: str) -> dict:
+    """Best-effort read; anything unreadable just costs a slow render its skip."""
+    if not session_id:
+        return {}
+    try:
+        with open(_memo_path(session_id), encoding="utf-8") as fh:
+            memo = json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
+    return memo if isinstance(memo, dict) else {}
+
+
+def _save_memo(session_id: str, memo: dict) -> None:
+    """Write the memo atomically, for the reason _save_fetched does."""
+    if not session_id:
+        return
+    path = _memo_path(session_id)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(memo), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_fetched(session_id: str, cwd: str, now: float) -> tuple[_Fetched, float] | None:
+    """The previous render's fetch results and the ts they were written under.
+
+    None when they cannot be reused. A cwd mismatch misses rather than serves
+    another directory's git segment: the session can change workspace between
+    renders. Any unreadable, stale or off-schema file also just misses — the
+    slow path rebuilds and overwrites.
+
+    The ts comes back with them because _catch_up_cache_stats has to rewrite the
+    file under that same timestamp, and re-reading this file to recover one
+    float is a second parse of a document already in hand.
+    """
+    if not session_id:
+        return None
+    try:
+        with open(_fast_cache_path(session_id), encoding="utf-8") as fh:
+            d = json.load(fh)
+        ts = float(d.get("ts", 0))
+        if (
+            d.get("schema") != _FAST_CACHE_SCHEMA
+            or d.get("cwd") != cwd
+            or not 0 <= now - ts < FAST_TTL_S
+        ):
+            return None
+        f = d["fetched"]
+        return _Fetched(
+            git=GitInfo(*f["git"]),
+            battery=f["battery"],
+            dsp=f["dsp"],
+            dcat=f["dcat"],
+            usage=f["usage"],
+            chat_cost=f["chat_cost"],
+            cums=tuple(f["cums"]),
+            total_in=f["total_in"],
+            sandbox=f["sandbox"],
+            sessions=f["sessions"],
+        ), ts
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _save_fetched(session_id: str, cwd: str, ts: float, fetched: _Fetched) -> None:
+    """Write the fetch cache atomically; best-effort like all render bookkeeping.
+
+    Temp file + os.replace, because Claude Code kills an in-flight render when
+    a new update triggers — a torn write must cost the next render its fast
+    path, never feed it half a JSON document.
+    """
+    if not session_id:
+        return
+    path = _fast_cache_path(session_id)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        payload = {
+            "schema": _FAST_CACHE_SCHEMA,
+            "ts": ts,
+            "cwd": cwd,
+            "fetched": {
+                "git": list(fetched.git),
+                "battery": fetched.battery,
+                "dsp": fetched.dsp,
+                "dcat": fetched.dcat,
+                "usage": fetched.usage,
+                "chat_cost": fetched.chat_cost,
+                "cums": list(fetched.cums),
+                "total_in": fetched.total_in,
+                "sandbox": fetched.sandbox,
+                "sessions": fetched.sessions,
+            },
+        }
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _catch_up_cache_stats(inp: _InputData, fetched: _Fetched, ts: float) -> _Fetched:
+    """Keep the cache-stats accumulation lossless across fast-path renders.
+
+    total_in is the accumulator's change key: a new value means an API response
+    the cached cums never counted, and a fast render that skipped the write
+    would lose that message for good once the next response replaced total_in.
+    So this is the one bookkeeping write the fast path keeps. The file is
+    rewritten with the new cums under its *original* timestamp — *ts*, as
+    _load_fetched read it — because extending the TTL here would let a chatty
+    turn keep the git segment stale forever.
+    """
+    import sqlite3
+
+    if not inp.session_id or inp.total_in == fetched.total_in:
+        return fetched
+    try:
+        cums = _accumulate_cache_stats(
+            inp.session_id, inp.cache_read, inp.cache_create, inp.input_fresh, inp.total_in
+        )
+    except sqlite3.OperationalError:
+        return fetched
+    fetched = fetched._replace(cums=cums, total_in=inp.total_in)
+    _save_fetched(inp.session_id, inp.cwd, ts, fetched)
+    return fetched
+
+
+def _fetch_all(
+    inp: _InputData, data: dict, native_rl: dict, now_epoch: float, *, test_mode: bool,
+) -> _Fetched:
+    """The slow path: every subprocess spawn, sqlite read and bookkeeping write."""
+    import sqlite3
+
+    memo = _load_memo(inp.session_id)
+    memo_before = dict(memo)
+    # Start external commands (non-blocking) — runs while we do in-process work
+    git_procs = _start_git(inp.cwd)
+    battery_proc = _start_battery()
+    dsp_proc = _start_dsp_check(memo.get("dsp"))
+    try:
+        # One read for the whole render: _fetch_usage decides from it whether a
+        # costs-only refresh is due, _merge_cost_data merges what it holds.
+        try:
+            import cache_db
+
+            cost_summary = cache_db.read_cost_summary(
+                max_age=COST_SUMMARY_MAX_AGE, cwd=inp.cwd,
+            )
+        except Exception:  # noqa: BLE001
+            cost_summary = None
+        # In-process: usage cache + .dogcats log (no subprocess)
+        usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl, cost_summary)
+        # Strip project-scoped costs from usage cache — they belong to
+        # whichever project last wrote the singleton row (macsetup-1zeq)
+        if usage_data:
+            for k in list(usage_data):
+                if "project_cost" in k:
+                    del usage_data[k]
+        _merge_cost_data(usage_data, inp.session_id, inp.cwd, native_rl, cost_summary)
+        dcat_data = _fetch_dcat(inp.cwd)
+        # Nothing on the line depends on these two; they sit here to overlap the
+        # subprocesses started above rather than trail them.
+        _capture_account(memo)
+        # S and W samples come from the raw stdin dict, sonnet/scoped from
+        # usage_data — the native S/W merge happens later, in main, and would
+        # not change what gets sampled here.
+        _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
+        sessions_str = _render_sessions(inp.cwd, now_epoch)
+
+        # Cache stats and the session cost. Neither depends on a git result, so
+        # both belong on this side of the join: the render costs the longer of
+        # the two halves rather than their sum. Both are guarded — with one WAL
+        # writer allowed, a busy database must cost the render a stale
+        # statistic, not the line.
+        try:
+            cums = _accumulate_cache_stats(
+                inp.session_id, inp.cache_read, inp.cache_create, inp.input_fresh, inp.total_in
+            )
+        except sqlite3.OperationalError:
+            cums = (0, 0, 0)
+        try:
+            chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
+        except sqlite3.OperationalError:
+            chat_cost_val = 0.0
+
+        # Collect subprocess results
+        git = _collect_git(git_procs)
+        battery_data = _collect_battery(battery_proc)
+        dsp_active = _collect_dsp(dsp_proc)
+    finally:
+        for p in (*git_procs.values(), battery_proc, dsp_proc):
+            _kill(p)
+
+    # The toggle is re-read here rather than left to _start_dsp_check, which no
+    # longer sees it once a verdict is memoized: turning DSP off mid-session
+    # would otherwise keep the badge for as long as the memo lives.
+    if not _on("DSP"):
+        dsp_active = False
+    elif dsp_active is None:
+        dsp_active = memo.get("dsp", False)
+    else:
+        memo["dsp"] = dsp_active
+
+    # current_dir follows the session's shell, but the session JSONL sits under
+    # the projects dir keyed by the launch directory — a cd into a subdirectory
+    # finds nothing and the segment vanishes mid-session. Retry at the repo root
+    # before concluding the cost is really zero. This is the one part of the
+    # cost that needs git, so it is all that waits for the join.
+    if not chat_cost_val and git.toplevel and git.toplevel != inp.cwd:
+        try:
+            chat_cost_val = compute_session_cost(inp.session_id, git.toplevel)
+        except sqlite3.OperationalError:
+            chat_cost_val = 0.0
+
+    if memo != memo_before:
+        _save_memo(inp.session_id, memo)
+
+    return _Fetched(
+        git=git,
+        battery=battery_data,
+        dsp=dsp_active,
+        dcat=dcat_data,
+        usage=usage_data,
+        chat_cost=chat_cost_val,
+        cums=cums,
+        total_in=inp.total_in,
+        sandbox=_render_sandbox(inp.cwd, git.toplevel),
+        sessions=sessions_str,
+    )
 
 
 def main() -> None:
@@ -1907,80 +2289,41 @@ def main() -> None:
 
     inp = _parse_input(data)
 
-    # Start external commands (non-blocking) — runs while we do in-process work
-    git_procs = _start_git(inp.cwd)
-    macmon_proc = _start_macmon()
-    battery_proc = _start_battery()
-    dsp_proc = _start_dsp_check()
-    try:
-        # Computed before the fetch decision (it gates whether the API is worth
-        # calling) but applied after the cost merge — see below.
-        native_rl = _native_rate_limits(data)
-        # One read for the whole render: _fetch_usage decides from it whether a
-        # costs-only refresh is due, _merge_cost_data merges what it holds.
-        try:
-            cost_summary = read_cost_summary(max_age=COST_SUMMARY_MAX_AGE, cwd=inp.cwd)
-        except Exception:  # noqa: BLE001
-            cost_summary = None
-        # In-process: usage cache + .dogcats log (no subprocess)
-        usage_data = _fetch_usage(inp.session_id, inp.cwd, native_rl, cost_summary)
-        # Strip project-scoped costs from usage cache — they belong to
-        # whichever project last wrote the singleton row (macsetup-1zeq)
-        if usage_data:
-            for k in list(usage_data):
-                if "project_cost" in k:
-                    del usage_data[k]
-        _merge_cost_data(usage_data, inp.session_id, inp.cwd, native_rl, cost_summary)
-        # S and W come from stdin when Claude Code sends them — always current,
-        # so they win over the cache. Applied after the cost merge, which keys
-        # its compute-vs-read choice on usage_data being empty. Sonnet, Extra
-        # and the scoped limit still come from the fetch.
-        if native_rl:
-            usage_data.update(native_rl)
-            usage_data["_native_rl"] = True
-        dcat_data = _fetch_dcat(inp.cwd)
-        # Nothing on the line depends on these two; they sit here to overlap the
-        # git and macmon subprocesses started above rather than trail them.
-        _capture_account()
-        # After the native_rl merge, so the sonnet/scoped half sees the same
-        # usage_data the line will render.
-        _snapshot_rate_limits(data, usage_data, now_epoch, test_mode=test_mode)
+    # Computed before the fetch decision (it gates whether the API is worth
+    # calling) but applied after the cost merge — see below.
+    native_rl = _native_rate_limits(data)
 
-        # Collect git results and macmon data
-        git = _collect_git(git_procs)
-        macmon_data = _collect_macmon(macmon_proc)
-        battery_data = _collect_battery(battery_proc)
-        dsp_active = _collect_dsp(dsp_proc)
-    finally:
-        for p in (*git_procs.values(), macmon_proc, battery_proc, dsp_proc):
-            _kill(p)
+    cached = None if test_mode else _load_fetched(inp.session_id, inp.cwd, now_epoch)
+    if cached is None:
+        fetched = _fetch_all(inp, data, native_rl, now_epoch, test_mode=test_mode)
+        if not test_mode:
+            _save_fetched(inp.session_id, inp.cwd, now_epoch, fetched)
+    else:
+        fetched = _catch_up_cache_stats(inp, *cached)
 
-    # Cache stats. Both writes below are guarded: with one WAL writer allowed,
-    # a busy database must cost the render a stale statistic, not the line.
-    try:
-        cum_fresh, cum_create, cum_read = _accumulate_cache_stats(
-            inp.session_id, inp.cache_read, inp.cache_create, inp.input_fresh, inp.total_in
-        )
-    except sqlite3.OperationalError:
-        cum_fresh = cum_create = cum_read = 0
+    git = fetched.git
+    usage_data = _adjust_passed_resets(dict(fetched.usage), now_epoch)
+    # S and W come from stdin when Claude Code sends them — always current,
+    # so they win over the cache (this render's or the fast-path file's).
+    # Sonnet, Extra and the scoped limit still come from the fetch.
+    if native_rl:
+        usage_data.update(native_rl)
+        usage_data["_native_rl"] = True
+    cum_fresh, cum_create, cum_read = fetched.cums
 
     # Render all sections
     top = [
         _render_timestamp(),
-        _render_dsp(dsp_active),
-        _render_sandbox(inp.cwd, git.toplevel),
+        _render_dsp(fetched.dsp),
+        fetched.sandbox,
         _render_session_id(inp.session_id),
         _render_hostname(),
         _render_dir(inp.cwd, git.toplevel),
         _render_git(git.status_out, git.stash_out, git.branch, git.insertions, git.deletions),
-        _render_dogcat(dcat_data),
+        _render_dogcat(fetched.dcat),
         _render_changes(inp.lines_added, inp.lines_removed),
     ]
-    try:
-        chat_cost_val = compute_session_cost(inp.session_id, inp.cwd)
-    except sqlite3.OperationalError:
-        chat_cost_val = 0.0
-    chat_cost = str(chat_cost_val) if chat_cost_val > 0 else ""
+    chat_cost = str(fetched.chat_cost) if fetched.chat_cost > 0 else ""
     used_tokens = _used_tokens(inp.used, inp.ctx_size, inp.total_in)
     session = _render_session(
         inp.model, inp.effort, inp.thinking_off, used_tokens, inp.ctx_size,
@@ -1988,16 +2331,14 @@ def main() -> None:
     )
     # ctx% trails the token counts it summarizes; stays independent of SESSION
     session = " ".join(s for s in (session, _render_ctx_pct(used_tokens, inp.ctx_size)) if s)
-    sessions = _render_sessions(inp.cwd, now_epoch)
-    macmon_str = _render_macmon(macmon_data)
-    battery_str = _render_battery(battery_data)
+    battery_str = _render_battery(fetched.battery)
     # The scoped segment's "current" mode compares against the session model.
     usage_data["_current_model"] = inp.model
     usage_session_rl, usage_rl, usage_cost = _render_usage(usage_data, now_epoch)
 
     _layout_and_print(
         top, session, usage_session_rl, usage_rl, usage_cost,
-        usage_data, macmon_str, battery_str, sessions, now_epoch, _t_start,
+        usage_data, battery_str, fetched.sessions, now_epoch, _t_start,
         force_red=_on("RED", default=False)
         or (_on("HAIKU_RED") and "haiku" in inp.model.lower()),
     )
