@@ -42,19 +42,19 @@ Ask the user (if not already clear):
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 
-Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 10 agents each independently scanning the same files.
+Read `../../agents/scan-steps.md` and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 10 agents each independently scanning the same files.
 
-1. Replace `{focus}` in `scan-steps.md`
+1. Replace `{focus}` in `../../agents/scan-steps.md`
 2. Follow the scan procedure — read manifests, source files, CI/CD, git log, etc.
-3. Format all collected file contents into the snapshot format specified in `scan-steps.md`
+3. Format all collected file contents into the snapshot format specified in `../../agents/scan-steps.md`
 4. Store the result as `{codebase_snapshot}` for use in Step 3
 
 ### Step 3: Launch Agents
 
-Read the agent instruction files and spin up agents using the Agent tool. In Full mode, launch all ten in parallel. In single mode, launch just the one.
+Read the agent instruction files from `../../agents/` and spin up agents using the Agent tool. In Full mode, launch all ten in parallel. In single mode, launch just the one.
 
 For each agent:
-1. Read its instruction file from this skill's directory
+1. Read its instruction file from `../../agents/`
 2. Replace `{path}`, `{style}`, `{subreddit}` (Reddit only), `{focus}` (with focus instruction or empty string), and `{codebase_snapshot}` (with the snapshot from Step 2.5) with actual values
 3. For `{focus}`: if the user specified a focus area, replace with the focus block below. If no focus was specified, replace `{focus}` with an empty string.
 4. If dcat issues were found, append them to the agent prompt under a `## Known Issues (skip these)` section
@@ -82,16 +82,16 @@ Concentrate your analysis primarily on **{area}**. During the scan, go deeper on
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reddit**: Read `reddit-scrutinizer.md`
-**Hacker News**: Read `hn-scrutinizer.md`
-**Twitter/X**: Read `twitter-scrutinizer.md`
-**Lobsters**: Read `lobsters-scrutinizer.md`
-**/g/**: Read `4chan-scrutinizer.md`
-**Fediverse**: Read `fediverse-scrutinizer.md`
-**Stack Overflow**: Read `stackoverflow-scrutinizer.md`
-**LinkedIn**: Read `linkedin-scrutinizer.md`
-**GitHub Issues**: Read `github-issues-scrutinizer.md`
-**YouTube**: Read `youtube-scrutinizer.md`
+**Reddit**: Read `../../agents/reddit-scrutinizer.md`
+**Hacker News**: Read `../../agents/hn-scrutinizer.md`
+**Twitter/X**: Read `../../agents/twitter-scrutinizer.md`
+**Lobsters**: Read `../../agents/lobsters-scrutinizer.md`
+**/g/**: Read `../../agents/4chan-scrutinizer.md`
+**Fediverse**: Read `../../agents/fediverse-scrutinizer.md`
+**Stack Overflow**: Read `../../agents/stackoverflow-scrutinizer.md`
+**LinkedIn**: Read `../../agents/linkedin-scrutinizer.md`
+**GitHub Issues**: Read `../../agents/github-issues-scrutinizer.md`
+**YouTube**: Read `../../agents/youtube-scrutinizer.md`
 
 ### Step 4: Present Results
 

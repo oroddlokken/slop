@@ -18,7 +18,7 @@ Nothing here runs a benchmark or a profiler — it is static reading. Reviewers 
 
 ## What you get
 
-Up to 7 agents independently review the codebase, each through a different lens. After all finish, findings are deduplicated and distilled into:
+One agent per lens independently reviews the codebase. After all finish, findings are deduplicated and distilled into:
 
 - **Fix Now** — unbounded growth, or measurable latency on a named hot path
 - **Should Address** — real cost on a warm path, or a hot path at scale you haven't hit yet
@@ -43,7 +43,7 @@ Every action item includes a file path and line number.
 
 | Mode | What runs |
 |------|-----------|
-| Full | All 7 lenses |
+| Full | Every lens |
 | Quick | 3 high-yield lenses: hot-loops, io-batching, blocking — CPU in the loop, round trips across a boundary, and waiting |
 | Pick | You choose which lenses to run |
 

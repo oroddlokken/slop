@@ -18,14 +18,13 @@ the manual version of that, and works from a clone in any directory.
 | `cf`, `co` | Orchestrator wrappers, one script under two names: `cf` starts `claudem f` and `co` starts `claudem o`, each with an injected system prompt telling the session to delegate implementation work to the `cfcoder` agent. The two prompts differ only in the reason for the split — `cf` reserves a cheaper session model for judgment, `co` is already Opus and splits for context isolation. The script dispatches on its invoked name (`c<model>[<effort>]`), so symlinks like `cfl` or `com` give other model/effort combos — only the bare names `cf` and `co` inject. |
 | `cfcoder.md` | The agent definition `cf` and `co` delegate to: Opus at high effort doing the implementation. Only takes effect from an agents dir Claude Code reads — see below. |
 | `pricing.py`, `exchange.py`, `cache_db.py` | Model price table, USD/NOK rates, and the shared SQLite cache all of the above read. |
-| `hooks/` | `block-git-stash-worktree.sh`, a `PreToolUse` hook that blocks stash and worktree commands. Test suite in the sibling `block-git-stash-tests/` (payloads built inline — no fixture files). |
-| `stop-phrase-guard/` | A `Stop` hook that catches ownership-dodging and session-quitting phrases. Non-blocking — the assistant still stops, but the matched rule surfaces as a `systemMessage`. Fixtures alongside it. |
+| `hooks/` | `block-git-stash-worktree.sh`, a `PreToolUse` hook that blocks stash and worktree commands. Test suite in `hooks/block-git-stash-tests/` (payloads built inline — no fixture files). |
 
 Requirements: `uv` (the status line, `ccreport` and `claudemem` resolve their
 own dependencies through PEP 723 shebangs), a system Python 3.12+ for
-`get_claude_usage.py`, `zsh` for `ccu`, `claudem` and `cf`/`co`, and `jq` for both hooks. The git-stash
-hook also wants `perl` — without it, it falls back to substring matching and
-over-blocks. Some pieces are macOS-only: the Keychain token lookup
+`get_claude_usage.py`, `zsh` for `ccu`, `claudem` and `cf`/`co`, and `jq` for the
+git-stash hook. That hook also wants `perl` — without it, it falls back to
+substring matching and over-blocks. Some pieces are macOS-only: the Keychain token lookup
 (`security`) and the battery (`pmset`) status line segment.
 
 ## Status line
@@ -114,31 +113,16 @@ ln -s /path/to/slop/claude/cf ~/bin/com   # opus, medium effort, no injection
           }
         ]
       }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/path/to/slop/claude/stop-phrase-guard/stop-phrase-guard.sh"
-          }
-        ]
-      }
     ]
   }
 }
 ```
 
-Both test suites take a `HOOK_PATH` override and exit with the failure count:
+The test suite takes a `HOOK_PATH` override and exits with the failure count:
 
 ```bash
-claude/block-git-stash-tests/run-tests.sh
-claude/stop-phrase-guard/run-tests.sh
+claude/hooks/block-git-stash-tests/run-tests.sh
 ```
-
-`stop-phrase-guard` matches against phrasing my own `CLAUDE.md` rules forbid, so
-its pattern list is worth reading before you wire it up — the rules it enforces
-are not yours.
 
 ## Project grouping (ccreport)
 

@@ -2,6 +2,8 @@
 
 Various slop I have made for use with Claude Code or OpenCode.
 
+[claude](claude) is the tooling I run inside Claude Code itself: the status line, `ccreport` cost reporting in USD and NOK, and a hook that blocks `git stash` and `git worktree`. The rest below are skills.
+
 [audit-agent-docs](audit-agent-docs) and [codehealth](codehealth) are skills I use often to keep vibe coded projects somewhat maintainable.
 
 [should-i-abstract](should-i-abstract) is a pragmatic DRY review that finds both under-DRY and over-DRY code — flagging true duplication worth consolidating and wrong abstractions worth inlining.
@@ -17,3 +19,5 @@ Various slop I have made for use with Claude Code or OpenCode.
 [fuzz-my-stuff-up](fuzz-my-stuff-up) throws hostile and malformed input at your code to find the crashes before your users do.
 
 [write-agent-docs](write-agent-docs) and [audit-agent-docs](audit-agent-docs)' sibling [audit-agent-prompt](audit-agent-prompt) cover the agent-instructions side: writing CLAUDE.md/AGENTS.md-style docs, and auditing a production agent's system prompt. [write-agent-prompt](write-agent-prompt) is the authoring counterpart for system prompts, personas, and tool descriptions.
+
+[ghostty](ghostty) is my terminal config.

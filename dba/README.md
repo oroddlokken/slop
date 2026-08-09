@@ -4,7 +4,7 @@ Database & SQL deep-dive. Spins up parallel agents — each reviewing through a 
 
 ## What you get
 
-Up to 12 agents independently scan your codebase, each through a different database quality lens. After all finish, findings are deduplicated and distilled into:
+One agent per lens independently scans your codebase, each through a different database quality lens. After all finish, findings are deduplicated and distilled into:
 
 - **Fix Now** — SQL injection, data corruption, missing transactions
 - **Should Address** — N+1 queries, missing indexes, schema drift
@@ -35,7 +35,7 @@ Every action item includes a file path, line number, and concrete fix.
 
 | Mode | What runs |
 |------|-----------|
-| Full | All 12 lenses (default) |
+| Full | Every lens (default) |
 | Quick | 5 high-risk: injection, n-plus-one, transaction-gaps, schema-drift, data-integrity |
 | Pick | You choose which lenses to run |
 

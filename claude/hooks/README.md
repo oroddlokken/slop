@@ -11,5 +11,5 @@ scanner so only *executed* git invocations count — a `git stash` inside a comm
 message, an `echo`, or a heredoc body is data and passes. Without perl it falls
 back to a bare substring match, which over-blocks rather than under-blocks.
 
-A fixture suite lives one level up: `../block-git-stash-tests/run-tests.sh`.
+A fixture suite lives beside it: `block-git-stash-tests/run-tests.sh`.
 It takes a `HOOK_PATH` override and exits with the failure count.

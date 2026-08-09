@@ -4,7 +4,7 @@ Meta code quality review. Spins up parallel agents — each reviewing through a 
 
 ## What you get
 
-Up to 12 agents independently scan your codebase, each through a different quality lens. After all finish, findings are deduplicated and distilled into:
+One agent per lens independently scans your codebase, each through a different quality lens. After all finish, findings are deduplicated and distilled into:
 
 - **Fix Now** — correctness, security, data integrity issues
 - **Should Address** — maintainability and reliability concerns
@@ -24,6 +24,7 @@ Every action item includes a file path and line number.
 | error-gaps | Missing, swallowed, or inconsistent error handling |
 | complexity | Long functions, deep nesting, high branching |
 | query-smells | N+1 queries, raw SQL in loops, missing parameterization |
+| caching | Stale/leaky caches, unbounded growth, missing invalidation or memoization |
 | dead-code | Unused functions, unreachable branches, dead routes |
 | naming | Inconsistent naming conventions, ambiguous identifiers |
 | dep-hygiene | Unused imports, unnecessary dependencies, outdated deps |
@@ -34,7 +35,7 @@ Every action item includes a file path and line number.
 
 | Mode | What runs |
 |------|-----------|
-| Full | All 12 lenses in parallel (default) |
+| Full | Every lens in parallel (default) |
 | Quick | 5 high-risk lenses: duplicates, complexity, error-gaps, hardcoded, type-structs |
 | Pick | You choose which lenses to run |
 

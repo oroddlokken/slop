@@ -4,7 +4,7 @@ Test quality deep-dive. Spins up parallel agents — each reviewing tests throug
 
 ## What you get
 
-Up to 10 agents independently analyze your test suite, each through a different quality lens. Goes beyond "do tests exist?" to ask "do these tests actually catch real bugs?" After all finish, findings are deduplicated and distilled into:
+One agent per lens independently analyzes your test suite, each through a different quality lens. Goes beyond "do tests exist?" to ask "do these tests actually catch real bugs?" After all finish, findings are deduplicated and distilled into:
 
 - **Fix Now** — correctness, security, data integrity issues
 - **Should Address** — maintainability and reliability concerns
@@ -32,7 +32,7 @@ Every action item includes a file path and line number.
 
 | Mode | What runs |
 |------|-----------|
-| Full | All 10 lenses in parallel (default) |
+| Full | Every lens in parallel (default) |
 | Quick | 5 high-impact lenses: coverage-gaps, user-flows, happy-path-only, error-paths, assertion-quality |
 | Pick | You choose which lenses to run |
 

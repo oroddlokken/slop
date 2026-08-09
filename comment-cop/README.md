@@ -8,7 +8,7 @@ The core judgment call: a *why*-comment carrying a real fact (rationale, gotcha,
 
 ## What you get
 
-Up to 10 agents independently review the codebase's comments, docstrings and prose docs, each through a different lens. After all finish, findings are deduplicated and distilled into:
+One agent per lens independently reviews the codebase's comments, docstrings and prose docs. After all finish, findings are deduplicated and distilled into:
 
 - **Fix Now** — comments that actively mislead
 - **Should Address** — rot, gaps, and prose that costs more than it gives
@@ -36,7 +36,7 @@ Every action item includes a file path and line number.
 
 | Mode | What runs |
 |------|-----------|
-| Full | All 10 lenses (default) |
+| Full | Every lens (default) |
 | Quick | 5 high-signal lenses: contradicts-code, rambling, llm-slop, missing-why, dead-comments |
 | Pick | You choose which lenses to run |
 

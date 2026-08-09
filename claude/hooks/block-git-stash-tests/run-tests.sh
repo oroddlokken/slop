@@ -1,12 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# Fixtures are built inline rather than stored as JSON files (the sibling
-# block-quoted-flags-tests idiom): every payload here is a one-line command
-# string, so a file per case would bury the thing under test.
+# Fixtures are built inline rather than stored as JSON files: every payload here
+# is a one-line command string, so a file per case would bury the thing under
+# test.
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-HOOK="${HOOK_PATH:-$DIR/../hooks/block-git-stash-worktree.sh}"
+HOOK="${HOOK_PATH:-$DIR/../block-git-stash-worktree.sh}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "FATAL: jq not found on PATH (required by the hook)" >&2
