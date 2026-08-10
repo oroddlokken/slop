@@ -1,6 +1,6 @@
 ---
 name: write-agent-prompt
-description: "Guidelines for authoring the text that defines a general agent — system prompts, personas, guardrails, tool descriptions, example sets. LLM-agnostic. Load when writing or editing the prose that steers an agent's behavior (persona, scope, clarification policy, output shape, uncertainty, escalation). For CLAUDE.md / AGENTS.md / coding-agent docs use write-agent-docs instead. For SDK wiring, prompt caching, and tool-use mechanics use claude-api."
+description: "Guidelines for authoring the text that defines a general agent — system prompts, personas, guardrails, tool descriptions, example sets. Also covers the files a Claude Code harness loads as instruction: skills (SKILL.md, .claude/skills/), output styles (output-styles/*.md), slash commands (.claude/commands/) and subagent definitions (.claude/agents/) — their body is prompt prose and their frontmatter description is what makes them load. LLM-agnostic. Load when writing or editing the prose that steers an agent's behavior (persona, scope, clarification policy, output shape, uncertainty, escalation), and on phrases like 'edit the output style', 'write a skill', 'fix this SKILL.md', 'make the skill trigger on X', 'add a rule to the skill'. For CLAUDE.md / AGENTS.md / coding-agent docs use write-agent-docs instead. For SDK wiring, prompt caching, and tool-use mechanics use claude-api."
 ---
 
 # Writing Agent Prompts
@@ -15,9 +15,10 @@ When a request straddles sibling-skill boundaries, apply skills in this order:
 
 1. Writing agent-facing documentation (CLAUDE.md, AGENTS.md, `.claude/rules/`) — use `write-agent-docs`; it supersedes this skill.
 2. Configuring the SDK runtime (instantiation, tool schemas, prompt caching, tool-use loops) — use `claude-api`; it supersedes this skill.
-3. Writing the prose the model reads as instruction (persona, scope, rules, tool descriptions, few-shot examples) — this skill.
+3. Writing a skill, output style, slash command or subagent definition (`SKILL.md`, `output-styles/*.md`, `.claude/commands/`, `.claude/agents/`) — this skill. The body is prompt text the harness injects, and the frontmatter `description` is the trigger that decides whether it ever gets injected, so both are written under the rules here.
+4. Writing the prose the model reads as instruction (persona, scope, rules, tool descriptions, few-shot examples) — this skill.
 
-A single task often needs all three in sequence: structure the docs with `write-agent-docs`, write the prose inside with this skill, configure SDK wiring with `claude-api`.
+A single task often needs all three skills in sequence: structure the docs with `write-agent-docs`, write the prose inside with this skill, configure SDK wiring with `claude-api`.
 
 ## Glossary
 

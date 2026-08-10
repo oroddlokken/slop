@@ -29,7 +29,7 @@ This skill reviews the *rendered layer*. Every heading, hint, tooltip, button la
 
 ## Rules
 
-- **Ask the user for mode (Step 1) and launch strategy** (Sequential or 1+Parallel). Recommend Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
+- **Ask the user for mode (Step 1) and launch strategy** (Sequential or Rolling 5). Recommend Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
 - **The orchestrator extracts the string inventory once and passes it to all agents** — agents do NOT scan independently. The inventory reproduces strings verbatim with file:line; it does not reproduce whole templates.
 - **Agents inherit the default model** — do not override with a specific model.
 - **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
@@ -172,13 +172,15 @@ Use the agent template (`agent.md`). The template places shared content (string 
 **Spawn contract** — how you call the Agent tool, in every launch mode:
 
 - **Never pass `name:`.** A named agent becomes an addressable mailbox teammate, not a subagent. The tool result is `Spawned successfully` plus an agent_id, the findings never come back, and `run_in_background: false` is ignored. `TaskList` and `TaskOutput` cannot see it either. Recovering costs a round of `SendMessage` to every agent asking it to resend.
-- **Pass `run_in_background: false`.** You need each agent's findings in hand before the distill step.
-- **The Agent tool's return value is the findings.** Read them out of the tool result. Do not wait for a message, a notification, or an idle ping — none of those carry the report.
+- **Sequential passes `run_in_background: false`; Rolling 5 passes `run_in_background: true`.** Sequential needs the report in the tool result to know the agent is done. Rolling 5 needs the call to return at once, so the window can stay full.
+- **Where the report arrives follows that flag.** Foreground: the Agent tool's return value is the findings — read them out of the tool result, and do not wait for a message or an idle ping. Background: the tool result carries an agent id, and the completion notification carries the findings.
+- **Never call `TaskOutput` on a subagent, and never Read its `.output` file.** That path is a symlink to the agent's full JSONL transcript and will overflow your context.
+- **Every launched agent must have reported before you distill.** Once the queue is empty, wait out the notifications still outstanding.
 
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. Spreads token spend across the run instead of bursting it against the 5-hour quota. Slowest.
-- **1+Parallel** — Launch one agent, then the remaining agents in parallel batches of at most 5. Anthropic rate-limits large simultaneous bursts, so batching past 5 triggers 429s mid-run and wastes the work of any agent that already completed. Same cost as Sequential, much faster.
+- **Rolling 5** — Keep five agents in flight from the first launch to the last. Spawn five with `run_in_background: true`, then spawn the next unlaunched reviewer the moment any completion notification arrives, until the queue is empty. Never let a sixth run: Anthropic rate-limits large simultaneous bursts, and a 429 mid-run wastes the work of every agent that already finished. Refilling per completion is what beats waves of five — a wave leaves each finished slot idle until its slowest agent returns. Same cost as Sequential, fastest.
 
 Skip the question only when the user's invocation already named a strategy; otherwise ask and wait for the answer, recommending **Sequential**.
 

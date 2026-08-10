@@ -44,6 +44,8 @@ Toggle sections via environment variables (1=enabled, 0=disabled):
     CLAUDE_STATUSLINE_THINKING              — nothink marker when thinking is off
   CLAUDE_STATUSLINE_USABLE_CTX               — base ctx% on the usable window (nominal
                                                minus the ~33k auto-compact reserve)
+  CLAUDE_STATUSLINE_CTX_GREEN                — ctx% green below the 50% yellow threshold
+                                               instead of dim grey (default 0)
   CLAUDE_STATUSLINE_BATTERY                 — battery % / state / time remaining (pmset) (default 0)
   CLAUDE_STATUSLINE_SESSIONS                — active sessions in last 15 min (default 0)
   CLAUDE_STATUSLINE_USAGE                   — Claude usage (session/week % with countdowns)
@@ -876,6 +878,16 @@ def _rl_sample(
     exists — the percentage still on hand describes the window that just ended,
     and the display substitutes 0 for it. Either value stamped with the current
     time is a fabricated sample of the new window.
+
+    A reset further out than cache_db.RL_MAX_LOOKAHEAD_S is dropped in the same
+    spirit: Claude Code sends resets_at = 9999999999 on stdin where it has no
+    real one, and no window this side of 2286 resets that far ahead. Stored, it
+    is a permanent row describing a window that never existed.
+
+    What is stored is the reset time normalized to the minute, not as read. The
+    percent gate in record_rate_limit_snapshots only bounds a window instance at
+    ~100 rows while every render of one window agrees on its resets_at, and the
+    API's raw float does not — see cache_db.rl_window_key.
     """
     if pct is None or resets_at is None:
         return None
@@ -884,11 +896,16 @@ def _rl_sample(
         resets = float(resets_at)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
-    if resets <= now:
-        return None
     import cache_db
 
-    return cache_db.RateLimitSample(window, used, resets, model, source)
+    # Both bounds against the reading rather than the normalized value: what is
+    # being judged here is whether the API said something usable.
+    if resets <= now or resets - now > cache_db.RL_MAX_LOOKAHEAD_S:
+        return None
+
+    return cache_db.RateLimitSample(
+        window, used, cache_db.rl_window_key(resets), model, source,
+    )
 
 
 def _rl_samples(data: dict, usage_data: dict, now: float) -> list[RateLimitSample]:
@@ -1136,12 +1153,16 @@ def _used_tokens(used: str, ctx_size: int, total_in: int) -> int | None:
     return None
 
 
-def _render_ctx_pct(used_tokens: int | None, ctx_size: int) -> str:
+def _render_ctx_pct(used_tokens: int | None, ctx_size: int, label: bool) -> str:
+    """Context fill. Labelled "ctx:5%" only where it has no token counts to sit
+    behind — glued to them as "47k/967k:5%", the counts are the label."""
     if used_tokens is None or ctx_size <= 0:
         return ""
     used_int = min(100, math.ceil(used_tokens * 100 / _usable_ctx(ctx_size)))
-    col = "31" if used_int >= 70 else "33" if used_int >= 50 else "32"
-    return f"\033[0;90mctx:\033[0;{col}m{used_int}%\033[0m"
+    low = "32" if _on("CTX_GREEN", default=False) else "90"
+    col = "31" if used_int >= 70 else "33" if used_int >= 50 else low
+    lead = "\033[0;90mctx:" if label else "\033[0;90m:"
+    return f"{lead}\033[0;{col}m{used_int}%\033[0m"
 
 
 def _render_changes(lines_added: int, lines_removed: int) -> str:
@@ -1879,17 +1900,21 @@ def _layout_and_print(
     DOT = f"{SUBDUED} · {RST}"
 
     top = [s for s in top if s]
-    # Render time trails the cost line, after AT; with that line switched off
-    # it trails the session segment instead, after ctx. Active session count
-    # trails the top line either way.
+    # Render time trails the last line, after BAT. Battery is off by default and
+    # the figure must not lose its home with it, so it falls back down the same
+    # stack it used to head: the cost line after AT, then the session segment
+    # after ctx. Active session count trails the top line in every case.
+    elapsed = ""
     if _on("RENDER_TIME", default=False):
         elapsed = _render_elapsed(_t_start)
-        if usage_cost:
-            usage_cost = f"{usage_cost}{DOT}{elapsed}"
-        elif session:
-            session = f"{session} {elapsed}"
-        else:
-            top.append(elapsed)
+        if not battery_str:
+            if usage_cost:
+                usage_cost = f"{usage_cost}{DOT}{elapsed}"
+            elif session:
+                session = f"{session} {elapsed}"
+            else:
+                top.append(elapsed)
+            elapsed = ""
     if sessions:
         top.append(sessions)
     top_str = " ".join(top)
@@ -1926,7 +1951,7 @@ def _layout_and_print(
         if rest:
             lines.append(DOT.join(rest))
 
-    last_parts = [battery_str] if battery_str else []
+    last_parts = [s for s in (battery_str, elapsed) if s]
     if last_parts:
         lines.append(DOT.join(last_parts))
     if force_red:
@@ -2329,8 +2354,10 @@ def main() -> None:
         inp.model, inp.effort, inp.thinking_off, used_tokens, inp.ctx_size,
         cum_fresh, cum_create, cum_read, chat_cost,
     )
-    # ctx% trails the token counts it summarizes; stays independent of SESSION
-    session = " ".join(s for s in (session, _render_ctx_pct(used_tokens, inp.ctx_size)) if s)
+    # ctx% glues onto the token counts it summarizes; stays independent of
+    # SESSION, and with SESSION off there are no counts, so it carries a label
+    ctx_pct = _render_ctx_pct(used_tokens, inp.ctx_size, label=not session)
+    session = f"{session}{ctx_pct}"
     battery_str = _render_battery(fetched.battery)
     # The scoped segment's "current" mode compares against the session model.
     usage_data["_current_model"] = inp.model

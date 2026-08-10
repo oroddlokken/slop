@@ -1,6 +1,6 @@
 ---
 name: write-agent-docs
-description: "Guidelines for writing and updating agent-facing documentation (CLAUDE.md, AGENTS.md, copilot-instructions.md, .claude/rules/). For a general agent's system prompt, persona, or tool descriptions (not repo docs), use write-agent-prompt. Load this skill when writing, editing, or updating agent instructions. Triggered by phrases like 'update CLAUDE.md', 'update agent docs', 'edit CLAUDE.md', 'add a rule', 'update copilot instructions', 'update AGENTS.md', or when you determine that agent docs need updating as part of other work."
+description: "Guidelines for writing and updating agent-facing documentation (CLAUDE.md, AGENTS.md, copilot-instructions.md, .claude/rules/). For a general agent's system prompt, persona, or tool descriptions — and for skill, output-style, slash-command and subagent files (SKILL.md, output-styles/*.md, .claude/commands/, .claude/agents/), which are prompt text rather than repo docs — use write-agent-prompt. Load this skill when writing, editing, or updating agent instructions. Triggered by phrases like 'update CLAUDE.md', 'update agent docs', 'edit CLAUDE.md', 'add a rule', 'update copilot instructions', 'update AGENTS.md', or when you determine that agent docs need updating as part of other work."
 ---
 
 # Writing Agent Docs

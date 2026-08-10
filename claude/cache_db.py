@@ -43,7 +43,7 @@ _conn: sqlite3.Connection | None = None
 # BUMP THIS on any change to _SCHEMA_SQL, _ADDED_COLUMNS, or the migration list
 # in _run_migrations — an existing DB is otherwise never reopened on the slow
 # path and never sees the new DDL. A needless bump costs one slow open per DB.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -269,12 +269,28 @@ CREATE TABLE IF NOT EXISTS exchange_rates (
 -- historic record to an account. A row is written when the account changes
 -- and never otherwise, so this stays a handful of rows for a machine's life.
 -- ts leads as the primary key: both readers want it ordered.
+--
+-- Two kinds of field, and the difference matters to the readers. The first four
+-- are the identity: accountUuid is the stable key, emailAddress the label a
+-- report shows, and the organization pair is what separates the same address
+-- billing through work from the same address billing personally. The three
+-- tiers are what that account was entitled to at the time — they say nothing
+-- about *who* it is, so nothing that compares identities may look at them, but
+-- a change in one is worth a row because a seat upgrade is exactly the kind of
+-- thing a fill-rate report needs a date for (macsetup-5cn4).
+--
+-- The tiers come out of the same cached oauthAccount blob as the rest, and
+-- Claude Code only refreshes it on /login (profileFetchedAt), so a tier that
+-- changed server-side can read stale here until the next sign-in.
 CREATE TABLE IF NOT EXISTS account_events (
-    ts                REAL PRIMARY KEY,
-    account_uuid      TEXT NOT NULL,
-    email             TEXT,
-    organization_uuid TEXT,
-    organization_name TEXT
+    ts                          REAL PRIMARY KEY,
+    account_uuid                TEXT NOT NULL,
+    email                       TEXT,
+    organization_uuid           TEXT,
+    organization_name           TEXT,
+    seat_tier                   TEXT,  -- Team seat product, e.g. 'team_tier_1'; NULL on personal plans
+    user_rate_limit_tier        TEXT,  -- per-user bucket, e.g. 'default_claude_max_5x'
+    organization_rate_limit_tier TEXT  -- org pool, e.g. 'default_raven'
 ) WITHOUT ROWID;
 
 -- Append-only utilization samples, written by the statusline render. The live
@@ -284,13 +300,24 @@ CREATE TABLE IF NOT EXISTS account_events (
 -- the same 5-hour/7-day window, which is what lets a report derive a fill rate
 -- rather than a scatter of unrelated readings.
 --
+-- Stored to the whole minute (rl_window_key), because the API's raw float drifts
+-- between fetches of one window and every reader of this column treats it as an
+-- identity. Rows written before that carry the drift permanently, so a reader
+-- has to bucket them again rather than trust the column — and rows written
+-- before the lookahead check carry Claude Code's 9999999999 placeholder, which
+-- is not a window at all (RL_MAX_LOOKAHEAD_S).
+--
 -- Deliberately no account column — a row is attributed by its ts against
 -- account_events, exactly as ccreport attributes a record, so a later /login or
 -- an `adopt` re-attributes these samples too with nothing to rewrite here.
 --
--- No pruning yet: the write gate in record_rate_limit_snapshots bounds this at
--- ~100 rows per window instance, and how long a fill history is worth keeping
--- is a reporting-side decision that has no reader yet.
+-- Never pruned, decided with the reader (macsetup-3u9n): the write gate in
+-- record_rate_limit_snapshots bounds one window instance at ~100 rows, and
+-- `ccreport limits` reports over the whole history — how often a window ever hit
+-- 100% is a question about all of it, and a window that filled a year ago is
+-- unreconstructible once dropped. The ~100 assumes normalized reset times: with
+-- the raw floats one scoped week reached 80 rows in a day, every one of them a
+-- window of its own as far as the gate could tell.
 CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
     ts        REAL NOT NULL,
     window    TEXT NOT NULL,   -- 'session' | 'week' | 'sonnet' | 'scoped'
@@ -301,6 +328,19 @@ CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
     PRIMARY KEY (window, ts)
 ) WITHOUT ROWID;
 """
+
+
+# account_events, split the way its readers read it — identity first, then the
+# tiers. Up here rather than beside the functions that use them (see "Account
+# change log" below) because _ADDED_COLUMNS needs the tier names to migrate an
+# existing DB, and a name spelled twice is a name that can drift.
+_ACCOUNT_IDENTITY_COLS = (
+    "account_uuid", "email", "organization_uuid", "organization_name",
+)
+_ACCOUNT_TIER_COLS = (
+    "seat_tier", "user_rate_limit_tier", "organization_rate_limit_tier",
+)
+_ACCOUNT_COLS = _ACCOUNT_IDENTITY_COLS + _ACCOUNT_TIER_COLS
 
 
 # Columns a DB created before them is missing. CREATE TABLE covers new DBs;
@@ -317,6 +357,8 @@ CREATE TABLE IF NOT EXISTS rate_limit_snapshots (
 # - file_costs week_model_json: the ALTER only makes the column readable. Rows
 #   written before it carry NULL while still matching on mtime and size, so
 #   _COST_ENTRY_SCHEMA below is what makes them re-scan
+# - the account_events tier columns: every event captured before them reads back
+#   with NULL tiers, which is the truth — nothing recorded what the tier was
 _ADDED_COLUMNS: list[tuple[str, str, str]] = [
     *(("usage", key, "REAL") for key in rolling_cost_keys()),
     ("usage", "scoped_percent", "INTEGER"),
@@ -325,6 +367,7 @@ _ADDED_COLUMNS: list[tuple[str, str, str]] = [
     ("ccreport_records", "cwd", "TEXT"),
     ("ccreport_records", "repo", "TEXT"),
     ("file_costs", "week_model_json", "TEXT"),
+    *(("account_events", col, "TEXT") for col in _ACCOUNT_TIER_COLS),
 ]
 
 # Shape of a file_costs row's payload, stored in meta as `cost_schema` and
@@ -2591,15 +2634,18 @@ def _clear_project_scopes(conn: sqlite3.Connection) -> None:
 # Account change log
 # ---------------------------------------------------------------------------
 #
-# Four fields survive out of ~/.claude.json's oauthAccount blob: accountUuid is
-# the stable key, emailAddress the label a report shows, and the organization
-# pair is what separates the same address billing through work from the same
-# address billing personally. Nothing else there is kept — seatTier,
-# billingType, the role fields and displayName are either volatile or say more
-# about the person than a cost report needs.
+# Seven fields survive out of ~/.claude.json's oauthAccount blob: the four
+# identity ones and the three tiers, both described at the CREATE TABLE. Nothing
+# else there is kept — billingType, the role fields and displayName are either
+# volatile or say more about the person than a cost report needs.
+#
+# _ACCOUNT_COLS, _ACCOUNT_IDENTITY_COLS and _ACCOUNT_TIER_COLS are defined
+# beside the schema, above.
 
-_ACCOUNT_COLS = ("account_uuid", "email", "organization_uuid", "organization_name")
 _ACCOUNT_SELECT = ", ".join(_ACCOUNT_COLS)
+# Bound as (ts, *_ACCOUNT_COLS), so the count follows the column list rather
+# than a hand-written run of question marks that a new column silently breaks.
+_ACCOUNT_PLACEHOLDERS = ", ".join("?" * (1 + len(_ACCOUNT_COLS)))
 
 # Timestamp of the one row `ccreport adopt` writes, which claims the history
 # that predates capture for an account. Zero because attribution takes the
@@ -2611,6 +2657,7 @@ ADOPTED_TS = 0.0
 # The oauthAccount keys behind _ACCOUNT_COLS, in the same order.
 _ACCOUNT_SOURCE_KEYS = (
     "accountUuid", "emailAddress", "organizationUuid", "organizationName",
+    "seatTier", "userRateLimitTier", "organizationRateLimitTier",
 )
 
 
@@ -2630,8 +2677,18 @@ def _account_identity(oauth: dict[str, Any]) -> tuple[str | None, ...]:
 
 
 def _account_row_to_dict(row: tuple) -> dict[str, Any]:
-    """One account_events row as a dict: ts plus the four identity fields."""
+    """One account_events row as a dict: ts plus every stored field."""
     return {"ts": row[0], **dict(zip(_ACCOUNT_COLS, row[1:], strict=True))}
+
+
+def effective_limit_tier(row: dict[str, Any]) -> str | None:
+    """The rate-limit tier *row* was actually subject to, or None if unrecorded.
+
+    The per-user tier wins: when Anthropic assigns one it is the bucket the
+    account draws against, and the org tier then only names the pool it would
+    otherwise have shared.
+    """
+    return row.get("user_rate_limit_tier") or row.get("organization_rate_limit_tier")
 
 
 def record_account_event(
@@ -2644,6 +2701,10 @@ def record_account_event(
     follow a /login — has to cost one SELECT and no write: ts is the primary
     key of a WITHOUT ROWID table, making "newest" the first step of a reverse
     key scan.
+
+    The comparison is over the whole stored tuple, tiers included, so a seat or
+    plan change on an unchanged login appends a row too — that is the point of
+    keeping them: the log is where a report finds the date a tier moved.
 
     An oauthAccount with no accountUuid is dropped rather than stored under a
     NULL key. Without it there is nothing stable to tell two accounts apart by,
@@ -2663,7 +2724,7 @@ def record_account_event(
     # that is the same instant, so the later reading is the one to keep.
     conn.execute(
         f"INSERT OR REPLACE INTO account_events (ts, {_ACCOUNT_SELECT}) "  # noqa: S608
-        "VALUES (?, ?, ?, ?, ?)",
+        f"VALUES ({_ACCOUNT_PLACEHOLDERS})",
         (time.time() if now is None else now, *identity),
     )
     conn.commit()
@@ -2719,13 +2780,16 @@ def set_adopted_account(account: dict[str, Any]) -> None:
 
     *account* is keyed by _ACCOUNT_COLS — a row dict as the readers here hand
     one back, not the camelCase oauthAccount blob record_account_event takes.
+    Every column, tiers included, so this stays a plain write of whatever the
+    caller decided the row should say; what a claim about history may honestly
+    put in the tier columns is the caller's problem, not this function's.
     Unlike a capture this is meant to be overwritten: there is only ever one
     such row, and re-adopting is how a user corrects it.
     """
     conn = get_connection()
     conn.execute(
         f"INSERT OR REPLACE INTO account_events (ts, {_ACCOUNT_SELECT}) "  # noqa: S608
-        "VALUES (?, ?, ?, ?, ?)",
+        f"VALUES ({_ACCOUNT_PLACEHOLDERS})",
         (ADOPTED_TS, *(account[col] for col in _ACCOUNT_COLS)),
     )
     conn.commit()
@@ -2754,6 +2818,45 @@ def clear_adopted_account() -> bool:
 # here, 24.1 there — would otherwise write a row per render forever. A window
 # fills over hours; nothing worth plotting happens inside five minutes.
 _RL_SNAPSHOT_MIN_INTERVAL_S = 300
+
+# How far ahead a reset time can plausibly sit. The longest window here is the
+# 7-day one, so a reading claiming more than this is not describing a window:
+# Claude Code has been seen sending resets_at = 9999999999 on stdin (a year-2286
+# placeholder), and four rows carrying it are in this table permanently. The
+# day of slack over seven is for a span quoted generously, not for a placeholder.
+#
+# Both ends read it from here: statusline_command._rl_sample refuses to store
+# one, and `ccreport limits` drops the ones already stored. A reader that
+# tolerated what the writer rejects would render a window resetting in 2286.
+RL_MAX_LOOKAHEAD_S = 8 * 86_400
+
+
+def rl_window_key(resets_at: float) -> float:
+    """*resets_at* rounded to the whole minute — one window instance's identity.
+
+    The usage API returns a float that drifts by up to a second between fetches
+    of the same window (observed: 80 scoped rows spanning 1786305599.03 to
+    1786305600.95, all of one reset at 1786305600). Both ends of this table
+    treat resets_at as the window's identity — the write gate to decide whether
+    a reading belongs to the window it already stored, `ccreport limits` to
+    group samples into one fill curve — so that drift made every render look
+    like a fresh window: the whole-percent gate never applied, and one week of
+    scoped history became 80 single-sample instances (macsetup-3u9n).
+
+    A minute because real resets land on one; anything finer is fetch latency.
+    Rounded rather than truncated, else a reset at :00 splits across two buckets
+    depending on which side of it the jitter fell.
+
+    The writer normalizes before storing. The reader applies it again on read,
+    because the rows written before this existed keep their jitter forever.
+    """
+    return round(resets_at / 60.0) * 60.0
+
+
+# The stored column order, which is also the order the INSERT below spells out.
+# Only load_rate_limit_snapshots binds it: it zips rows into dicts, so a column
+# added to the table has to be added here or the reader silently drops it.
+_RL_SNAPSHOT_COLS = ("ts", "window", "used_pct", "resets_at", "model", "source")
 
 
 class RateLimitSample(NamedTuple):
@@ -2787,6 +2890,11 @@ def record_rate_limit_snapshots(
     is what bounds one window instance at ~100 rows; the resets_at exception is
     there so a fresh window's first sample is not held back by it. used_pct
     stores the raw float — the gate rounds, the row does not.
+
+    That bound holds only while every sample of one window carries the same
+    resets_at, which is why the caller normalizes it (rl_window_key) rather than
+    passing the reading through: an exact-float comparison against a drifting
+    reset time takes the resets_at exception on every render and writes a row.
 
     No exception handling here: the render call site owns that, like every other
     bookkeeping write it makes.
@@ -2822,6 +2930,28 @@ def record_rate_limit_snapshots(
     # rather than relying on sqlite3 not having begun a transaction for SELECTs.
     if wrote:
         conn.commit()
+
+
+def load_rate_limit_snapshots() -> list[dict[str, Any]]:
+    """Every utilization sample ever taken, oldest first.
+
+    Unbounded on purpose, and affordable: the write gate holds one window
+    instance to ~100 rows, and `ccreport limits` groups by instance, so a LIMIT
+    here would silently truncate the oldest instance rather than the report.
+
+    Ordering by ts leaves the samples of one instance already in fill order.
+    Window breaks the tie, which makes the order total — (window, ts) is the
+    primary key, and every render offers every window at the same ts, so ts
+    alone would leave a whole render's samples in whatever order the sort chose.
+    """
+    conn = get_connection()
+    cols = ", ".join(_RL_SNAPSHOT_COLS)
+    return [
+        dict(zip(_RL_SNAPSHOT_COLS, row, strict=True))
+        for row in conn.execute(
+            f"SELECT {cols} FROM rate_limit_snapshots ORDER BY ts, window"  # noqa: S608
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

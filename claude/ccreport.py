@@ -41,12 +41,16 @@ import exchange
 import pricing
 import project_identity
 from cache_db import (
+    _ACCOUNT_IDENTITY_COLS,
+    _ACCOUNT_TIER_COLS,
     ADOPTED_TS,
+    RL_MAX_LOOKAHEAD_S,
     add_project_override,
     check_ccreport_valid,
     clear_adopted_account,
     count_ccreport_records_without_signals,
     delete_project_override,
+    effective_limit_tier,
     get_project_overrides,
     init_ccreport_meta,
     invalidate_ccreport,
@@ -56,6 +60,7 @@ from cache_db import (
     load_ccreport_records_in_range,
     load_ccreport_records_since,
     load_ccreport_rollups,
+    load_rate_limit_snapshots,
     read_adopted_account,
     read_ccreport_rollup_fingerprint,
     read_latest_account,
@@ -260,15 +265,16 @@ def _same_account(a: dict, b: dict) -> bool:
     """Whether two account rows name the same account, ignoring when each was written.
 
     Compared on the stored identity rather than on the rendered description,
-    which collapses two uuids that happen to share an address.
+    which collapses two uuids that happen to share an address. The identity
+    columns only: a row also carries the tiers that account was on, and a seat
+    upgrade does not make it somebody else — a caller asking "is this the same
+    account?" would otherwise get "no" from a plan change.
     """
-    return {k: v for k, v in a.items() if k != "ts"} == {
-        k: v for k, v in b.items() if k != "ts"
-    }
+    return all(a[col] == b[col] for col in _ACCOUNT_IDENTITY_COLS)
 
 
 class AccountTimeline:
-    """Which Claude account was signed in at a given moment.
+    """Which Claude account was signed in at a given moment, and on which tier.
 
     Built from the append-only account_events log the statusline writes. The
     log holds wall-clock capture times as epoch seconds, and a record's
@@ -279,16 +285,33 @@ class AccountTimeline:
     def __init__(self, events: list[dict]) -> None:
         self._ts = [e["ts"] for e in events]
         self._labels = _account_labels(events)
+        # Resolved once here rather than per lookup: both answers come off the
+        # same event, so the two getters differ only in which list they index.
+        self._tiers = [effective_limit_tier(e) for e in events]
+
+    def _index_at(self, when: datetime) -> int:
+        """Position of the event in force at *when*, or -1 when none is.
+
+        A moment older than the first captured event has no event: the log
+        starts when capture was switched on, and what ran before it is
+        genuinely not recorded anywhere.
+        """
+        return bisect.bisect_right(self._ts, when.timestamp()) - 1
 
     def label_at(self, when: datetime) -> str:
-        """The account in force at *when*: the newest event at or before it.
+        """The account in force at *when*, "unknown" before the first event."""
+        i = self._index_at(when)
+        return self._labels[i] if i >= 0 else UNKNOWN_ACCOUNT
 
-        A record older than the first captured event is "unknown" rather than
-        the oldest known account — the log starts when capture was switched on,
-        and what ran before it is genuinely not recorded anywhere.
+    def tier_at(self, when: datetime) -> str | None:
+        """The effective rate-limit tier at *when*, None where it is unrecorded.
+
+        None covers both "no event yet" and "an event that predates the tier
+        columns" — neither is a tier reading, and a report has to show them as
+        absent rather than as a change to something.
         """
-        i = bisect.bisect_right(self._ts, when.timestamp())
-        return self._labels[i - 1] if i else UNKNOWN_ACCOUNT
+        i = self._index_at(when)
+        return self._tiers[i] if i >= 0 else None
 
 
 @dataclass
@@ -931,6 +954,11 @@ def _rollup_fingerprint(
     otherwise hide. The orphan set is in it because a file being purged moves
     it to the back of the dedup order, which can hand a duplicated message's
     surviving copy a different project.
+
+    The log goes in whole, tier columns included, so an event that changed only
+    a tier rebuilds rollups no attribution moved. Deliberate: over-invalidating
+    costs one rebuild on the next run, and narrowing this to the fields that
+    happen to matter today is how a later one starts mattering unnoticed.
     """
     parts: list[str] = [
         # The record cache's own contract: a version bump or a naming change
@@ -1212,6 +1240,38 @@ def _column_width(column) -> int:
     return max(widths)
 
 
+def _natural_width(table: Table, columns=None) -> int:
+    """How wide *table* wants to be: every cell at full width, plus the box.
+
+    *columns* narrows the question to a subset — what the table would take with
+    the rest dropped.
+    """
+    padding = table.padding[1] + table.padding[3]
+    cells = sum(_column_width(c) + padding
+                for c in (table.columns if columns is None else columns))
+    return cells + table._extra_width  # noqa: SLF001
+
+
+def _fit_columns(table: Table, droppable: Sequence[str]) -> None:
+    """Drop *droppable* columns, in that order, until the table fits the console.
+
+    For a table with more columns than a terminal has room for. Rich's own
+    answer is to shave every column by a character or two, which turns each of
+    them into an ellipsis and loses the whole table rather than one column of
+    it. Dropping in a stated order means the report decides what goes.
+
+    Rich keys a column's padding off its position, so the survivors are
+    renumbered; a column removed from the middle otherwise leaves the table
+    with no last column and an over-padded right edge.
+    """
+    for header in droppable:
+        if _natural_width(table) <= console.width:
+            return
+        table.columns[:] = [c for c in table.columns if str(c.header) != header]
+    for index, column in enumerate(table.columns):
+        column._index = index  # noqa: SLF001
+
+
 def _print_report(table: Table) -> None:
     """Print a report table, dropping Models when the terminal is too narrow.
 
@@ -1220,9 +1280,8 @@ def _print_report(table: Table) -> None:
     dead column behind. Removing it first keeps the rest of the table readable.
     """
     if table.columns and str(table.columns[-1].header) == "Models":
-        padding = table.padding[1] + table.padding[3]
-        fixed = sum(_column_width(c) + padding for c in table.columns[:-1])
-        if console.width - fixed - table._extra_width < MODELS_MIN_WIDTH:  # noqa: SLF001
+        fixed = _natural_width(table, table.columns[:-1])
+        if console.width - fixed < MODELS_MIN_WIDTH:
             table.columns.pop()
     console.print()
     console.print(table)
@@ -1882,9 +1941,637 @@ def cmd_adopt(args) -> None:
         print("Aborted.")
         return
 
-    set_adopted_account(identity)
+    # Identity copied from the newest capture, tiers deliberately blank: the row
+    # claims who paid for pre-capture history, and which tier they were on back
+    # then is not something today's login can be asked. A copied tier would read
+    # as a reading and would date a tier change to the wrong side of it.
+    set_adopted_account({**identity, **dict.fromkeys(_ACCOUNT_TIER_COLS)})
     print(f"Adopted. Those records now report as {_account_description(identity)}.")
     print("Undo with: ccreport adopt --remove")
+
+
+# --- Rate limit utilization history ---
+
+# The four windows the statusline can sample, in the order it offers them and
+# the order this report prints them. Also the --window choices.
+#
+# A window the table has never heard of is still reported, under its raw name
+# and after these — the writer's list of windows lives in statusline_command.py,
+# and a report over permanent history is the wrong place to lose a row or raise
+# over one because the two lists drifted.
+LIMIT_WINDOWS = ("session", "week", "sonnet", "scoped")
+
+_LIMIT_WINDOW_LABELS = {
+    "session": "Session (5h)",
+    "week": "Week (7d)",
+    "sonnet": "Sonnet (7d)",
+    "scoped": "Scoped model (7d)",
+}
+
+# Where a cell has nothing to show: a tier no event recorded, a scoped sample
+# that named no model. Spelled rather than left empty so the gap reads as "not
+# recorded" instead of as a rendering fault.
+_ABSENT = "—"
+
+
+@dataclass
+class WindowInstance:
+    """One rate-limit window's life, as the samples of it that were taken.
+
+    A window instance is one 5-hour or 7-day span: the samples that share a
+    resets_at are readings of the same quota filling up, which is what makes a
+    peak and a fill time mean anything. *samples* are in ts order, as
+    load_rate_limit_snapshots returns them.
+    """
+
+    window: str
+    model: str | None
+    resets_at: float
+    samples: list[dict]
+
+    @property
+    def peak(self) -> float:
+        """The fullest this window was ever seen. Raw float, as stored."""
+        return max(s["used_pct"] for s in self.samples)
+
+    @property
+    def first_ts(self) -> float:
+        return self.samples[0]["ts"]
+
+    @property
+    def peak_ts(self) -> float:
+        """When the peak was first reached, not the last sample that matched it.
+
+        A window that sits at its peak for hours filled once; the later samples
+        are the plateau, and counting them as fill time would report the idle
+        stretch as part of how fast it got there.
+        """
+        peak = self.peak
+        return next(s["ts"] for s in self.samples if s["used_pct"] == peak)
+
+    @property
+    def fill_s(self) -> float:
+        """Seconds from the first sample to the peak.
+
+        A floor, not the truth: the window may already have been filling before
+        the first render that saw it, and 0 means the peak was already there.
+        """
+        return self.peak_ts - self.first_ts
+
+    @property
+    def hit_limit(self) -> bool:
+        """Whether this window filled.
+
+        Rounded to match the write gate: it only lets a reading through when the
+        whole percent moves, so 99.6 is the last sample a full window can leave
+        behind and treating it as short of the limit would undercount.
+        """
+        return round(self.peak) >= 100
+
+    @property
+    def key(self) -> tuple[str, str | None, float]:
+        """What _window_instances grouped on, and so unique across a report."""
+        return (self.window, self.model, self.resets_at)
+
+    @property
+    def last_ts(self) -> float:
+        return self.samples[-1]["ts"]
+
+    @property
+    def opening_pct(self) -> float:
+        """The first reading taken of this window, which is rarely 0.
+
+        Capture starts when a render happens, not when the window opens, so a
+        window seen first at 77% had already spent 77 points nobody watched.
+        Every rate below is measured from here, and the reports name it, so the
+        number is read as "since we started looking" and not as the window's own
+        history.
+        """
+        return self.samples[0]["used_pct"]
+
+    @property
+    def latest_pct(self) -> float:
+        """The newest reading — where the window stands, if it is still open."""
+        return self.samples[-1]["used_pct"]
+
+    @property
+    def rise(self) -> float:
+        """Points gained between the first sample and the peak."""
+        return self.peak - self.opening_pct
+
+    @property
+    def burn_pph(self) -> float | None:
+        """Points per hour over the fill span, or None when there is no span.
+
+        Wall-clock, not active-hours: an overnight gap between two renders
+        counts as time the window took to fill. That makes it the rate to
+        project a reset time with (idle hours will happen again before this
+        window closes) and the wrong one to answer how fast a working hour
+        spends the quota.
+
+        None where the arithmetic has no meaning — one sample, or a peak
+        already there when the first render saw it — rather than 0, which
+        would read as "this window is not filling".
+        """
+        if self.fill_s <= 0 or self.rise <= 0:
+            return None
+        return self.rise / (self.fill_s / 3600)
+
+    def is_open(self, now: float) -> bool:
+        """Whether the window has yet to reset."""
+        return self.resets_at > now
+
+    def projected_pct(self, now: float) -> float | None:
+        """Where the latest reading lands by reset time at the current rate.
+
+        Extrapolated from the last sample rather than from *now*, which is only
+        used to decide whether the window is still open: both ends of the line
+        are then readings, and a machine that has not rendered in six hours
+        does not get those hours counted twice — once as idle time inside the
+        rate, once as time still to burn.
+
+        None for a closed window (its outcome is the peak, not a projection)
+        and for one with no measurable rate. Uncapped: a projection over 100%
+        is the useful reading, since it says the limit arrives before the reset
+        does.
+        """
+        rate = self.burn_pph
+        if rate is None or not self.is_open(now):
+            return None
+        return self.latest_pct + rate * (self.resets_at - self.last_ts) / 3600
+
+
+def _window_instances(samples: list[dict]) -> list[WindowInstance]:
+    """Group *samples* into window instances, oldest instance first.
+
+    Keyed on (window, model, resets_at) rather than resets_at alone: the scoped
+    limit follows whichever model it is scoped to, and two models' weekly
+    windows reset together. *samples* must be in ts order — insertion order then
+    carries both the instances and the samples within one.
+
+    The reset time is bucketed to the minute through cache_db.rl_window_key, and
+    the bucket is what the instance reports. Rows written before the writer
+    normalized carry the API's jitter permanently, and grouping them on the exact
+    float turned one scoped week into 80 single-sample instances. The samples
+    keep the float they were stored with; only the instance's identity is
+    rounded, so nothing here rewrites what was recorded.
+    """
+    by_key: dict[tuple[str, str | None, float], WindowInstance] = {}
+    for s in samples:
+        resets = cache_db.rl_window_key(s["resets_at"])
+        key = (s["window"], s["model"], resets)
+        inst = by_key.get(key)
+        if inst is None:
+            inst = by_key[key] = WindowInstance(s["window"], s["model"], resets, [])
+        inst.samples.append(s)
+    return list(by_key.values())
+
+
+_SPEND_ALL = "*"
+"""The _SpendIndex series covering every model, whatever family it belongs to."""
+
+# Window types whose quota counts one model family, where the samples do not
+# name it. The scoped window carries its model in the sample; these do not.
+_WINDOW_FAMILY = {"sonnet": "sonnet"}
+
+
+def _window_family(inst: WindowInstance) -> str | None:
+    """Which model family's spend fills *inst*, or None for all of them.
+
+    The scoped window follows whichever model it is scoped to and names it in
+    the sample; the Sonnet window is scoped by its own definition. Session and
+    week count everything, so they get no filter. pricing.model_family maps a
+    sample's display name ("Fable") and a record's model ID ("claude-fable-5")
+    onto the same key, which is what lets the two be compared at all.
+    """
+    if inst.model:
+        return pricing.model_family(inst.model)
+    return _WINDOW_FAMILY.get(inst.window)
+
+
+class _SpendIndex:
+    """Deduplicated record cost, summable over a time range and model family.
+
+    Built once per run and queried once per window instance, because instances
+    overlap — every session window sits inside a week window, and summing the
+    corpus per instance is quadratic once a year of history has accumulated.
+
+    Each family keeps its own timestamps and running total rather than a column
+    in one array: the cost is then one bisect per query and one pass per record,
+    instead of a per-family pass over every record.
+
+    *records* must be in timestamp order, which is what load_all_records
+    returns.
+    """
+
+    def __init__(self, records: list[UsageRecord]) -> None:
+        self._ts: dict[str, list[float]] = {}
+        self._cum: dict[str, list[float]] = {}
+        for rec in records:
+            cost = rec.cost()
+            when = rec.timestamp.timestamp()
+            for key in (_SPEND_ALL, pricing.model_family(rec.model)):
+                self._ts.setdefault(key, []).append(when)
+                cum = self._cum.setdefault(key, [0.0])
+                cum.append(cum[-1] + cost)
+
+    @property
+    def empty(self) -> bool:
+        """Whether there is no corpus at all behind this index.
+
+        The reports ask, because $0.00 of spend against a window that visibly
+        filled is a missing corpus, not a free window, and rendering it as a
+        number would state the wrong one.
+        """
+        return not self._ts
+
+    def total(self, start: float, end: float, family: str | None = None) -> float:
+        """USD spent in [*start*, *end*], on *family* alone when given.
+
+        Both bounds inclusive, matching _keep and the window instance they come
+        from — a record written in the same second as the first sample belongs
+        to the window that sample opened.
+        """
+        key = family or _SPEND_ALL
+        stamps = self._ts.get(key)
+        if not stamps:
+            return 0.0
+        cum = self._cum[key]
+        return (cum[bisect.bisect_right(stamps, end)]
+                - cum[bisect.bisect_left(stamps, start)])
+
+
+@dataclass(frozen=True)
+class WindowSpend:
+    """What one window instance's observed rise cost, in API-priced dollars.
+
+    An exchange rate, not an identity: the rate limit meters something Anthropic
+    does not publish, and this divides what the same work would have cost at API
+    prices by the points it consumed. It answers "what is the rest of this
+    window worth" in the only unit this tool has.
+
+    Measured over the fill span (first sample → peak), the same span
+    WindowInstance.rise and .burn_pph are measured over, so the three describe
+    one stretch of time and not three.
+    """
+
+    usd: float | None
+    """Spend over the fill span."""
+    per_pp: float | None
+    """USD per point gained."""
+    headroom_usd: float | None
+    """What the points left are worth at that rate; None for a closed window,
+    whose points are gone rather than left."""
+
+
+_NO_SPEND = WindowSpend(None, None, None)
+
+
+def _instance_spend(
+    inst: WindowInstance, index: _SpendIndex, now: float,
+) -> WindowSpend:
+    """Price *inst*'s rise, and what is left of it, against the record corpus.
+
+    A window that never rose while it was watched prices as nothing at all
+    rather than as $0.00: its fill span is a single instant, and the spend of
+    an instant is a number nobody asked for wearing the answer to "was this
+    window free".
+    """
+    if index.empty or inst.rise <= 0:
+        return _NO_SPEND
+    usd = index.total(inst.first_ts, inst.peak_ts, _window_family(inst))
+    per_pp = usd / inst.rise
+    headroom = (
+        max(100.0 - inst.latest_pct, 0.0) * per_pp if inst.is_open(now) else None
+    )
+    return WindowSpend(usd, per_pp, headroom)
+
+
+def _load_instance_spend(
+    instances: list[WindowInstance], now: float,
+) -> dict[tuple[str, str | None, float], WindowSpend]:
+    """Price every instance, keyed the way _window_instances grouped them.
+
+    One corpus load, bounded to the span the instances cover: a report of the
+    last two days of windows has no use for two years of records. The bound is
+    the same one `--since` gives every other report, so the load is the cheap
+    filtered path rather than the whole table.
+
+    The full record path on purpose — dedup is what makes the number an answer.
+    Summing the rows raw double-counts every message the log wrote twice, which
+    on this machine reported $510 against a stretch that actually cost $231.
+    """
+    if not instances:
+        return {}
+    since = _as_local(min(i.first_ts for i in instances))
+    until = _as_local(max(i.peak_ts for i in instances))
+    index = _SpendIndex(load_all_records(since=since, until=until))
+    return {i.key: _instance_spend(i, index, now) for i in instances}
+
+
+def _implausible_reset(sample: dict) -> bool:
+    """Whether *sample*'s reset time is too far out to be a window.
+
+    The writer refuses these now (statusline_command._rl_sample), but this table
+    is permanent history and four rows carrying Claude Code's 9999999999
+    placeholder are already in it. Reported as-is they are one window per
+    placeholder, resetting in 2286, with a fill time in decades.
+    """
+    return sample["resets_at"] - sample["ts"] > RL_MAX_LOOKAHEAD_S
+
+
+def _instance_order(inst: WindowInstance) -> tuple[int, str, float, str]:
+    """Sort key: window type as printed, then chronological, model breaking ties.
+
+    Applied once, before the table and the JSON split, so the two agree on the
+    order — the model tiebreak is what makes it total, since two scoped models'
+    weekly windows reset at the same moment. An unlabelled window sorts after
+    all four and by name, which is also the order _window_types prints them.
+    """
+    known = inst.window in LIMIT_WINDOWS
+    rank = LIMIT_WINDOWS.index(inst.window) if known else len(LIMIT_WINDOWS)
+    return (rank, "" if known else inst.window, inst.resets_at, inst.model or "")
+
+
+def _window_types(instances: list[WindowInstance]) -> list[str]:
+    """The window types present, the four known ones in order and the rest after."""
+    present = {i.window for i in instances}
+    return [w for w in LIMIT_WINDOWS if w in present] + sorted(present - set(LIMIT_WINDOWS))
+
+
+def _fmt_span(seconds: float) -> str:
+    """A fill time as hours and minutes: 3h 07m, 42m, 0m."""
+    hours, minutes = divmod(int(seconds // 60), 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def _as_local(ts: float) -> datetime:
+    """An epoch as an aware datetime, for the AccountTimeline lookups.
+
+    Both lookups compare epochs, so the zone is only there to make the value
+    aware — but they take a datetime because every other caller has one.
+    """
+    return datetime.fromtimestamp(ts, _local_tz())
+
+
+def _fmt_epoch(ts: float) -> str:
+    """An epoch as local wall-clock time, in the tables' usual format."""
+    return _as_local(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _peak_style(pct: float) -> str:
+    """Colour a peak by how close it came to the limit."""
+    if round(pct) >= 100:
+        return "bold red"
+    if pct >= 90:
+        return "yellow"
+    if pct >= 50:
+        return "green"
+    return "dim green"
+
+
+def _fmt_burn(rate: float | None) -> str:
+    """A burn rate as points per hour, or the absent marker.
+
+    Two decimals below 10: a 7-day window moves at tenths of a point an hour,
+    and one decimal renders half a week's history as 0.1.
+    """
+    if rate is None:
+        return _ABSENT
+    return f"{rate:.1f}" if rate >= 10 else f"{rate:.2f}"
+
+
+def _fmt_money(usd: float | None) -> str:
+    """A spend or an exchange rate, or the absent marker for a missing corpus."""
+    return _ABSENT if usd is None else fmt_cost(usd)
+
+
+def _limits_entry(
+    inst: WindowInstance,
+    accounts: AccountTimeline,
+    spend: WindowSpend,
+    now: float,
+) -> dict:
+    """One instance as JSON: raw floats and epochs, nothing formatted.
+
+    The point of --json here is arithmetic somewhere else — plotting a fill
+    curve, correlating a tier change with the week it landed — so every number
+    goes out as stored and the local-time rendering stays in the table.
+    """
+    when = _as_local(inst.first_ts)
+    return {
+        "window": inst.window,
+        "model": inst.model,
+        "resets_at": inst.resets_at,
+        "first_ts": inst.first_ts,
+        "peak_ts": inst.peak_ts,
+        "last_ts": inst.last_ts,
+        "opening_used_pct": inst.opening_pct,
+        "peak_used_pct": inst.peak,
+        "latest_used_pct": inst.latest_pct,
+        "samples": len(inst.samples),
+        "fill_seconds": inst.fill_s,
+        "burn_pp_per_hour": inst.burn_pph,
+        "open": inst.is_open(now),
+        "projected_used_pct": inst.projected_pct(now),
+        "spend_usd": spend.usd,
+        "usd_per_pp": spend.per_pp,
+        "headroom_usd": spend.headroom_usd,
+        "hit_limit": inst.hit_limit,
+        "account": accounts.label_at(when),
+        "limit_tier": accounts.tier_at(when),
+    }
+
+
+def _open_note(inst: WindowInstance, spend: WindowSpend, now: float) -> str | None:
+    """The caption line for a window that has not reset yet, or None.
+
+    A projection belongs to one row, so a column of it would be one number and
+    a stack of dashes. It also needs saying in words: the reading it starts
+    from, the rate it applies, and — when the first sample was not 0 — that
+    both are measured over what was observed and not over the window's life.
+    """
+    if not inst.is_open(now):
+        return None
+    named = f"{short_model(inst.model)}: " if inst.model else ""
+    standing = f"{named}open at {inst.latest_pct:.1f}% ({_fmt_epoch(inst.last_ts)})"
+    parts = [f"{standing}, seen from {inst.opening_pct:.1f}%"]
+    projected = inst.projected_pct(now)
+    if projected is None:
+        parts.append("no rate to project from yet")
+    else:
+        parts.append(
+            f"{_fmt_burn(inst.burn_pph)} pp/h → {projected:.0f}% by reset "
+            f"{_fmt_epoch(inst.resets_at)}"
+        )
+    if spend.headroom_usd is not None:
+        parts.append(
+            f"{100 - inst.latest_pct:.1f} pp left ≈ {fmt_cost(spend.headroom_usd)}"
+        )
+    return "; ".join(parts)
+
+
+def _group_per_pp(group: list[WindowInstance], spends: dict) -> float | None:
+    """The group's own exchange rate: its total spend over its total rise.
+
+    Not the mean of the per-window rates — a window that rose one point would
+    weigh as much as a week that rose forty.
+    """
+    priced = [(i, spends[i.key]) for i in group if spends[i.key].usd is not None]
+    rise = sum(i.rise for i, _s in priced if i.rise > 0)
+    if not rise:
+        return None
+    return sum(s.usd for i, s in priced if i.rise > 0) / rise
+
+
+def report_limits(
+    instances: list[WindowInstance],
+    accounts: AccountTimeline,
+    spends: dict[tuple[str, str | None, float], WindowSpend],
+    now: float,
+) -> None:
+    """Print one table per window type, each summarized by its own footer.
+
+    *instances* arrive in _instance_order, so each group is already chronological.
+
+    Account and tier are attributed at the instance's first sample, the way
+    ccreport attributes a record: the table answers "who was drawing on this
+    window, under which tier", and a /login part-way through a window makes that
+    the account the window opened under.
+
+    *spends* is keyed by WindowInstance.key. Every instance must be in it, an
+    unpriceable one as _NO_SPEND: a missing key here would be a KeyError in the
+    middle of a rendered table.
+    """
+    for window in _window_types(instances):
+        group = [i for i in instances if i.window == window]
+        scoped = window == "scoped"
+        notes = [n for n in (_open_note(i, spends[i.key], now) for i in group) if n]
+        table = Table(
+            title=f"{_LIMIT_WINDOW_LABELS.get(window, window)} — {len(group)} window(s)",
+            title_style="bold", box=box.ROUNDED, expand=False, show_lines=False,
+            caption="\n".join(notes) or None, caption_style="dim",
+        )
+        table.add_column("Reset", style="white", no_wrap=True)
+        if scoped:
+            table.add_column("Model", style="magenta", no_wrap=True)
+        table.add_column("Peak", justify="right", no_wrap=True)
+        table.add_column("Samples", justify="right", style="dim", no_wrap=True)
+        table.add_column("Fill", justify="right", no_wrap=True)
+        table.add_column("pp/h", justify="right", no_wrap=True)
+        table.add_column("Spend", justify="right", no_wrap=True)
+        table.add_column("$/pp", justify="right", no_wrap=True)
+        table.add_column("Hit", justify="center", no_wrap=True)
+        # The two wrappable columns, so Rich shaves width off these first.
+        table.add_column("Account", style="green")
+        table.add_column("Tier", style="dim")
+
+        for inst in group:
+            when = _as_local(inst.first_ts)
+            tier = accounts.tier_at(when)
+            spend = spends[inst.key]
+            row = [_fmt_epoch(inst.resets_at)]
+            if scoped:
+                row.append(short_model(inst.model) if inst.model else _ABSENT)
+            row += [
+                Text(f"{inst.peak:.1f}%", style=_peak_style(inst.peak)),
+                str(len(inst.samples)),
+                _fmt_span(inst.fill_s),
+                _fmt_burn(inst.burn_pph),
+                Text(_fmt_money(spend.usd), style=cost_style(spend.usd or 0.0)),
+                _fmt_money(spend.per_pp),
+                Text("yes", style="bold red") if inst.hit_limit else "",
+                _flex_cell(accounts.label_at(when)),
+                _flex_cell(tier or _ABSENT),
+            ]
+            table.add_row(*row)
+
+        hits = sum(1 for i in group if i.hit_limit)
+        peak = max(i.peak for i in group)
+        priced = [spends[i.key].usd for i in group if spends[i.key].usd is not None]
+        summary: list = [Text(f"{len(group)} window(s)", style="dim bold")]
+        if scoped:
+            summary.append("")
+        summary += [
+            Text(f"{peak:.1f}%", style=_peak_style(peak)),
+            str(sum(len(i.samples) for i in group)),
+            "",
+            "",
+            _fmt_money(sum(priced) if priced else None),
+            _fmt_money(_group_per_pp(group, spends)),
+            f"{hits} hit",
+            "", "",
+        ]
+        table.add_section()
+        table.add_row(*summary, style="dim")
+        # Which columns go when the terminal is too narrow for all of them.
+        # Tier and account change rarely and are named in the row above the one
+        # that changed them; the sample count is how the numbers were arrived
+        # at, not one of them.
+        _fit_columns(table, ("Tier", "Account", "Samples"))
+        _print_report(table)
+
+
+def cmd_limits(args) -> None:
+    """Report how full each rate-limit window got, and how fast.
+
+    rate_limit_snapshots and account_events answer how full each window got and
+    who was drawing on it. What the filling cost is not in either — a sample
+    carries a percentage and no tokens — so the records covering the sampled
+    span are loaded too, and only that span: the window instances bound the
+    load, and history nobody sampled buys this report nothing.
+
+    --since/--until select samples, not instances, so a window straddling the
+    boundary reports the peak and fill time of the part inside the range, and
+    the spend of that part.
+    """
+    since = parse_date(args.since) if args.since else None
+    until = parse_date(args.until) if args.until else None
+
+    samples = load_rate_limit_snapshots()
+    if not samples:
+        print(
+            "No rate-limit samples recorded yet; the status line writes them as "
+            "it renders.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.window:
+        samples = [s for s in samples if s["window"] == args.window]
+    if since:
+        samples = [s for s in samples if s["ts"] >= since.timestamp()]
+    if until:
+        samples = [s for s in samples if s["ts"] <= until.timestamp()]
+
+    # After the filters, so the count describes the data this run would have
+    # reported rather than every placeholder on the machine. Said out loud
+    # because a report that quietly drops rows is a report that cannot be
+    # reconciled with the row count in the table.
+    kept = [s for s in samples if not _implausible_reset(s)]
+    if len(kept) < len(samples):
+        print(
+            f"note: dropped {len(samples) - len(kept)} sample(s) whose reset time "
+            f"is more than {RL_MAX_LOOKAHEAD_S // 86400} days past the reading — a "
+            "placeholder Claude Code sent, kept in history but not a window",
+            file=sys.stderr,
+        )
+    samples = kept
+    if not samples:
+        print("No rate-limit samples match those filters.", file=sys.stderr)
+        sys.exit(1)
+
+    instances = sorted(_window_instances(samples), key=_instance_order)
+    accounts = AccountTimeline(load_account_events())
+    now = datetime.now(UTC).timestamp()
+    spends = _load_instance_spend(instances, now)
+    if args.json:
+        print(json.dumps(
+            [_limits_entry(i, accounts, spends[i.key], now) for i in instances],
+            indent=2,
+        ))
+        return
+    report_limits(instances, accounts, spends, now)
 
 
 def main() -> None:
@@ -1898,13 +2585,14 @@ def main() -> None:
         description="Analyze Claude Code token usage and costs from local JSONL logs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  ccusage.py daily --since 20260201\n"
-               "  ccusage.py monthly\n"
-               "  ccusage.py session --limit 10\n"
-               "  ccusage.py daily --breakdown --project myapp\n"
-               "  ccusage.py account\n"
-               "  ccusage.py monthly --account personal@example.com\n"
-               "  ccusage.py adopt            # claim pre-capture history\n",
+               "  ccreport.py daily --since 20260201\n"
+               "  ccreport.py monthly\n"
+               "  ccreport.py session --limit 10\n"
+               "  ccreport.py daily --breakdown --project myapp\n"
+               "  ccreport.py account\n"
+               "  ccreport.py monthly --account personal@example.com\n"
+               "  ccreport.py adopt            # claim pre-capture history\n"
+               "  ccreport.py limits -w session\n",
     )
     sub = parser.add_subparsers(dest="command", help="Report type")
 
@@ -1946,6 +2634,14 @@ def main() -> None:
     pad.add_argument("--yes", "-y", action="store_true",
                      help="Skip the confirmation prompt")
 
+    # Rate-limit utilization history, from the statusline's samples.
+    pl = sub.add_parser("limits", help="Rate-limit window utilization history")
+    pl.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
+    pl.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
+    pl.add_argument("--window", "-w", choices=LIMIT_WINDOWS,
+                    help="Only this window type")
+    pl.add_argument("--json", "-j", action="store_true", help="Output as JSON")
+
     # Default (no subcommand): every report, the account table conditionally.
     parser.add_argument("--since", help="Start date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
@@ -1960,6 +2656,12 @@ def main() -> None:
 
     if args.command in ("overrides", "merge", "unmerge"):
         cmd_overrides(args)
+        return
+    # Loads records itself, bounded to the span its samples cover, so it runs
+    # here rather than falling through to the report path's unbounded load and
+    # the report it has no use for.
+    if args.command == "limits":
+        cmd_limits(args)
         return
     # Unlike the three above, this one loads records — its preview counts what
     # the adoption would cover — so it runs itself rather than falling through

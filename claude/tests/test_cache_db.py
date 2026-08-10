@@ -49,6 +49,21 @@ CREATE TABLE ccreport_records (
     cache_create INTEGER NOT NULL, cache_read INTEGER NOT NULL);
 """
 
+# account_events as it looked before the tier columns, holding one capture. The
+# schema script's CREATE TABLE IF NOT EXISTS sees the table and leaves it alone,
+# so only the ALTERs in _ADDED_COLUMNS can widen this.
+_PRE_TIER_ACCOUNT_EVENTS_SQL = """
+CREATE TABLE account_events (
+    ts                REAL PRIMARY KEY,
+    account_uuid      TEXT NOT NULL,
+    email             TEXT,
+    organization_uuid TEXT,
+    organization_name TEXT
+) WITHOUT ROWID;
+INSERT INTO account_events VALUES
+    (100.0, 'uuid-old', 'old@work.example', 'org-old', 'Old AS');
+"""
+
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
@@ -173,6 +188,35 @@ class TestSchemaColumns:
             # Tables added after a DB was created arrive through the schema
             # script, which only runs because SCHEMA_VERSION moved.
             assert {"account_events", "rate_limit_snapshots"} <= _tables(conn)
+        finally:
+            conn.close()
+            cache_db._conn = None
+
+    def test_a_pre_tier_account_log_keeps_its_rows_and_gains_the_columns(
+        self, tmp_path, monkeypatch,
+    ):
+        """CREATE TABLE IF NOT EXISTS cannot widen a table that already exists."""
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DISABLE", "1")
+        monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DIR", str(tmp_path / "snaps"))
+        path = tmp_path / "old.db"
+        old = sqlite3.connect(path)
+        old.executescript(_PRE_MIGRATION_SQL + _PRE_TIER_ACCOUNT_EVENTS_SQL)
+        old.commit()
+        old.close()
+
+        monkeypatch.setattr(cache_db, "DB_PATH", path)
+        monkeypatch.setattr(cache_db, "_conn", None)
+        conn = cache_db.get_connection()
+        try:
+            assert set(cache_db._ACCOUNT_TIER_COLS) <= _columns(conn, "account_events")
+            # The capture is intact and its tiers read as unrecorded, which is
+            # what they are — nothing was watching them when it was written.
+            assert cache_db.load_account_events() == [{
+                "ts": 100.0, "account_uuid": "uuid-old", "email": "old@work.example",
+                "organization_uuid": "org-old", "organization_name": "Old AS",
+                "seat_tier": None, "user_rate_limit_tier": None,
+                "organization_rate_limit_tier": None,
+            }]
         finally:
             conn.close()
             cache_db._conn = None
@@ -1896,12 +1940,16 @@ class TestAccountEvents:
         "emailAddress": "me@work.example",
         "organizationUuid": "org-work",
         "organizationName": "Work AS",
-        # Fields the table deliberately does not keep.
         "seatTier": "team_tier_1",
+        "userRateLimitTier": "default_claude_max_5x",
+        "organizationRateLimitTier": "default_raven",
+        # Fields the table deliberately does not keep.
         "billingType": "stripe_subscription",
         "displayName": "Me",
         "organizationRole": "owner",
     }
+    IDENTITY = (100.0, "uuid-work", "me@work.example", "org-work", "Work AS")
+    TIERS = ("team_tier_1", "default_claude_max_5x", "default_raven")
 
     def _rows(self, db):
         return db.execute(
@@ -1909,20 +1957,42 @@ class TestAccountEvents:
             "FROM account_events ORDER BY ts"
         ).fetchall()
 
-    def test_only_the_four_identity_fields_are_stored(self, db):
+    def _tiers(self, db):
+        return db.execute(
+            "SELECT seat_tier, user_rate_limit_tier, organization_rate_limit_tier "
+            "FROM account_events ORDER BY ts"
+        ).fetchall()
+
+    def test_the_identity_and_the_tiers_are_stored_and_nothing_else(self, db):
         assert record_account_event(self.ACC, now=100.0) is True
-        assert self._rows(db) == [
-            (100.0, "uuid-work", "me@work.example", "org-work", "Work AS"),
-        ]
+        assert self._rows(db) == [self.IDENTITY]
+        assert self._tiers(db) == [self.TIERS]
         assert _columns(db, "account_events") == {
             "ts", "account_uuid", "email", "organization_uuid", "organization_name",
+            "seat_tier", "user_rate_limit_tier", "organization_rate_limit_tier",
         }
+
+    def test_a_personal_plan_stores_its_missing_tiers_as_null(self, db):
+        record_account_event(
+            {"accountUuid": "uuid-home", "emailAddress": "me@home.example",
+             "organizationRateLimitTier": "default_claude_max_20x"},
+            now=100.0,
+        )
+        assert self._tiers(db) == [(None, None, "default_claude_max_20x")]
 
     def test_an_unchanged_account_writes_nothing(self, db):
         record_account_event(self.ACC, now=100.0)
         assert record_account_event(self.ACC, now=200.0) is False
-        assert record_account_event(dict(self.ACC, seatTier="other"), now=300.0) is False
+        assert record_account_event(dict(self.ACC, displayName="Other"), now=300.0) is False
         assert len(self._rows(db)) == 1
+
+    @pytest.mark.parametrize(
+        "key", ["seatTier", "userRateLimitTier", "organizationRateLimitTier"])
+    def test_a_tier_change_on_the_same_login_appends(self, db, key):
+        """The date a seat was upgraded is exactly what this log is for."""
+        record_account_event(self.ACC, now=100.0)
+        assert record_account_event(dict(self.ACC, **{key: "moved"}), now=200.0) is True
+        assert [r[1] for r in self._rows(db)] == ["uuid-work", "uuid-work"]
 
     def test_a_switch_appends_without_touching_the_old_row(self, db):
         record_account_event(self.ACC, now=100.0)
@@ -1981,10 +2051,35 @@ class TestAccountEvents:
         assert events[1] == {
             "ts": 300.0, "account_uuid": "uuid-work", "email": "me@work.example",
             "organization_uuid": "org-work", "organization_name": "Work AS",
+            "seat_tier": "team_tier_1",
+            "user_rate_limit_tier": "default_claude_max_5x",
+            "organization_rate_limit_tier": "default_raven",
         }
 
     def test_an_empty_log_loads_as_an_empty_list(self, db):
         assert cache_db.load_account_events() == []
+
+
+class TestEffectiveLimitTier:
+    """Which of the two rate-limit tiers a row was actually subject to."""
+
+    def _row(self, user=None, org=None):
+        return {"user_rate_limit_tier": user, "organization_rate_limit_tier": org}
+
+    def test_the_user_tier_wins_over_the_org_pool(self):
+        row = self._row(user="default_claude_max_5x", org="default_raven")
+        assert cache_db.effective_limit_tier(row) == "default_claude_max_5x"
+
+    def test_the_org_tier_answers_when_there_is_no_user_tier(self):
+        assert cache_db.effective_limit_tier(
+            self._row(org="default_claude_max_20x")) == "default_claude_max_20x"
+
+    def test_neither_recorded_is_none(self):
+        assert cache_db.effective_limit_tier(self._row()) is None
+
+    def test_a_row_from_before_the_columns_existed_is_none(self):
+        """Nothing recorded the tier then, and absent is not a tier."""
+        assert cache_db.effective_limit_tier({"account_uuid": "u", "email": "e"}) is None
 
 
 class TestAdoptedAccount:
@@ -1999,6 +2094,10 @@ class TestAdoptedAccount:
     ROW = {
         "account_uuid": "uuid-adopted", "email": "me@adopted.example",
         "organization_uuid": "org-a", "organization_name": "Adopted AS",
+        # What ccreport adopt writes: the claim says nothing about which tier
+        # that pre-capture history ran under, and nothing can be asked.
+        "seat_tier": None, "user_rate_limit_tier": None,
+        "organization_rate_limit_tier": None,
     }
 
     def _identities(self, events):
@@ -2167,6 +2266,27 @@ class TestRateLimitSnapshots:
     def test_an_empty_sample_list_is_a_no_op(self, db):
         record_rate_limit_snapshots([], now=1000.0)
         assert self._rows(db) == []
+
+    def test_every_sample_loads_back_oldest_first(self, db):
+        """Window breaks the ts tie: one render offers every window at once."""
+        record_rate_limit_snapshots([
+            self._sample(41.0, window="week"), self._sample(23.5),
+        ], now=1000.0)
+        record_rate_limit_snapshots(
+            [self._sample(12.0, window="scoped", model="claude-fable-5", source="api")],
+            now=2000.0,
+        )
+        assert cache_db.load_rate_limit_snapshots() == [
+            {"ts": 1000.0, "window": "session", "used_pct": 23.5,
+             "resets_at": self.RESETS, "model": None, "source": "stdin"},
+            {"ts": 1000.0, "window": "week", "used_pct": 41.0,
+             "resets_at": self.RESETS, "model": None, "source": "stdin"},
+            {"ts": 2000.0, "window": "scoped", "used_pct": 12.0,
+             "resets_at": self.RESETS, "model": "claude-fable-5", "source": "api"},
+        ]
+
+    def test_an_empty_table_loads_as_an_empty_list(self, db):
+        assert cache_db.load_rate_limit_snapshots() == []
 
     def test_the_newest_lookup_is_a_primary_key_scan(self, db):
         """The render pays this SELECT per window on every single render."""

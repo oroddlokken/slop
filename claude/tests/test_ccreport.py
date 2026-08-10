@@ -692,6 +692,47 @@ class TestAccountTimeline:
         assert tl.label_at(dt.datetime.fromtimestamp(1500.0, UTC)) == "uuid-none"
 
 
+class TestAccountTimelineTiers:
+    """The tier lookup rides the same events as the label lookup."""
+
+    def _tl(self, *events):
+        """A timeline from (ts, user_tier, org_tier) triples."""
+        return ccr.AccountTimeline([
+            {"ts": ts, "account_uuid": "u1", "email": "me@work.example",
+             "organization_uuid": "o1", "organization_name": "Work AS",
+             "seat_tier": None, "user_rate_limit_tier": user,
+             "organization_rate_limit_tier": org}
+            for ts, user, org in events
+        ])
+
+    def _at(self, tl, ts):
+        return tl.tier_at(dt.datetime.fromtimestamp(ts, UTC))
+
+    def test_the_tier_in_force_is_the_newest_event_at_or_before(self):
+        tl = self._tl(
+            (1000.0, "default_claude_max_5x", "default_raven"),
+            (2000.0, "default_claude_max_20x", "default_raven"),
+        )
+        assert self._at(tl, 1500.0) == "default_claude_max_5x"
+        assert self._at(tl, 2500.0) == "default_claude_max_20x"
+
+    def test_a_moment_before_the_first_event_has_no_tier(self):
+        tl = self._tl((1000.0, "default_claude_max_5x", None))
+        assert self._at(tl, 999.0) is None
+
+    def test_an_event_from_before_the_tier_columns_has_no_tier(self):
+        """Its columns read NULL, which is absent rather than a change."""
+        tl = self._tl((1000.0, None, None))
+        assert self._at(tl, 1500.0) is None
+
+    def test_the_org_pool_answers_when_no_user_tier_was_assigned(self):
+        tl = self._tl((1000.0, None, "default_claude_max_20x"))
+        assert self._at(tl, 1500.0) == "default_claude_max_20x"
+
+    def test_an_empty_log_has_no_tier(self):
+        assert self._at(self._tl(), 1500.0) is None
+
+
 class TestKeepAttributesAccounts:
     """The stamp and the --account filter share _keep with every other filter."""
 
@@ -1007,6 +1048,23 @@ class TestAdopt:
         capsys.readouterr()
         assert cache_db.read_adopted_account()["email"] == "me@work.example"
 
+    def test_the_claim_copies_the_identity_and_no_tier(self, loader, capsys):
+        """What tier that history ran under is unknown, and a copy would fake it."""
+        _write_jsonl(loader / "old.jsonl", when="2026-06-15T10:00:00Z",
+                     project_cwd="/tmp/live", ids=["msg-old"])
+        cache_db.record_account_event(
+            {"accountUuid": "u-work", "emailAddress": "me@work.example",
+             "organizationName": "Org", "seatTier": "team_tier_1",
+             "userRateLimitTier": "default_claude_max_5x",
+             "organizationRateLimitTier": "default_raven"},
+            now=self._epoch("2026-06-15T12:00:00Z"),
+        )
+        ccr.cmd_adopt(self._args())
+        capsys.readouterr()
+        adopted = cache_db.read_adopted_account()
+        assert adopted["email"] == "me@work.example"
+        assert [adopted[c] for c in ccr._ACCOUNT_TIER_COLS] == [None, None, None]
+
     def test_remove_never_prompts(self, loader, capsys):
         """The autouse fixture makes a stray prompt an error, not a hang."""
         self._corpus(loader)
@@ -1063,8 +1121,16 @@ class TestSameAccount:
     @pytest.mark.parametrize("field", [
         "account_uuid", "email", "organization_uuid", "organization_name",
     ])
-    def test_every_stored_field_counts(self, field):
+    def test_every_identity_field_counts(self, field):
         assert ccr._same_account(self._row(), self._row(**{field: "changed"})) is False
+
+    @pytest.mark.parametrize("field", [
+        "seat_tier", "user_rate_limit_tier", "organization_rate_limit_tier",
+    ])
+    def test_a_tier_difference_is_still_the_same_account(self, field):
+        """A seat upgrade does not make the login somebody else."""
+        base = self._row(**dict.fromkeys(ccr._ACCOUNT_TIER_COLS))
+        assert ccr._same_account(base, {**base, field: "moved"}) is True
 
 
 class TestAccountsWorthShowing:
@@ -1557,3 +1623,494 @@ class TestRecordOsloDate:
             ccr, "load_rates", lambda dates, _pf=None: asked.append(dates) or {})
         ccr.load_rates_for_records([_rec(oslo_date=dt.date(2026, 1, 1))])
         assert asked == [{dt.date(2026, 1, 1)}]
+
+
+# --- Rate limit utilization history (macsetup-3u9n) ---
+
+
+def _local_epoch(iso: str) -> float:
+    """A local wall-clock time as an epoch, which is how a sample stores it."""
+    return dt.datetime.fromisoformat(iso).replace(tzinfo=ccr._local_tz()).timestamp()
+
+
+# One 5-hour window on the 15th and one on the 16th. Reset times are what group
+# the samples, so they are named rather than derived at each call site.
+_W1_RESET = _local_epoch("2026-06-15T13:00")
+_W2_RESET = _local_epoch("2026-06-16T13:00")
+_W1_START = _local_epoch("2026-06-15T08:00")
+_W2_START = _local_epoch("2026-06-16T08:00")
+
+
+def _seed_samples(window, resets, start, pcts, *, step=3600.0, model=None, source="stdin"):
+    """Offer *pcts* an hour apart, so every one clears the write gate."""
+    for i, pct in enumerate(pcts):
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample(window, pct, resets, model, source)],
+            now=start + i * step,
+        )
+
+
+def _instances():
+    return sorted(
+        ccr._window_instances(cache_db.load_rate_limit_snapshots()),
+        key=ccr._instance_order,
+    )
+
+
+class TestWindowInstances:
+    """A window instance is the samples sharing one reset time."""
+
+    def test_two_reset_times_are_two_instances(self):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        _seed_samples("session", _W2_RESET, _W2_START, [1.0, 30.0])
+        assert [(i.resets_at, len(i.samples)) for i in _instances()] == [
+            (_W1_RESET, 2), (_W2_RESET, 2),
+        ]
+
+    def test_two_models_under_one_reset_time_are_two_instances(self):
+        """The scoped limit follows a model, and which model it scopes can change."""
+        _seed_samples("scoped", _W2_RESET, _W2_START, [5.0, 9.0],
+                      model="claude-fable-5", source="api")
+        _seed_samples("scoped", _W2_RESET, _W2_START + 4 * 3600, [70.0, 80.0],
+                      model="claude-opus-5", source="api")
+        assert [(i.model, i.peak) for i in _instances()] == [
+            ("claude-fable-5", 9.0), ("claude-opus-5", 80.0),
+        ]
+
+    def test_sub_minute_jitter_in_stored_rows_still_groups_as_one(self):
+        """Rows written before the writer normalized keep their drift forever."""
+        for i, jitter in enumerate([-0.97, 0.03, 0.94, -0.41]):
+            cache_db.record_rate_limit_snapshots(
+                [cache_db.RateLimitSample(
+                    "scoped", 10.0 + i * 10, _W2_RESET + jitter, "claude-fable-5", "api")],
+                now=_W2_START + i * 3600,
+            )
+        (inst,) = _instances()
+        assert len(inst.samples) == 4
+        assert inst.resets_at == _W2_RESET
+        # The instance reports the bucket; the rows keep what was recorded.
+        assert [s["resets_at"] for s in inst.samples] != [_W2_RESET] * 4
+
+    def test_the_windows_are_kept_apart(self):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0])
+        _seed_samples("week", _W1_RESET, _W1_START, [61.0])
+        assert [i.window for i in _instances()] == ["session", "week"]
+
+    def test_the_peak_is_the_fullest_reading_not_the_last(self):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 88.4, 40.0])
+        assert _instances()[0].peak == 88.4
+
+    def test_the_fill_time_runs_to_the_peak_and_not_past_it(self):
+        """Hours spent sitting at the peak are plateau, not fill."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 61.0, 61.0, 61.0])
+        inst = _instances()[0]
+        assert inst.fill_s == 3600.0
+        assert ccr._fmt_span(inst.fill_s) == "1h 00m"
+
+    def test_a_single_sample_fills_in_no_time(self):
+        """0 means the peak was already there when the first render saw it."""
+        _seed_samples("session", _W1_RESET, _W1_START, [61.0])
+        assert _instances()[0].fill_s == 0.0
+        assert ccr._fmt_span(0.0) == "0m"
+
+    @pytest.mark.parametrize(("peak", "hit"), [(99.6, True), (100.0, True), (99.4, False)])
+    def test_hitting_the_limit_is_decided_on_the_rounded_peak(self, peak, hit):
+        """The write gate rounds, so 99.6 is the last sample a full window leaves."""
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, peak])
+        assert _instances()[0].hit_limit is hit
+
+
+class TestWindowBurn:
+    """How fast a window filled, and where that rate lands it by reset time."""
+
+    def test_the_rate_is_the_rise_over_the_fill_span(self):
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 20.0, 40.0])
+        assert _instances()[0].burn_pph == 15.0
+
+    def test_the_plateau_is_no_part_of_the_rate(self):
+        """Fill runs to the peak, so the rate divides by the same span."""
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 40.0, 40.0, 40.0])
+        assert _instances()[0].burn_pph == 30.0
+
+    def test_the_rise_is_measured_from_the_first_reading_taken(self):
+        """Capture starts at a render, not at the window; 77% is where we looked."""
+        _seed_samples("week", _W1_RESET, _W1_START, [77.0, 86.0])
+        inst = _instances()[0]
+        assert (inst.opening_pct, inst.rise, inst.burn_pph) == (77.0, 9.0, 9.0)
+
+    @pytest.mark.parametrize("pcts", [[61.0], [61.0, 61.0]])
+    def test_a_window_that_never_rose_while_watched_has_no_rate(self, pcts):
+        """None, not 0 — 0 would read as a window that is not filling."""
+        _seed_samples("session", _W1_RESET, _W1_START, pcts)
+        assert _instances()[0].burn_pph is None
+
+    def _projected(self, pcts, now_iso):
+        _seed_samples("session", _W1_RESET, _W1_START, pcts)
+        return _instances()[0].projected_pct(_local_epoch(now_iso))
+
+    def test_the_projection_runs_from_the_last_sample_to_the_reset(self):
+        """20 pp/h, last read at 09:00 and 30%, four hours to the 13:00 reset."""
+        assert self._projected([10.0, 30.0], "2026-06-15T10:00") == 110.0
+
+    def test_the_projection_is_not_capped_at_full(self):
+        """Over 100% is the answer: the limit arrives before the reset does."""
+        assert self._projected([10.0, 30.0], "2026-06-15T10:00") > 100
+
+    def test_a_closed_window_is_not_projected(self):
+        """Its outcome is the peak. There is nothing left to predict."""
+        assert self._projected([10.0, 30.0], "2026-06-15T13:01") is None
+
+    def test_a_window_with_no_rate_is_not_projected(self):
+        assert self._projected([30.0], "2026-06-15T10:00") is None
+
+    def test_idle_time_between_two_renders_counts_against_the_rate(self):
+        """Wall-clock, and named as such: an overnight gap is time it took."""
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 20.0], step=4 * 3600.0)
+        assert _instances()[0].burn_pph == 2.5
+
+
+def _spend_rec(iso, *, usd, model="claude-opus-5"):
+    return _rec(model=model, cost_usd=usd,
+                timestamp=dt.datetime.fromtimestamp(_local_epoch(iso), UTC))
+
+
+class TestSpendIndex:
+    """Range sums over the record corpus, by model family."""
+
+    def _index(self):
+        return ccr._SpendIndex([
+            _spend_rec("2026-06-15T08:00", usd=1.0),
+            _spend_rec("2026-06-15T09:00", usd=2.0, model="claude-fable-5"),
+            _spend_rec("2026-06-15T10:00", usd=4.0),
+        ])
+
+    def _total(self, start, end, family=None):
+        return self._index().total(
+            _local_epoch(start), _local_epoch(end), family)
+
+    def test_both_bounds_are_inclusive(self):
+        """A record written in the first sample's second is inside the window."""
+        assert self._total("2026-06-15T08:00", "2026-06-15T10:00") == 7.0
+
+    def test_records_outside_the_range_are_left_out(self):
+        assert self._total("2026-06-15T09:00", "2026-06-15T09:30") == 2.0
+
+    def test_a_family_sums_only_its_own_models(self):
+        assert self._total("2026-06-15T08:00", "2026-06-15T10:00", "fable") == 2.0
+
+    def test_a_family_with_no_records_sums_to_nothing(self):
+        assert self._total("2026-06-15T08:00", "2026-06-15T10:00", "haiku") == 0.0
+
+    def test_an_index_with_no_corpus_behind_it_says_so(self):
+        assert ccr._SpendIndex([]).empty is True
+        assert self._index().empty is False
+
+
+class TestWindowFamily:
+    """Which model family's spend a window's quota counts."""
+
+    def _inst(self, window, model=None):
+        return ccr.WindowInstance(window, model, _W1_RESET, [
+            {"ts": _W1_START, "used_pct": 1.0, "resets_at": _W1_RESET,
+             "model": model, "source": "api"},
+        ])
+
+    def test_the_scoped_window_follows_the_model_it_names(self):
+        assert ccr._window_family(self._inst("scoped", "claude-fable-5")) == "fable"
+
+    def test_the_sonnet_window_is_scoped_without_naming_a_model(self):
+        assert ccr._window_family(self._inst("sonnet")) == "sonnet"
+
+    @pytest.mark.parametrize("window", ["session", "week"])
+    def test_the_unscoped_windows_count_every_model(self, window):
+        assert ccr._window_family(self._inst(window)) is None
+
+
+class TestInstanceSpend:
+    """What a window's rise cost, and what the rest of it is worth."""
+
+    def _priced(self, pcts, *, now_iso="2026-06-15T10:00", records=None):
+        _seed_samples("session", _W1_RESET, _W1_START, pcts)
+        index = ccr._SpendIndex(records if records is not None else [
+            _spend_rec("2026-06-15T08:30", usd=10.0),
+            _spend_rec("2026-06-15T09:30", usd=5.0),
+        ])
+        return ccr._instance_spend(
+            _instances()[0], index, _local_epoch(now_iso))
+
+    def test_the_spend_is_what_the_fill_span_cost(self):
+        """08:00 → 09:00 is the fill; the 09:30 record is after the peak."""
+        assert self._priced([10.0, 30.0, 30.0]).usd == 10.0
+
+    def test_the_exchange_rate_divides_that_spend_by_the_rise(self):
+        assert self._priced([10.0, 30.0, 30.0]).per_pp == 0.5
+
+    def test_the_headroom_prices_the_points_left_in_an_open_window(self):
+        """70 points to go at $0.50 each."""
+        assert self._priced([10.0, 30.0, 30.0]).headroom_usd == 35.0
+
+    def test_a_closed_window_has_no_headroom_to_price(self):
+        assert self._priced([10.0, 30.0, 30.0],
+                            now_iso="2026-06-15T13:01").headroom_usd is None
+
+    def test_a_full_window_is_worth_nothing_more(self):
+        """Not a negative number, which is what 100 - 104 would price."""
+        assert self._priced([10.0, 104.0]).headroom_usd == 0.0
+
+    def test_a_window_that_never_rose_prices_as_nothing_at_all(self):
+        """$0.00 over an instant would read as a window that was free."""
+        assert self._priced([30.0]) == ccr._NO_SPEND
+
+    def test_a_missing_corpus_prices_as_nothing_at_all(self):
+        assert self._priced([10.0, 30.0], records=[]) == ccr._NO_SPEND
+
+
+class TestLimitsAttribution:
+    """Account and tier come off the event in force at the first sample."""
+
+    def _capture(self, iso, uuid, email, user_tier):
+        cache_db.record_account_event(
+            {"accountUuid": uuid, "emailAddress": email, "organizationName": "Org",
+             "seatTier": "team_tier_1", "userRateLimitTier": user_tier,
+             "organizationRateLimitTier": "default_raven"},
+            now=_local_epoch(iso),
+        )
+
+    def _seeded(self):
+        """Two session windows straddling a tier change on the same login."""
+        self._capture("2026-06-14T12:00", "u-work", "me@work.example",
+                      "default_claude_max_5x")
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        self._capture("2026-06-15T20:00", "u-work", "me@work.example",
+                      "default_claude_max_20x")
+        _seed_samples("session", _W2_RESET, _W2_START, [1.0, 30.0])
+        return _instances(), ccr.AccountTimeline(cache_db.load_account_events())
+
+    def test_each_window_reports_the_tier_it_opened_under(self):
+        instances, accounts = self._seeded()
+        assert [accounts.tier_at(ccr._as_local(i.first_ts)) for i in instances] == [
+            "default_claude_max_5x", "default_claude_max_20x",
+        ]
+
+    def test_the_account_label_comes_from_the_same_event(self):
+        instances, accounts = self._seeded()
+        assert [accounts.label_at(ccr._as_local(i.first_ts)) for i in instances] == [
+            "me@work.example", "me@work.example",
+        ]
+
+    def test_a_window_older_than_the_log_reports_neither(self):
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 40.0])
+        self._capture("2026-06-16T12:00", "u-work", "me@work.example",
+                      "default_claude_max_5x")
+        accounts = ccr.AccountTimeline(cache_db.load_account_events())
+        when = ccr._as_local(_instances()[0].first_ts)
+        assert accounts.label_at(when) == ccr.UNKNOWN_ACCOUNT
+        assert accounts.tier_at(when) is None
+
+
+class TestCmdLimits:
+    """The subcommand: filters, the JSON shape, and the empty cases."""
+
+    @pytest.fixture(autouse=True)
+    def _corpus_stub(self, monkeypatch):
+        """No corpus unless a test seeds one.
+
+        The real load walks the machine's own ~/.claude tree, which is both slow
+        and different on every machine the suite runs on.
+        """
+        self.records: list = []
+        monkeypatch.setattr(ccr, "load_all_records", lambda **_kw: self.records)
+
+    def _args(self, **kw):
+        return types.SimpleNamespace(
+            **{"since": None, "until": None, "window": None, "json": False, **kw})
+
+    def _corpus(self):
+        cache_db.record_account_event(
+            {"accountUuid": "u-work", "emailAddress": "me@work.example",
+             "organizationName": "Org", "userRateLimitTier": "default_claude_max_5x"},
+            now=_local_epoch("2026-06-14T12:00"),
+        )
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0, 99.7])
+        _seed_samples("week", _W1_RESET, _W1_START, [30.0, 44.0])
+        _seed_samples("scoped", _W2_RESET, _W2_START, [5.0, 9.0],
+                      model="claude-fable-5", source="api")
+
+    def _run_json(self, capsys, **kw):
+        """The parsed --json entries and the stderr text, from one capture.
+
+        Both in one call because readouterr() drains both streams: reading the
+        entries and then reading stderr hands the second read an empty string.
+        """
+        ccr.cmd_limits(self._args(json=True, **kw))
+        cap = capsys.readouterr()
+        return json.loads(cap.out), cap.err
+
+    def _json(self, capsys, **kw):
+        return self._run_json(capsys, **kw)[0]
+
+    def test_an_unwritten_table_exits_one_with_a_reason(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_limits(self._args())
+        assert exc.value.code == 1
+        assert "No rate-limit samples recorded" in capsys.readouterr().err
+
+    def test_filters_that_match_nothing_exit_one(self, capsys):
+        self._corpus()
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_limits(self._args(since="20990101"))
+        assert exc.value.code == 1
+        assert "match those filters" in capsys.readouterr().err
+
+    def test_the_json_entry_carries_raw_floats_and_epochs(self, capsys):
+        self._corpus()
+        self.records = [_spend_rec("2026-06-15T08:30", usd=8.0)]
+        assert self._json(capsys, window="session") == [{
+            "window": "session", "model": None, "resets_at": _W1_RESET,
+            "first_ts": _W1_START, "peak_ts": _W1_START + 3600.0,
+            "last_ts": _W1_START + 3600.0, "opening_used_pct": 2.0,
+            "peak_used_pct": 99.7, "latest_used_pct": 99.7,
+            "samples": 2, "fill_seconds": 3600.0, "burn_pp_per_hour": 97.7,
+            "open": False, "projected_used_pct": None,
+            "spend_usd": 8.0, "usd_per_pp": 8.0 / 97.7, "headroom_usd": None,
+            "hit_limit": True, "account": "me@work.example",
+            "limit_tier": "default_claude_max_5x",
+        }]
+
+    def test_the_json_lists_every_window_in_the_printed_order(self, capsys):
+        self._corpus()
+        assert [(e["window"], e["model"]) for e in self._json(capsys)] == [
+            ("session", None), ("week", None), ("scoped", "claude-fable-5"),
+        ]
+
+    def test_the_window_filter_selects_one_type(self, capsys):
+        self._corpus()
+        assert [e["window"] for e in self._json(capsys, window="week")] == ["week"]
+
+    def test_a_date_bound_selects_samples_not_whole_instances(self, capsys):
+        """A 5-hour window straddling midnight reports the part inside the range."""
+        _seed_samples("session", _local_epoch("2026-06-16T02:00"),
+                      _local_epoch("2026-06-15T23:00"), [40.0, 90.0], step=5400.0)
+        entries = self._json(capsys, since="20260616")
+        assert [(e["samples"], e["peak_used_pct"]) for e in entries] == [(1, 90.0)]
+
+    SENTINEL = 9_999_999_999.0
+    """The placeholder resets_at Claude Code sent on stdin; four rows carry it."""
+
+    def _seed_sentinel(self):
+        cache_db.record_rate_limit_snapshots(
+            [cache_db.RateLimitSample("session", 12.0, self.SENTINEL, None, "stdin")],
+            now=_W1_START,
+        )
+
+    def test_a_placeholder_reset_is_dropped_and_said_out_loud(self, capsys):
+        self._corpus()
+        self._seed_sentinel()
+        entries, err = self._run_json(capsys, window="session")
+        assert [e["resets_at"] for e in entries] == [_W1_RESET]
+        assert "dropped 1 sample(s)" in err
+        assert "8 days" in err
+
+    def test_nothing_is_said_when_nothing_was_dropped(self, capsys):
+        self._corpus()
+        assert self._run_json(capsys)[1] == ""
+
+    def test_the_note_counts_only_what_this_run_would_have_shown(self, capsys):
+        """The filters run first, so a --window the placeholder is not in stays quiet."""
+        self._corpus()
+        self._seed_sentinel()
+        assert self._run_json(capsys, window="week")[1] == ""
+
+    def test_a_run_left_with_nothing_but_placeholders_exits_one(self, capsys):
+        self._seed_sentinel()
+        with pytest.raises(SystemExit) as exc:
+            ccr.cmd_limits(self._args())
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "dropped 1 sample(s)" in err
+        assert "match those filters" in err
+
+    def test_a_window_this_report_has_no_label_for_still_shows_up(self, capsys, monkeypatch):
+        """The writer's window list lives elsewhere; drift must not lose history."""
+        buf = io.StringIO()
+        monkeypatch.setattr(ccr, "console", Console(file=buf, width=200, no_color=True))
+        _seed_samples("session", _W1_RESET, _W1_START, [2.0])
+        _seed_samples("opus_hourly", _W1_RESET, _W1_START, [61.0])
+        ccr.cmd_limits(self._args())
+        out = buf.getvalue()
+        assert out.index("Session (5h)") < out.index("opus_hourly — 1 window(s)")
+
+    def test_the_table_names_each_window_and_summarizes_it(self, capsys, monkeypatch):
+        buf = io.StringIO()
+        monkeypatch.setattr(ccr, "console", Console(file=buf, width=200, no_color=True))
+        self._corpus()
+        ccr.cmd_limits(self._args())
+        out = buf.getvalue()
+        assert "Session (5h) — 1 window(s)" in out
+        assert "Scoped model (7d) — 1 window(s)" in out
+        assert "fable-5" in out
+        assert "99.7%" in out
+        assert "1 hit" in out
+        assert "0 hit" in out
+        assert "default_claude_max_5x" in out
+
+
+class TestLimitsRendering:
+    """The table's own decisions: the caption, and what a narrow terminal loses."""
+
+    def _render(self, monkeypatch, *, width=200, records=(), now=None):
+        buf = io.StringIO()
+        monkeypatch.setattr(ccr, "console", Console(file=buf, width=width, no_color=True))
+        instances = _instances()
+        stamp = _local_epoch(now) if now else _W1_START
+        spends = {
+            i.key: ccr._instance_spend(i, ccr._SpendIndex(list(records)), stamp)
+            for i in instances
+        }
+        ccr.report_limits(instances, _timeline(), spends, stamp)
+        return buf.getvalue()
+
+    def test_an_open_window_is_read_out_under_its_table(self, monkeypatch):
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
+        out = self._render(monkeypatch, now="2026-06-15T10:00", records=[
+            _spend_rec("2026-06-15T08:30", usd=10.0),
+        ])
+        assert "open at 30.0%" in out
+        assert "seen from 10.0%" in out
+        assert "20.0 pp/h" in out
+        assert "110% by reset 2026-06-15 13:00" in out
+        assert "70.0 pp left" in out
+
+    def test_the_caption_names_the_model_of_a_scoped_window(self, monkeypatch):
+        _seed_samples("scoped", _W1_RESET, _W1_START, [10.0, 30.0],
+                      model="claude-fable-5", source="api")
+        assert "fable-5: open at 30.0%" in self._render(
+            monkeypatch, now="2026-06-15T10:00")
+
+    def test_a_closed_window_is_read_out_to_nobody(self, monkeypatch):
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
+        assert "open at" not in self._render(monkeypatch, now="2026-06-15T13:01")
+
+    def test_an_open_window_with_no_rate_says_that_instead_of_a_number(self, monkeypatch):
+        _seed_samples("session", _W1_RESET, _W1_START, [30.0])
+        out = self._render(monkeypatch, now="2026-06-15T10:00")
+        assert "no rate to project from yet" in out
+
+    def test_a_narrow_terminal_drops_the_named_columns_in_order(self, monkeypatch):
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
+        wide = self._render(monkeypatch, width=200)
+        for header in ("Tier", "Account", "Samples"):
+            assert header in wide
+        narrow = self._render(monkeypatch, width=80)
+        assert "Tier" not in narrow
+        assert "Account" not in narrow
+        assert "Samples" in narrow
+
+    def test_the_numbers_survive_a_terminal_too_narrow_for_the_words(self, monkeypatch):
+        """Rich's own answer is to ellipsize every column, losing all of them."""
+        _seed_samples("session", _W1_RESET, _W1_START, [10.0, 30.0])
+        narrow = self._render(monkeypatch, width=80, records=[
+            _spend_rec("2026-06-15T08:30", usd=10.0),
+        ])
+        assert "20.0" in narrow
+        assert "$0.5" in narrow

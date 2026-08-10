@@ -111,6 +111,22 @@ class TestWindowSize:
         assert out.endswith(f"/{expected}\033[0m")
 
 
+class TestCtxPct:
+    def test_glued_form_carries_no_label(self):
+        assert sl._render_ctx_pct(10_000, 200_000, label=False) == "\033[0;90m:\033[0;90m6%\033[0m"
+
+    def test_standalone_form_is_labelled(self):
+        assert sl._render_ctx_pct(10_000, 200_000, label=True).startswith("\033[0;90mctx:")
+
+    @pytest.mark.parametrize(("green", "col"), [("0", "90"), ("1", "32")])
+    def test_ctx_green_recolors_only_the_low_band(self, monkeypatch, green, col):
+        monkeypatch.setenv("CLAUDE_STATUSLINE_CTX_GREEN", green)
+        monkeypatch.setenv("CLAUDE_STATUSLINE_USABLE_CTX", "0")
+        assert sl._render_ctx_pct(20_000, 200_000, label=False).endswith(f"\033[0;{col}m10%\033[0m")
+        assert sl._render_ctx_pct(120_000, 200_000, label=False).endswith("\033[0;33m60%\033[0m")
+        assert sl._render_ctx_pct(160_000, 200_000, label=False).endswith("\033[0;31m80%\033[0m")
+
+
 class TestCfBadge:
     """The wrapper's own name is the label, so cf and co sessions read apart."""
 
@@ -824,6 +840,9 @@ class TestCaptureAccount:
         "emailAddress": "me@work.example",
         "organizationUuid": "org-work",
         "organizationName": "Work AS",
+        "seatTier": "team_tier_1",
+        "userRateLimitTier": "default_claude_max_5x",
+        "organizationRateLimitTier": "default_raven",
     }
 
     @pytest.fixture
@@ -847,6 +866,10 @@ class TestCaptureAccount:
         assert event["account_uuid"] == "uuid-work"
         assert event["email"] == "me@work.example"
         assert event["organization_name"] == "Work AS"
+        # The whole blob is handed over, so the tiers ride along with it.
+        assert event["seat_tier"] == "team_tier_1"
+        assert event["user_rate_limit_tier"] == "default_claude_max_5x"
+        assert event["organization_rate_limit_tier"] == "default_raven"
 
     def test_repeat_renders_do_not_grow_the_log(self, config):
         import json
@@ -958,7 +981,10 @@ class TestRateLimitSamples:
     """What the render offers the snapshot gate, and what it refuses to invent."""
 
     NOW = 1_000_000.0
-    RESETS = NOW + 8100
+    # Both on a whole minute, because _rl_sample normalizes a reset time to one
+    # (cache_db.rl_window_key) and these cases are about the readings, not that.
+    RESETS = 1_008_000.0
+    WEEK_RESETS = 1_404_000.0
 
     def _stdin(self, **windows):
         return {"rate_limits": windows}
@@ -972,11 +998,11 @@ class TestRateLimitSamples:
         """_native_rate_limits rounds for the display; the fill rate needs the float."""
         data = self._stdin(
             five_hour={"used_percentage": 23.47, "resets_at": self.RESETS},
-            seven_day={"used_percentage": 41.02, "resets_at": self.RESETS + 400_000},
+            seven_day={"used_percentage": 41.02, "resets_at": self.WEEK_RESETS},
         )
         assert sl._rl_samples(data, {}, self.NOW) == [
             ("session", 23.47, self.RESETS, None, "stdin"),
-            ("week", 41.02, self.RESETS + 400_000, None, "stdin"),
+            ("week", 41.02, self.WEEK_RESETS, None, "stdin"),
         ]
 
     def test_api_resets_are_converted_from_iso(self):
@@ -1028,6 +1054,53 @@ class TestRateLimitSamples:
         assert sl._rl_samples({}, usage, self.NOW) == [
             ("scoped", 7.0, self.RESETS, None, "api"),
         ]
+
+
+class TestRateLimitResetNormalization:
+    """The API's reset time is a float that drifts; the window is not."""
+
+    NOW = 1_000_000.0
+    RESETS = 1_008_000.0
+
+    def _sample(self, resets, now=None):
+        return sl._rl_sample(
+            "scoped", 42.0, resets, None, "api", self.NOW if now is None else now,
+        )
+
+    @pytest.mark.parametrize("jitter", [-0.97, -0.03, 0.0, 0.03, 29.4, -29.4])
+    def test_sub_minute_drift_lands_on_the_same_window(self, jitter):
+        """One reset, one identity — 80 scoped rows shared a window and a float each."""
+        assert self._sample(self.RESETS + jitter).resets_at == self.RESETS
+
+    def test_the_next_minute_is_still_a_different_window(self):
+        """Normalizing must not merge two windows that genuinely differ."""
+        assert self._sample(self.RESETS + 60).resets_at == self.RESETS + 60
+
+    def test_jitter_does_not_bypass_the_write_gate(self, tmp_path):
+        """The bypass is what let one day of scoped history reach 80 rows."""
+        import cache_db
+
+        for i, jitter in enumerate([0.03, -0.44, 0.91, -0.12]):
+            # An hour apart and a whole percent apart would each pass the gate on
+            # their own; what must not pass is the reset time looking new.
+            cache_db.record_rate_limit_snapshots(
+                [self._sample(self.RESETS + jitter)], now=self.NOW + i * 3600,
+            )
+        rows = cache_db.load_rate_limit_snapshots()
+        assert len(rows) == 1
+        assert rows[0]["resets_at"] == self.RESETS
+
+    @pytest.mark.parametrize("resets", [
+        9_999_999_999.0,        # the placeholder Claude Code sends on stdin
+        NOW + 8 * 86_400 + 1,   # just past the bound
+        NOW + 400 * 86_400,     # a year out
+    ])
+    def test_a_reset_too_far_out_is_not_a_reading(self, resets):
+        assert self._sample(resets) is None
+
+    def test_the_longest_real_window_still_records(self):
+        """The bound has to clear a 7-day window quoted generously."""
+        assert self._sample(self.NOW + 7 * 86_400) is not None
 
 
 class TestSnapshotRateLimitsGating:
