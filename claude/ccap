@@ -1,0 +1,17 @@
+#!/usr/bin/env zsh
+# Launch Claude Code with ccreport's quota guard armed: a warning past 80% of a
+# usage window, a halted turn past 90%.
+#
+# Usage: ccap [claude args...]
+#
+# CCQUOTA_STOP is what arms the hook, and the hook reads the environment its
+# session was launched with, so a running session cannot be capped after the
+# fact. Both numbers are defaults: `CCQUOTA_STOP=95 ccap` moves the line for one
+# session.
+
+set -euo pipefail
+
+export CCQUOTA_WARN="${CCQUOTA_WARN:-80}"
+export CCQUOTA_STOP="${CCQUOTA_STOP:-90}"
+
+exec claude "$@"

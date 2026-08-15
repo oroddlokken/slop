@@ -12,6 +12,8 @@ Various slop I have made for use with Claude Code or OpenCode.
 
 [perf-cop](perf-cop) is the runtime-cost sweep — parallel agents hunting hot loops, chatty I/O, blocking calls and cold-start weight, where every finding has to name the workload it costs or it gets demoted.
 
+[will-it-run](will-it-run) asks the other half of that question — not what a path costs, but whether it fits: you declare the RAM, cores, disk and cooling of the machine it lands on, and one agent checks peak demand against each ceiling.
+
 [dba](dba) is a database & SQL deep-dive — parallel agents scanning through lenses like injection, N+1, schema drift, and transaction gaps, distilled into prioritized fixes.
 
 [test-my-tests](test-my-tests) asks whether your tests would actually catch real bugs, not just whether they exist.
