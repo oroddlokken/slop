@@ -47,7 +47,7 @@ Every action item includes a file path and line number.
 | Quick | 3 high-yield lenses: hot-loops, io-batching, blocking — CPU in the loop, round trips across a boundary, and waiting |
 | Pick | You choose which lenses to run |
 
-Agents run sequentially by default — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost. Parallel is available when you want speed instead.
+Agents run sequentially by default — it spreads token spend across the run instead of bursting it. Either way one agent runs alone first: it writes the cache entry for the system prompt and tool definitions, and every agent after it reads that entry. The rolling window costs the same and finishes sooner.
 
 ## Against its siblings
 

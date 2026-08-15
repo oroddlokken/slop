@@ -57,7 +57,7 @@ For each drift:
 |-------|---------|
 | **Location** | doc file:line |
 | **Doc claims** | The command / flag / env var / signature / path stated |
-| **Code has** | What the code actually exposes (or that it's gone) |
+| **Code has** | What the code exposes (or that it's gone) |
 | **User impact** | The error or confusion a reader hits by following the doc |
 | **Suggestion** | Update the doc to match the code |
 
@@ -78,6 +78,6 @@ After scanning, output your `## Findings Summary` table:
 ## Rules
 
 - **Verify against the code, don't guess.** Grep for the symbol/flag/env var before claiming drift. A false drift report sends the user to "fix" correct docs.
-- **Fix the doc to match the code** (unless the code is clearly the bug — then note "possible code/doc mismatch, confirm intent" and don't guess which side is right). A count is the exception: remove the number instead of updating it, so the same sentence cannot drift a second time.
+- **Fix the doc to match the code** (unless the code is the bug — then note "possible code/doc mismatch, confirm intent" and don't guess which side is right). A count is the exception: remove the number instead of updating it, so the same sentence cannot drift a second time.
 - **This lens owns external prose only** (`*.md`, `*.rst`, README, docs sites). In-source docstring drift is `contradicts-code`.
 - **Prioritize the happy path.** A broken first-run instruction outranks a stale link deep in an appendix.

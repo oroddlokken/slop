@@ -14,8 +14,11 @@ A paragraph justifying a choice the user did not question, usually opening with 
 - "Not checked here — the deploy tool already owns it."
 - "The editor is withheld on this screen because edits made here would race the file on disk."
 - "We compute this server-side so the number is consistent for everyone."
+- "Kept here for backwards compatibility." / "Kept here until the new flow ships."
 
 The tell: a causal connective (`because`, `so`, `rather than`, `which is why`) joining a product decision to a principle. Nothing in the sentence tells the user what to do.
+
+`Kept here` is the compressed form and gets the same treatment. It argues for the control's continued existence, which the user did not challenge and cannot change. Where the answer is "then don't use it", the fix is a limit — "Read-only; edit on /settings" — not the history of why it survived.
 
 ### The boundary essay
 
@@ -76,7 +79,7 @@ The test: **does the sentence change what the user does next?** Rationale never 
 
 ## How to Scan
 
-1. **Grep the inventory for causal connectives** at sentence scale: `because`, `so that`, `which is why`, `rather than`, `the reason`, `by design`, `intentionally`, `deliberately`, `we chose`, `we decided`.
+1. **Grep the inventory for causal connectives** at sentence scale: `because`, `so that`, `which is why`, `rather than`, `the reason`, `by design`, `intentionally`, `deliberately`, `we chose`, `we decided`, `kept here`, `left in place`.
 2. **Grep for comparative and promotional claims**: `nothing else`, `unlike`, `the only`, `best`, `smart`, `powerful`, `comprehensive`, `actionable`, `seamless`, `simply the`.
 3. **Grep for first-person product voice**: `we `, `our `, `us `. In an interface, first person is almost always the developer explaining themselves.
 4. **For each long paragraph in the inventory, delete every clause that does not change the user's next action.** What remains is the proposed replacement. Frequently it is nothing.

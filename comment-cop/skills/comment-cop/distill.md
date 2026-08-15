@@ -21,7 +21,7 @@ Build a canonical list as an internal scratchpad. The user does not see this.
 
 ### 1.0 Apply errata
 
-You may receive an **errata list** — corrections the orchestrator made to the shared brief after some agents had already run. Each entry states what the brief claimed, what is actually true with a `file:line` citation, and which agents ran before it was added. Skip this step when no errata were passed.
+You may receive an **errata list** — corrections the orchestrator made to the shared brief after some agents had already run. Each entry states what the brief claimed, what is true with a `file:line` citation, and which agents ran before it was added. Skip this step when no errata were passed.
 
 Errata override the brief. For every finding from an agent that ran *before* an entry was added:
 
@@ -33,7 +33,7 @@ Findings from agents launched after an entry already had it, so leave them alone
 ### 1.1 Validate
 
 For each finding, read the cited file:line. Confirm two things:
-1. The comment/doc quoted actually exists there (not hallucinated).
+1. The comment/doc quoted exists there (not hallucinated).
 2. It is a real prose problem, not a why-comment carrying rationale that was misread as clutter. If the comment captures real rationale, a gotcha, or a non-obvious constraint, mark the finding `false-positive` and exclude it — protecting good comments is part of the job.
 
 If the cited prose does not exist or does not match, mark `hallucinated` and exclude. Keep counts of both.
@@ -44,8 +44,8 @@ Assign each surviving finding to one impact category:
 - **Misleading** — the prose is wrong or contradicts the code; a maintainer trusting it is harmed. (contradicts-code, doc-drift, lying docstrings)
 - **Rot risk** — accurate today but engineered to go stale (anecdotes, tickets, dates, live-instance names).
 - **Clutter** — noise that costs reading time without misleading (rambling, restates-code, noise, dead-comments).
-- **Gap** — missing prose where it is genuinely needed (missing-why, docstring-gaps).
-- **Noise (drop)** — subjective preference, or a comment that is actually fine → drop.
+- **Gap** — missing prose where it is needed (missing-why, docstring-gaps).
+- **Noise (drop)** — subjective preference, or a comment that is fine → drop.
 
 ### 1.3 Deduplicate
 

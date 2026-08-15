@@ -1,6 +1,6 @@
 # Find Rambling Prose
 
-Scan for comments and docstrings that say in five paragraphs what belongs in one line. The target is self-indulgent narrative: essays, storytelling, and over-explanation that bury the one fact a reader actually needs. A comment is prose that has to earn its length — most of it does not.
+Scan for comments and docstrings that say in five paragraphs what belongs in one line. The target is self-indulgent narrative: essays, storytelling, and over-explanation that bury the one fact a reader needs. A comment is prose that has to earn its length — most of it does not.
 
 ## What to Look For
 
@@ -30,11 +30,12 @@ The tell is a phrase that recurs across files: the same constraint named the sam
 
 ## How to Scan
 
-1. **Measure prose-to-signal ratio.** For each docstring/block comment, ask: what is the single fact a maintainer needs? How many sentences deliver it? If it is 1 fact in 6 sentences, flag the 5.
-2. **Read the first sentence, then the rest.** If the first sentence already tells you what the thing does and the rest is backstory, the rest is the finding.
-3. **Look for narrative verbs and framing** — "wants", "the canonical case", "today", "imagine", "you might think".
-4. **Spot triple-explanation** — the same rationale appearing in a module docstring, a nearby comment, and a class docstring. (Cross-layer repetition is partly `restates-code`/`noise` territory — here, flag the *volume*, coordinate on the location.)
-5. **Distinguish density from rambling.** A dense docstring packed with distinct facts a maintainer needs is NOT rambling — it is good. Rambling is *low information per word*.
+1. **Sort the candidates by size before reading any of them.** A block comment or docstring over 3 content lines, and any comment line over 100 characters, are where this lens pays off. Neither number is a verdict — most real docstrings clear 3 lines — but reading longest-first means the findings land before attention runs out.
+2. **Measure prose-to-signal ratio.** For each docstring/block comment, ask: what is the single fact a maintainer needs? How many sentences deliver it? If it is 1 fact in 6 sentences, flag the 5.
+3. **Read the first sentence, then the rest.** If the first sentence already tells you what the thing does and the rest is backstory, the rest is the finding.
+4. **Look for narrative verbs and framing** — "wants", "the canonical case", "today", "imagine", "you might think".
+5. **Spot triple-explanation** — the same rationale appearing in a module docstring, a nearby comment, and a class docstring. (Cross-layer repetition is partly `restates-code`/`noise` territory — here, flag the *volume*, coordinate on the location.)
+6. **Distinguish density from rambling.** A dense docstring packed with distinct facts a maintainer needs is NOT rambling — it is good. Rambling is *low information per word*.
 
 ## Report Findings
 
@@ -44,7 +45,7 @@ For each rambling comment/docstring:
 |-------|---------|
 | **Location** | file:line range of the prose |
 | **Length** | Approx. sentences/lines of prose vs. the ~1 that carries the signal |
-| **The one fact** | The single thing the reader actually needs |
+| **The one fact** | The single thing the reader needs |
 | **Suggestion** | The tightened version, or "cut to: `<one line>`" |
 
 ### Severity Guide
@@ -64,7 +65,7 @@ After scanning, output your `## Findings Summary` table:
 ## Rules
 
 - **Propose the tightened text, don't just say "too long."** Show the one-line replacement.
-- **Never delete a fact — only cut words.** If the ramble contains a real gotcha, preserve the gotcha in the shortened version. When unsure whether a sentence carries a fact, keep it and flag only the clearly redundant parts.
+- **Never delete a fact — only cut words.** If the ramble contains a real gotcha, preserve the gotcha in the shortened version. When unsure whether a sentence carries a fact, keep it and flag only the redundant parts.
 - **Respect the project's own norm.** If every docstring in the codebase is a paragraph, a two-paragraph one is the outlier — calibrate to the house style, flag the excess above it.
 - **A short comment is never rambling.** This lens is about volume; one-line redundancy belongs to `restates-code`.
 - **Length is not proof of care.** Comment volume tracks how hard the decision felt to write, not how surprising the code is to read. A decision that took a day and a decision that took a minute get the same one line if they are equally non-obvious on the page.

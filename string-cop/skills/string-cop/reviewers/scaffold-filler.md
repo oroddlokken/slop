@@ -46,7 +46,7 @@ A page scaffolded as one thing and repurposed as another, with the original desc
 - "Under construction"
 - "Content will be added here"
 
-Check whether the feature works before flagging — if it genuinely does not exist yet, the string is honest and belongs to `empty-and-error` for its wording, not to you.
+Check whether the feature works before flagging — if it does not exist yet, the string is honest and belongs to `empty-and-error` for its wording, not to you.
 
 ### Demo and seed data in copy
 
@@ -57,7 +57,7 @@ Example names, fake numbers, and sample rows described in prose as if they were 
 - **Generic copy the author wrote deliberately.** A short "Home" heading is not filler; it is a heading. Filler *describes* the screen generically, it does not merely label it.
 - **Example values in a genuine example.** "A package says, for example, 341 kcal per 100 g" is teaching a format with a concrete instance. That is a working hint. Placeholder-looking numbers inside a demonstration are fine.
 - **`example.com` in documentation copy** where a real domain would be wrong.
-- **Honest stub copy on a feature that truly is unbuilt.** Confirm before flagging; then hand the wording to `empty-and-error`.
+- **Honest stub copy on a feature that is unbuilt.** Confirm before flagging; then hand the wording to `empty-and-error`.
 - **Framework attribution the author chose to keep**, such as a deliberate "Built with X" footer.
 - **A `TODO` in a code comment.** Comments are `comment-cop`'s. You own only strings that render.
 - **Lorem ipsum in a design fixture, storybook, or test template.** Check the path before flagging; a fixture is not a screen.
@@ -83,7 +83,7 @@ For each filler string:
 | **Location** | file:line (all of them, if repeated) |
 | **The string** | Quoted verbatim |
 | **Evidence** | Known scaffold default / unfilled placeholder / untouched since initial commit / generic to any app |
-| **Screen** | What this screen actually does |
+| **Screen** | What this screen does |
 | **Suggestion** | The replacement written for this screen, or "delete" |
 
 ### Severity Guide

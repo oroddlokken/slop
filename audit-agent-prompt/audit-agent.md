@@ -66,7 +66,7 @@ Resolve ambiguity inline. Decide on every finding yourself; the orchestrator exp
 
 {lenses}
 
-## Self-Verification
+## False-Positive Filters
 
 Before assembling the output, check each draft finding against these filters — removing a finding is cheaper than asking the user to filter your report:
 

@@ -2,9 +2,9 @@
 
 This file is executed by the **orchestrator** (the main Claude Code session), NOT by individual review agents. The orchestrator extracts strings once and passes the inventory to all agents. Your role is extraction (find every string that reaches a screen) and faithful reproduction (each string verbatim, with the file:line and the element that carries it); the agents do the analysis.
 
-**Critical for this skill: do not reproduce whole files.** A sibling skill like `comment-cop` dumps source verbatim because it reviews prose *inside* files. String Cop reviews prose that *escapes* files onto a screen, and that is a small fraction of the bytes. Sixty templates reproduced whole will exhaust the context before the first agent runs and bury ten real strings under ten thousand lines of markup. Extract the strings, keep the markup that identifies them, drop everything else.
+**Do not reproduce whole files.** A sibling skill like `comment-cop` dumps source verbatim because it reviews prose *inside* files. String Cop reviews prose that *escapes* files onto a screen, and that is a small fraction of the bytes. Sixty templates reproduced whole will exhaust the context before the first agent runs and bury ten real strings under ten thousand lines of markup. Extract the strings, keep the markup that identifies them, drop everything else.
 
-**Equally critical: reproduce each extracted string byte-for-byte.** Do not reflow, re-wrap, correct, or summarize a string. The reviewers grade wording; a paraphrase corrupts the evidence. Preserve the curly quotes, the double spaces, the trailing period, the `&nbsp;`.
+**Reproduce each extracted string byte-for-byte.** Do not reflow, re-wrap, correct, or summarize a string. The reviewers grade wording; a paraphrase corrupts the evidence. Preserve the curly quotes, the double spaces, the trailing period, the `&nbsp;`.
 
 ### Extraction Procedure
 
@@ -12,7 +12,7 @@ This file is executed by the **orchestrator** (the main Claude Code session), NO
 
 #### 1. Enumerate the screens
 
-List template files and map each to the route or view that renders it (`render_template("weight.html")`, a controller action, a component's route). Record the mapping — reviewers need it to check a string against what actually renders, and `cross-screen` needs to know which strings share a screen. Partials and includes (`_timeline.html`, `_forms.html`) are their own entries, with a note listing which screens include them: a string in a partial ships to every screen that pulls it in.
+List template files and map each to the route or view that renders it (`render_template("weight.html")`, a controller action, a component's route). Record the mapping — reviewers need it to check a string against what renders, and `cross-screen` needs to know which strings share a screen. Partials and includes (`_timeline.html`, `_forms.html`) are their own entries, with a note listing which screens include them: a string in a partial ships to every screen that pulls it in.
 
 #### 2. Extract template strings
 
@@ -116,4 +116,4 @@ Omit:
 - Generated report directories (`htmlcov/`, `coverage/`, `dist/`), vendored assets, `node_modules/`, `.venv/`, `site-packages/`
 - Files matching `.env*`, `*.secrets`, `*credentials*.json`, `*.key`, `*.pem`, `secrets.yml` — list by name only
 
-**Inventory size limit**: if the inventory exceeds ~400,000 bytes (≈100K tokens), narrow it before asking the user to narrow scope — this inventory is strings, so that size means a genuinely large app. Drop whole screens rather than truncating strings; a truncated string cannot be graded. Prefer dropping screens with only labels and no prose. List every dropped screen in the inventory so the reviewers and the user both know coverage was bounded.
+**Inventory size limit**: if the inventory exceeds ~400,000 bytes (≈100K tokens), narrow it before asking the user to narrow scope — this inventory is strings, so that size means a large app. Drop whole screens rather than truncating strings; a truncated string cannot be graded. Prefer dropping screens with only labels and no prose. List every dropped screen in the inventory so the reviewers and the user both know coverage was bounded.

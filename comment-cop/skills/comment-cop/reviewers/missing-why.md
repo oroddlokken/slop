@@ -33,7 +33,7 @@ Scan for code that *needs* a comment and doesn't have one. This is the inverse o
 3. **Check swallowed errors.** Every bare/broad except or ignored return: is it stated *why* ignoring is correct?
 4. **Look for ordering comments' absence** — sequential statements where reordering would break correctness.
 5. **Compare against the house style.** Where code deviates from the codebase's own convention with no explanation, flag it.
-6. **Do NOT demand a why for self-evident code.** A plain `for`, a clear guard, a well-named call needs no comment. Only flag genuinely non-obvious decisions — over-flagging here just recreates the noise problem.
+6. **Do NOT demand a why for self-evident code.** A plain `for`, a clear guard, a well-named call needs no comment. Only flag non-obvious decisions — over-flagging here recreates the noise problem.
 
 ## Report Findings
 
@@ -62,7 +62,7 @@ After scanning, output your `## Findings Summary` table:
 
 ## Rules
 
-- **Suggest the actual why, not "add a comment."** If you can infer the rationale from the code/context, write the one-liner. If you genuinely cannot infer it, say "why unknown — ask the author" so the user knows to supply it.
+- **Suggest the actual why, not "add a comment."** If you can infer the rationale from the code/context, write the one-liner. If you cannot infer it, say "why unknown — ask the author" so the user knows to supply it.
 - **Prefer why over what.** The comment you propose should explain the reason, not narrate the mechanism (that would just create `restates-code` clutter).
 - **Be conservative.** The bar is "a competent maintainer would plausibly get this wrong without a note." Do not flag obvious code — a flood of trivial "add a comment" findings is itself noise.
 - **This lens finds absence, not presence.** If a why-comment exists but is bad, that's another lens (rambling/contradicts-code). Here the finding is that nothing is there.

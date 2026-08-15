@@ -29,7 +29,7 @@ Scan the code that other people call — exported functions, public classes/meth
 3. **For each present docstring, check contract completeness** — every param, the return shape, raised exceptions, side effects, units.
 4. **Detect the dominant docstring style** in the codebase and flag inconsistency against it.
 5. **Check the summary line** exists and is a real summary, not a restatement of the name (a name-echo is `restates-code`; here flag *absence* of any summary).
-6. **Calibrate to project norms.** If the project clearly documents only public API and leaves helpers bare, honor that — don't demand docstrings the house style doesn't want.
+6. **Calibrate to project norms.** If the project documents only public API and leaves helpers bare, honor that — don't demand docstrings the house style doesn't want.
 
 ## Report Findings
 
@@ -59,6 +59,6 @@ After scanning, output your `## Findings Summary` table:
 ## Rules
 
 - **Say what to document, not "add a docstring."** Name the params, the return shape, the exceptions that need covering.
-- **Scale the bar by visibility.** Public/exported = high bar; private helper = only flag if genuinely confusing. Don't carpet-bomb every `_helper`.
+- **Scale the bar by visibility.** Public/exported = high bar; private helper = only flag if confusing. Don't carpet-bomb every `_helper`.
 - **Don't reward padding.** A docstring that merely restates the signature does not close the gap — if the fix would just echo the name, the real need is a *contract* (params/returns/raises), say so. (A pure name-echo docstring is `restates-code`'s finding.)
 - **Wrong/stale docs are `contradicts-code`.** This lens owns *absence* and *structure*; that lens owns *inaccuracy*.

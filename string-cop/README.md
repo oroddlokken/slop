@@ -40,7 +40,7 @@ Every action item includes a file path and line number.
 | Quick | 5 high-signal lenses: contradicts-view, reassurance, self-justification, widget-narration, scaffold-filler |
 | Pick | You choose which lenses to run |
 
-Agents run sequentially by default — the shared prefix of each agent prompt is cached by the API, so sequential runs are the cheap option. Parallel is available when you want speed instead.
+Agents run sequentially by default — it spreads token spend across the run instead of bursting it. Either way one agent runs alone first: it writes the cache entry for the system prompt and tool definitions, and every agent after it reads that entry. The rolling window costs the same and finishes sooner.
 
 ## Installation
 

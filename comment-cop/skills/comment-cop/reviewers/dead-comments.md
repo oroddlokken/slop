@@ -16,7 +16,7 @@ Scan for comments that are not documentation at all: commented-out code, debug l
 ### Stale task markers
 - `TODO` / `FIXME` / `XXX` / `HACK` with no owner, no ticket, no date — especially ones describing work that looks long since done or abandoned
 - Contradictory markers ("TODO: remove this" on code the system now depends on)
-- `TODO`s that are actually feature wishlists parked in the wrong place
+- `TODO`s that are feature wishlists parked in the wrong place
 
 ### Zombie documentation
 - Docstrings for deleted parameters/functions left dangling

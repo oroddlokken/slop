@@ -1,6 +1,6 @@
 # Find the Textbook Where a Number Belongs
 
-Scan for strings that teach the user a domain concept when the screen could simply show the value. The shape is a paragraph explaining an equation, a physiological mechanism, an algorithm, or a statistical method, sitting next to the number that method produced.
+Scan for strings that teach the user a domain concept when the screen could show the value. The shape is a paragraph explaining an equation, a physiological mechanism, an algorithm, or a statistical method, sitting next to the number that method produced.
 
 The developer wrote it while implementing the formula, when the formula was the interesting thing. To the user it is not interesting: they want the number, and at most they want to know how far to trust it. A lecture answers a question they did not ask, in a place where they cannot study.
 
@@ -103,4 +103,4 @@ After scanning, output your `## Findings Summary` table:
 - **Propose the replacement line verbatim.** Write the sentence you want on the page.
 - **Length alone is not the finding.** A long string that is all facts is a good string. Count facts, not words.
 - **A method name is not a method lecture.** Keep the name; cut the explanation of the name.
-- **If the lesson is genuinely needed, move it.** Help page, docs route, or a disclosure the user opens. Deleting a real explanation because it is in the wrong place loses information; relocating it does not.
+- **If the lesson is needed, move it.** Help page, docs route, or a disclosure the user opens. Deleting a real explanation because it is in the wrong place loses information; relocating it does not.

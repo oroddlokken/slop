@@ -1,14 +1,13 @@
 ---
 name: audit-agent-docs
 description: "Audit agent-facing documentation (CLAUDE.md, AGENTS.md, copilot-instructions.md) for redundancies, contradictions, gaps, and misplaced content. Supports Claude Code, OpenAI Codex, and GitHub Copilot. For a general agent's system prompt, persona, or tool descriptions (not repo docs), use audit-agent-prompt. Use when the user wants to review or improve their agent instructions."
-disable-model-invocation: true
 ---
 
 # Audit Docs
 
 Spin up parallel sub-agents to audit agent-facing documentation from multiple critical angles, then distill findings into concrete proposed edits.
 
-**Workflow at a glance:** (1) ask the user for target path and scope *before* launching anything — layouts vary too widely to guess; (2) discover docs inside the project root; (3) launch one sub-agent per lens; (4) distill combined findings; (5) self-verify the report; (6) wait for explicit approval before applying edits.
+**Workflow at a glance:** (1) ask the user for target path and scope *before* launching anything — layouts vary too widely to guess; (2) discover docs inside the project root; (3) launch one sub-agent per lens; (4) distill combined findings; (5) check the report against its output contract; (6) wait for explicit approval before applying edits.
 
 ## Scope & Guardrails
 
@@ -233,7 +232,8 @@ Use the agent template (`audit-agent.md`). The template places shared content (k
 **Spawn contract** — how you call the Agent tool, in every launch mode:
 
 - **Never pass `name:`.** A named agent becomes an addressable mailbox teammate, not a subagent. The tool result is `Spawned successfully` plus an agent_id, the findings never come back, and `run_in_background: false` is ignored. `TaskList` and `TaskOutput` cannot see it either. Recovering costs a round of `SendMessage` to every agent asking it to resend.
-- **Sequential passes `run_in_background: false`; Rolling 5 passes `run_in_background: true`.** Sequential needs the report in the tool result to know the agent is done. Rolling 5 needs the call to return at once, so the window can stay full.
+- **Every agent inherits the default model and the default agent type.** Pass no model override and no `subagent_type`. Either one changes the system prompt or the tool definitions, which invalidates the shared cache entry — the next agent writes it from cold instead of reading it.
+- **Sequential passes `run_in_background: false`. 1+Rolling 5 passes `false` for the priming agent and `true` for every agent after it.** Sequential needs the report in the tool result to know the agent is done. The rolling window needs the call to return at once, so the window can stay full. The priming agent runs alone and in the foreground: a cache entry becomes readable only once the request that writes it starts streaming, so agents launched at the same moment all miss it and all pay to write it.
 - **Where the report arrives follows that flag.** Foreground: the Agent tool's return value is the findings — read them out of the tool result, and do not wait for a message or an idle ping. Background: the tool result carries an agent id, and the completion notification carries the findings.
 - **Never call `TaskOutput` on a subagent, and never Read its `.output` file.** That path is a symlink to the agent's full JSONL transcript and will overflow your context.
 - **Every launched agent must have reported before you distill.** Once the queue is empty, wait out the notifications still outstanding.
@@ -241,7 +241,7 @@ Use the agent template (`audit-agent.md`). The template places shared content (k
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. Spreads token spend across the run instead of bursting it against the 5-hour quota. Slowest.
-- **Rolling 5** — Keep five agents in flight from the first launch to the last. Spawn five with `run_in_background: true`, then spawn the next unlaunched reviewer the moment any completion notification arrives, until the queue is empty. Never let a sixth run: Anthropic rate-limits large simultaneous bursts, and a 429 mid-run wastes the work of every agent that already finished. Refilling per completion is what beats waves of five — a wave leaves each finished slot idle until its slowest agent returns. Same cost as Sequential, fastest.
+- **1+Rolling 5** — Launch one reviewer alone with `run_in_background: false` and wait for its report. That agent pays the cold write for the system prompt and tool definitions; every agent after it reads that entry. Then keep five agents in flight from the second launch to the last: spawn five with `run_in_background: true`, and spawn the next unlaunched reviewer the moment any completion notification arrives, until the queue is empty. Never let a sixth run: Anthropic rate-limits large simultaneous bursts, and a 429 mid-run wastes the work of every agent that already finished. Refilling per completion is what beats waves of five — a wave leaves each finished slot idle until its slowest agent returns. Keep the window full for the cache as well as the clock: a read refreshes the entry's five-minute life, so a gap longer than that sends the next agent back to a cold write. Same cost as Sequential, fastest.
 
 If the user doesn't specify, use **Sequential**.
 
@@ -329,9 +329,9 @@ Severity scale: Critical, High, Medium, Low. Sort rows by file, then by starting
 **Why**: "Be graceful" and "use best judgment" can't be checked; the rewrite names each error class and its action.
 ```
 
-### Step 5: Self-Verification
+### Step 5: Report Conformance
 
-Before presenting the distilled report to the user, check:
+Before presenting the distilled report to the user, check it against its output contract:
 
 - Every finding cites a file path and specific line numbers.
 - Every quote is copy-pasted from the documentation, not paraphrased.
@@ -347,7 +347,7 @@ After the checks pass, present the report and ask the user: "Want me to apply th
 
 ## Rules
 
-- **Determine launch strategy with the user** (Sequential or Rolling 5). Default to Sequential for cost savings.
+- **Determine launch strategy with the user** (Sequential or 1+Rolling 5). Default to Sequential for cost savings.
 - **Each agent audits independently** — if a later agent can see earlier findings, it anchors to them and covers fewer novel angles. Cross-lens agreement at the distill step is the real signal that a finding is robust. Run agents in the chosen strategy's isolation model; do not paste one agent's output into another's context.
 
   Loopholes to refuse:

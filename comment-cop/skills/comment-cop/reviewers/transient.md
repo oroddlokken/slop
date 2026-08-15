@@ -22,6 +22,14 @@ Two shapes, both flagged:
 
 **Grade the spread, not the instance.** One stray id is Low. The same project prefix across dozens of files is a house habit; one High finding naming the prefix, the file count and the fix beats forty Lows that get skimmed past.
 
+### References to in-progress planning artifacts
+
+The same rot as a ticket id, one level up: prose that defers to a spec, a milestone, a phase or a task number. `per the M3 spec`, `see the migration plan`, `draft schema, task 4`, `T12 covers the rest`. The document is written to be superseded, and when it is, the comment points at nothing.
+
+The grade follows what the reference is doing. A trailing pointer is Low — delete it. A comment whose only content is the reference (`Blocked on milestone 2`) has no fact left once the milestone ships, and the fix is to write what the code actually does.
+
+Watch the false positives here: `plan`, `spec` and `draft` are ordinary words in a query planner, a parser, or an editor. Flag the reference to a document, never the noun.
+
 ### Temporal framing
 - "recently added", "new in this version", "the old behaviour", "for now", "temporarily", "will be removed soon" with no date or version — permanently "recent"
 - "matching the prior behaviour" — prior to what? unresolvable later
@@ -37,9 +45,10 @@ Two shapes, both flagged:
 
 1. **Search for proper nouns in comments** — capitalized resource names, service names, registries, hostnames. Ask: will this name still exist / be relevant in a year?
 2. **Grep for ticket patterns** in comments/docstrings: `[a-z]+-[0-9a-z]{3,}`, `#\d+`, `JIRA-`. Derive the local prefix first — it is usually the repo or product name — then grep it case-insensitively across every file type, source and tests and migrations and templates alike. Count the hits and the files before writing the finding.
-3. **Grep for temporal words**: `recently`, `currently`, `new`, `old`, `now`, `soon`, `temporarily`, `for now`, `as of`, `prior`, `used to`.
-4. **Find dates and names** in comments.
-5. **For each hit, separate the durable point from the transient carrier.** "A can't-evaluate is an infra problem, not a policy violation" is durable; "(chartroom-5dbt)" and "the live skybank-savings Deployment" are transient carriers of it.
+3. **Grep for planning artifacts**: `spec`, `milestone`, `draft`, `plan`, `phase`, `M[0-9]+`, `T[0-9]+`, `task ?[0-9]+`. Read every hit — these words have day jobs in most codebases.
+4. **Grep for temporal words**: `recently`, `currently`, `new`, `old`, `now`, `soon`, `temporarily`, `for now`, `as of`, `prior`, `used to`.
+5. **Find dates and names** in comments.
+6. **For each hit, separate the durable point from the transient carrier.** "A can't-evaluate is an infra problem, not a policy violation" is durable; "(chartroom-5dbt)" and "the live skybank-savings Deployment" are transient carriers of it.
 
 ## Report Findings
 

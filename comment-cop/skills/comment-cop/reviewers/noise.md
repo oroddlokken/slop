@@ -62,5 +62,5 @@ After scanning, output your `## Findings Summary` table:
 
 - **Default to delete.** Decoration is subtractive-only — the fix is removal.
 - **Respect mandated boilerplate.** Copyright/license headers required by policy are not findings — note the policy and move on.
-- **Navigational dividers can earn their place** in a genuinely long file; flag only empty decoration or dividers substituting for a needed split.
+- **Navigational dividers can earn their place** in a long file; flag only empty decoration or dividers substituting for a needed split.
 - **Type restatement next to prose belongs here; prose narrating logic is `restates-code`.** Don't double-report — this lens owns the decorative/label/type-echo cases.

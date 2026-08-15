@@ -58,7 +58,7 @@ A claim of correctness is unfalsifiable to the reader and adds nothing. If accur
 The whole value of this lens depends on the distinction below. Get it wrong and you strip the app's honest warnings.
 
 - **A consequence stated before a destructive action.** "Deleting this removes all 14 entries" on a confirm dialog is not reassurance, it is the disclosure that makes consent meaningful. Keep it. The difference: reassurance denies a risk, disclosure names one.
-- **A scope statement the user genuinely cannot infer.** If a settings screen reads a config file and the user reasonably fears it writes back, "read-only — edit the file by hand" is a fact about the screen's capability. It survives if it names *what* is read-only and *what the user must do instead*; it fails if it is a bare "nothing is written here" with no next step.
+- **A scope statement the user cannot infer.** If a settings screen reads a config file and the user reasonably fears it writes back, "read-only — edit the file by hand" is a fact about the screen's capability. It survives if it names *what* is read-only and *what the user must do instead*; it fails if it is a bare "nothing is written here" with no next step.
 - **A privacy or retention fact with a source.** "Photos are processed on this machine; nothing is uploaded" on a screen that visibly uploads elsewhere is a real distinction. A blanket "your privacy matters" is not.
 - **A limit the screen cannot show.** "Only the last 90 days are kept" is a limit, not comfort. Protect it.
 - **Regulatory or legal copy** that has to be there. Note it and move on.

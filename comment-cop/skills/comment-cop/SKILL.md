@@ -1,6 +1,6 @@
 ---
 name: comment-cop
-description: "Reviews what the comments and docs SAY, not what the code does. Use when asked to clean up comments, docstrings, or README prose; when a codebase feels buried under stale or self-indulgent explanation; when checking whether docstrings still match their signatures; or when hunting machine-written filler. Protects why-comments that carry a real gotcha and flags the rest. Spins up parallel agents (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, noise, llm-slop), then distills findings into prioritized action points. For user-facing strings use string-cop; for the logic itself use codehealth."
+description: "Reviews what the comments and docs SAY, not what the code does. Use when asked to clean up comments, docstrings, or README prose; when a codebase feels buried under stale or self-indulgent explanation; when checking whether docstrings still match their signatures; or when hunting machine-written filler. Protects why-comments that carry a real gotcha and flags the rest. Spins up parallel agents (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, counting, settled-history, noise, llm-slop), then distills findings into prioritized action points. For user-facing strings use string-cop; for the logic itself use codehealth."
 argument-hint: "[area]"
 disable-model-invocation: true
 ---
@@ -20,9 +20,9 @@ This skill reviews the *documentation layer*, not the logic. It asks: does this 
 
 ## Rules
 
-- **Ask the user for mode (Step 1) and launch strategy** (Sequential or Rolling 5). Recommend Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
+- **Ask the user for mode (Step 1) and launch strategy** (Sequential or 1+Rolling 5). Recommend Sequential — it spreads token spend across the run instead of bursting it. Both strategies run one agent alone first, so that agent writes the shared cache entry and every agent after it reads instead of writes. Never open with a simultaneous burst.
 - **The orchestrator prescans the codebase once and passes the snapshot to all agents** — agents do NOT scan independently. The snapshot must reproduce files verbatim so comments survive intact.
-- **Agents inherit the default model** — do not override with a specific model.
+- **Agents inherit the default model and the default agent type.** Pass no model override and no `subagent_type`. Either one changes the system prompt or the tool definitions, which invalidates the shared cache entry — the next agent writes it from cold instead of reading it.
 - **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
 - **Never propose changes to the logic.** Every finding is about a comment, docstring, or doc — its accuracy, necessity, or clarity. If the code is wrong, that is out of scope (point the user at `/codehealth`).
 
@@ -32,8 +32,8 @@ This skill reviews the *documentation layer*, not the logic. It asks: does this 
 
 Ask the user which mode they want:
 
-- **Full** — Run all 10 reviewers, then distill (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, noise, llm-slop).
-- **Quick** — Run 5 high-signal reviewers (contradicts-code, rambling, llm-slop, missing-why, dead-comments), then distill. Faster.
+- **Full** — Run every reviewer, then distill (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, counting, settled-history, noise, llm-slop).
+- **Quick** — Run the high-signal subset (contradicts-code, rambling, llm-slop, missing-why, dead-comments), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
 Skip the question only when the user's invocation already named a mode (e.g. "run comment-cop quick" → Quick). A bare `/comment-cop` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
@@ -43,7 +43,7 @@ Skip the question only when the user's invocation already named a mode (e.g. "ru
 Comments rarely cause data loss directly, so severity is measured by **how badly the prose misleads or costs a maintainer**:
 
 - **Critical**: A comment or doc that actively misdirects on a safety-critical property (thread-safety, locking, security, money handling, data integrity) such that trusting it causes a bug.
-- **High**: A comment/docstring that contradicts the code, or a genuinely non-obvious hazard left unexplained — a maintainer will be misled or will reintroduce a bug. Also prose that only resolves through a system outside the repo (ticket ids carrying the rationale) once it spans more than a handful of files: the reader can never resolve it and the fix is a codebase-wide sweep.
+- **High**: A comment/docstring that contradicts the code, or a non-obvious hazard left unexplained — a maintainer will be misled or will reintroduce a bug. Also prose that only resolves through a system outside the repo (ticket ids carrying the rationale) once it spans more than a handful of files: the reader can never resolve it and the fix is a codebase-wide sweep.
 - **Medium**: Rotting anecdotes, cross-layer redundancy, docstring gaps on public API, doc/README drift — real maintenance cost, no immediate trap.
 - **Low**: Rambling prose, restatements of the obvious, decorative noise — clutter, fix-when-nearby.
 
@@ -61,6 +61,8 @@ Available reviewers:
 | dead-comments | Commented-out code, debug cruft, TODO/FIXME/XXX graveyards |
 | docstring-gaps | Public API: missing docstrings, wrong/undocumented params, returns, raises; style violations |
 | doc-drift | README / markdown / usage examples out of sync with actual signatures, flags, env vars |
+| counting | Counts of a set the prose does not own, lead-ins numbering their own list, "step 5"-style positional references |
+| settled-history | True prose about the past — removals, migrations, fixed hazards, rejected alternatives, edit annotations |
 | noise | Banner comments, decorative dividers, redundant type restatements, section theater |
 | llm-slop | Machine-written prose tics: "load-bearing", "robust", "simply", "it's not X — it's Y", em-dash spray, `# Load the config` narration |
 
@@ -68,6 +70,8 @@ Available reviewers:
 
 Some reviewers examine the same comment from different angles. When findings overlap:
 - **contradicts-code** owns all *in-source* comments and docstrings that disagree with code. **doc-drift** owns *external* prose (README, `.md`, docs sites). If a docstring is stale, contradicts-code owns it; if the README is stale, doc-drift owns it.
+- **settled-history owns prose that is true and about the past; contradicts-code and doc-drift own prose that is false about the present.** "The old parser choked on tabs, so this pre-splits" is accurate and theirs to skip, settled-history's to cut. Where a removal note is also wrong — the thing came back, or never left — contradicts-code leads and settled-history rides along. **transient** owns a phrase that *will* rot ("recently", "for now", a live instance name); settled-history owns one that already has nothing to act on. **dead-comments** keeps commented-out code and TODO graveyards exclusively; a paragraph *about* deleted code is settled-history. **llm-slop** keeps `# Changed from X to Y` when the tell is the assistant's changelog voice; in the author's own voice it is settled-history. One action point either way.
+- **counting owns count-shaped claims; doc-drift and contradicts-code own claims that are already false.** A doc promising "all 10 lenses" beside a directory of 11 trips both: doc-drift has the drift, counting has the number itself. Merge to one action point whose fix is the count-free rewrite, not the corrected number. A count that is still accurate today belongs to counting alone, in docs and in-source comments alike. Positional references ("step 5 of the protocol", "the second branch below") are counting's exclusively — no other lens flags them.
 - **rambling** owns multi-sentence narrative regardless of content. **restates-code** owns short comments that mirror a single adjacent statement. A one-liner echoing the code → restates-code; a three-paragraph essay → rambling even if partly redundant.
 - **transient** owns the rot-prone *specifics* (an instance name, a ticket id, a date). **rambling** owns the surrounding verbosity. In one bloated docstring, transient flags the anecdote, rambling flags the length — but coordinate so it is one action point in distill.
 - **docstring-gaps** owns the *presence and structural quality* of API docstrings (missing, wrong params/returns/raises). **missing-why** owns inline rationale for non-obvious code that has no comment at all. A public function with no docstring → docstring-gaps; a magic constant with no explanation → missing-why.
@@ -144,7 +148,7 @@ The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a fil
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 
-Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 10 agents each independently scanning the same files.
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids every agent independently scanning the same files.
 
 1. Replace `{languages}` and `{focus}` in `scan-steps.md`
 2. Follow the scan procedure — read source files (comments intact), README, and markdown docs
@@ -158,7 +162,7 @@ Use the agent template (`agent.md`). The template places shared content (codebas
 **Spawn contract** — how you call the Agent tool, in every launch mode:
 
 - **Never pass `name:`.** A named agent becomes an addressable mailbox teammate, not a subagent. The tool result is `Spawned successfully` plus an agent_id, the findings never come back, and `run_in_background: false` is ignored. `TaskList` and `TaskOutput` cannot see it either. Recovering costs a round of `SendMessage` to every agent asking it to resend.
-- **Sequential passes `run_in_background: false`; Rolling 5 passes `run_in_background: true`.** Sequential needs the report in the tool result to know the agent is done. Rolling 5 needs the call to return at once, so the window can stay full.
+- **Sequential passes `run_in_background: false`. 1+Rolling 5 passes `false` for the priming agent and `true` for every agent after it.** Sequential needs the report in the tool result to know the agent is done. The rolling window needs the call to return at once, so the window can stay full. The priming agent runs alone and in the foreground: a cache entry becomes readable only once the request that writes it starts streaming, so agents launched at the same moment all miss it and all pay to write it.
 - **Where the report arrives follows that flag.** Foreground: the Agent tool's return value is the findings — read them out of the tool result, and do not wait for a message or an idle ping. Background: the tool result carries an agent id, and the completion notification carries the findings.
 - **Never call `TaskOutput` on a subagent, and never Read its `.output` file.** That path is a symlink to the agent's full JSONL transcript and will overflow your context.
 - **Every launched agent must have reported before you distill.** Once the queue is empty, wait out the notifications still outstanding.
@@ -166,16 +170,16 @@ Use the agent template (`agent.md`). The template places shared content (codebas
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. Spreads token spend across the run instead of bursting it against the 5-hour quota. Slowest.
-- **Rolling 5** — Keep five agents in flight from the first launch to the last. Spawn five with `run_in_background: true`, then spawn the next unlaunched reviewer the moment any completion notification arrives, until the queue is empty. Never let a sixth run: Anthropic rate-limits large simultaneous bursts, and a 429 mid-run wastes the work of every agent that already finished. Refilling per completion is what beats waves of five — a wave leaves each finished slot idle until its slowest agent returns. Same cost as Sequential, fastest.
+- **1+Rolling 5** — Launch one reviewer alone with `run_in_background: false` and wait for its report. That agent pays the cold write for the system prompt and tool definitions; every agent after it reads that entry. Then keep five agents in flight from the second launch to the last: spawn five with `run_in_background: true`, and spawn the next unlaunched reviewer the moment any completion notification arrives, until the queue is empty. Never let a sixth run: Anthropic rate-limits large simultaneous bursts, and a 429 mid-run wastes the work of every agent that already finished. Refilling per completion is what beats waves of five — a wave leaves each finished slot idle until its slowest agent returns. Keep the window full for the cache as well as the clock: a read refreshes the entry's five-minute life, so a gap longer than that sends the next agent back to a cold write. Same cost as Sequential, fastest.
 
 Skip the question only when the user's invocation already named a strategy; otherwise ask and wait for the answer, recommending **Sequential**.
 
-**Prompt caching** — Agents do not share cached prompt content with each other. Measured over a 16-agent run (2026-08-04): every agent read back the same ~7K tokens of system prompt and tool definitions, then created everything else fresh — including a byte-identical 11K-token snapshot, once per agent.
+**Prompt caching** — The system prompt and tool definitions are the only part agents share; everything else each agent creates fresh, including a byte-identical snapshot, once per agent. Measured over a 16-agent run (2026-08-04): ~7K tokens read back per agent against an 11K-token snapshot written per agent. A 5-agent run (2026-08-10) shows what launch order does to that shareable part: the first agent read 0 and wrote 16,713 tokens, each later agent read 5,994 and wrote ~10.9K. Launch one agent alone and the 5,994 is read four times; open with five at once and it is written five times, at the 1.25× write rate.
 
 The cause is breakpoint placement. Caching matches a byte prefix ending at a `cache_control` breakpoint, and the harness sets one after the system prompt and one at the end of each message. The Agent tool takes a single prompt string, so the shared snapshot and the per-agent assignment land inside the same cached unit and can never match across agents. Sharing would require the shared half in its own content block with a breakpoint at that boundary; the Agent tool exposes no way to ask for one.
 
 - **The `---` divider is a section divider, not a cache boundary.** Shared placeholders (`{codebase_snapshot}`, `{path}`, `{languages}`, `{focus}`, `{known_issues}`) still resolve once and stay identical across agents, and per-agent placeholders still go below the line — that keeps the template readable and the resolve step cheap. No cost depends on it.
-- **Snapshot size is the lever that does matter.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves money; launch order does not.
+- **Snapshot size is the bigger lever.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves more than launch order does, and both are worth taking.
 
 **Build the shared prefix once:**
 1. Read `agent.md` from this skill's directory
@@ -201,7 +205,7 @@ Concentrate your analysis primarily on **{area}**. During the review, go deeper 
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reviewer criteria files** are in this skill's `reviewers/` directory: `rambling.md`, `transient.md`, `contradicts-code.md`, `restates-code.md`, `missing-why.md`, `dead-comments.md`, `docstring-gaps.md`, `doc-drift.md`, `noise.md`, `llm-slop.md`.
+**Reviewer criteria files** are in this skill's `reviewers/` directory: `rambling.md`, `transient.md`, `contradicts-code.md`, `restates-code.md`, `missing-why.md`, `dead-comments.md`, `docstring-gaps.md`, `doc-drift.md`, `counting.md`, `settled-history.md`, `noise.md`, `llm-slop.md`.
 
 ### Amending the Brief Mid-Run
 
@@ -209,7 +213,7 @@ The resolved template is **frozen once the first agent launches** — do not edi
 
 When you find the brief is wrong mid-run — a prescan claim an agent contradicts, a mis-stated invariant, a file that does not exist — record the correction instead of applying it:
 
-1. **Append to an errata list** for this run. One entry per correction: what the brief claimed, what is actually true, and a `file:line` citation for the correction.
+1. **Append to an errata list** for this run. One entry per correction: what the brief claimed, what is true, and a `file:line` citation for the correction.
 2. **Append the errata to the per-agent half** (below `---`) of every agent launched from then on, under a `## Errata` heading introduced by: "The brief contains errors. The entries below are authoritative wherever they contradict it."
 3. **Pass the errata to distill**, noting which agents ran before each entry was added. Distill drops or annotates any earlier finding that rests on a corrected claim.
 

@@ -1,6 +1,6 @@
 ---
 name: string-cop
-description: "Reviews what the screen SAYS, not how it looks. Use when asked to review UI copy, labels, hints, tooltips, empty states, error messages, or flash text; when an interface reads as over-explained or self-congratulatory; or when a hint might contradict what the page actually renders. Covers templates plus the view and domain code that supplies strings. Spins up parallel agents (contradicts-view, reassurance, self-justification, lecture, widget-narration, redundancy, scaffold-filler, cross-screen, empty-and-error, llm-slop), then distills findings into prioritized action points. Layout, spacing, and color are out of scope; for comments use comment-cop."
+description: "Reviews what the screen SAYS, not how it looks. Use when asked to review UI copy, labels, hints, tooltips, empty states, error messages, or flash text; when an interface reads as over-explained or self-congratulatory; or when a hint might contradict what the page renders. Covers templates plus the view and domain code that supplies strings. Spins up parallel agents (contradicts-view, reassurance, self-justification, lecture, widget-narration, redundancy, scaffold-filler, cross-screen, empty-and-error, llm-slop), then distills findings into prioritized action points. Layout, spacing, and color are out of scope; for comments use comment-cop."
 argument-hint: "[area]"
 disable-model-invocation: true
 ---
@@ -29,9 +29,9 @@ This skill reviews the *rendered layer*. Every heading, hint, tooltip, button la
 
 ## Rules
 
-- **Ask the user for mode (Step 1) and launch strategy** (Sequential or Rolling 5). Recommend Sequential — it spreads token spend across the run instead of bursting it. Agents do not share prompt cache with each other, so launch order does not change cost.
+- **Ask the user for mode (Step 1) and launch strategy** (Sequential or 1+Rolling 5). Recommend Sequential — it spreads token spend across the run instead of bursting it. Both strategies run one agent alone first, so that agent writes the shared cache entry and every agent after it reads instead of writes. Never open with a simultaneous burst.
 - **The orchestrator extracts the string inventory once and passes it to all agents** — agents do NOT scan independently. The inventory reproduces strings verbatim with file:line; it does not reproduce whole templates.
-- **Agents inherit the default model** — do not override with a specific model.
+- **Agents inherit the default model and the default agent type.** Pass no model override and no `subagent_type`. Either one changes the system prompt or the tool definitions, which invalidates the shared cache entry — the next agent writes it from cold instead of reading it.
 - **Run distillation after all agents complete.** Raw output is overwhelming without deduplication and prioritization.
 - **Never propose changes to the logic or the layout.** Every finding is about a string — its accuracy, necessity, or clarity. If the view is wrong, that is out of scope (point the user at `/codehealth`). If the page is ugly, that is a design concern, not a string finding.
 
@@ -62,7 +62,7 @@ Available reviewers:
 
 | Reviewer | Lens |
 |----------|------|
-| contradicts-view | The string disagrees with what the view actually renders. The only lens that can produce a Critical |
+| contradicts-view | The string disagrees with what the view renders. The only lens that can produce a Critical |
 | reassurance | Safety claims nobody asked for; comfort about a risk the user never raised |
 | self-justification | Design rationale and self-praise on the page |
 | lecture | Textbook paragraph where a number belongs |
@@ -89,7 +89,7 @@ Several reviewers examine the same string from different angles. When findings o
 
 ### Step 1.5: Render Layer Prescan
 
-Detect what actually renders strings so agents cover every source, not just the largest template directory.
+Detect what renders strings so agents cover every source, not just the largest template directory.
 
 1. Run `git ls-files` in the target path (or cwd) and group files by extension
 2. Identify template engines by extension and content: `.html`/`.jinja`/`.j2` (Jinja), `.html` with `{% %}` under a Django app, `.erb`, `.hbs`, `.mustache`, `.vue`, `.svelte`, `.tsx`/`.jsx` (JSX text nodes), `.templ`, `.gohtml`
@@ -172,7 +172,7 @@ Use the agent template (`agent.md`). The template places shared content (string 
 **Spawn contract** — how you call the Agent tool, in every launch mode:
 
 - **Never pass `name:`.** A named agent becomes an addressable mailbox teammate, not a subagent. The tool result is `Spawned successfully` plus an agent_id, the findings never come back, and `run_in_background: false` is ignored. `TaskList` and `TaskOutput` cannot see it either. Recovering costs a round of `SendMessage` to every agent asking it to resend.
-- **Sequential passes `run_in_background: false`; Rolling 5 passes `run_in_background: true`.** Sequential needs the report in the tool result to know the agent is done. Rolling 5 needs the call to return at once, so the window can stay full.
+- **Sequential passes `run_in_background: false`. 1+Rolling 5 passes `false` for the priming agent and `true` for every agent after it.** Sequential needs the report in the tool result to know the agent is done. The rolling window needs the call to return at once, so the window can stay full. The priming agent runs alone and in the foreground: a cache entry becomes readable only once the request that writes it starts streaming, so agents launched at the same moment all miss it and all pay to write it.
 - **Where the report arrives follows that flag.** Foreground: the Agent tool's return value is the findings — read them out of the tool result, and do not wait for a message or an idle ping. Background: the tool result carries an agent id, and the completion notification carries the findings.
 - **Never call `TaskOutput` on a subagent, and never Read its `.output` file.** That path is a symlink to the agent's full JSONL transcript and will overflow your context.
 - **Every launched agent must have reported before you distill.** Once the queue is empty, wait out the notifications still outstanding.
@@ -180,16 +180,16 @@ Use the agent template (`agent.md`). The template places shared content (string 
 **Launch strategy** — Ask the user:
 
 - **Sequential** (default) — Launch agents one at a time, each after the previous completes. Spreads token spend across the run instead of bursting it against the 5-hour quota. Slowest.
-- **Rolling 5** — Keep five agents in flight from the first launch to the last. Spawn five with `run_in_background: true`, then spawn the next unlaunched reviewer the moment any completion notification arrives, until the queue is empty. Never let a sixth run: Anthropic rate-limits large simultaneous bursts, and a 429 mid-run wastes the work of every agent that already finished. Refilling per completion is what beats waves of five — a wave leaves each finished slot idle until its slowest agent returns. Same cost as Sequential, fastest.
+- **1+Rolling 5** — Launch one reviewer alone with `run_in_background: false` and wait for its report. That agent pays the cold write for the system prompt and tool definitions; every agent after it reads that entry. Then keep five agents in flight from the second launch to the last: spawn five with `run_in_background: true`, and spawn the next unlaunched reviewer the moment any completion notification arrives, until the queue is empty. Never let a sixth run: Anthropic rate-limits large simultaneous bursts, and a 429 mid-run wastes the work of every agent that already finished. Refilling per completion is what beats waves of five — a wave leaves each finished slot idle until its slowest agent returns. Keep the window full for the cache as well as the clock: a read refreshes the entry's five-minute life, so a gap longer than that sends the next agent back to a cold write. Same cost as Sequential, fastest.
 
 Skip the question only when the user's invocation already named a strategy; otherwise ask and wait for the answer, recommending **Sequential**.
 
-**Prompt caching** — Agents do not share cached prompt content with each other. Measured over a 16-agent run (2026-08-04): every agent read back the same ~7K tokens of system prompt and tool definitions, then created everything else fresh — including a byte-identical 11K-token snapshot, once per agent.
+**Prompt caching** — The system prompt and tool definitions are the only part agents share; everything else each agent creates fresh, including a byte-identical snapshot, once per agent. Measured over a 16-agent run (2026-08-04): ~7K tokens read back per agent against an 11K-token snapshot written per agent. A 5-agent run (2026-08-10) shows what launch order does to that shareable part: the first agent read 0 and wrote 16,713 tokens, each later agent read 5,994 and wrote ~10.9K. Launch one agent alone and the 5,994 is read four times; open with five at once and it is written five times, at the 1.25× write rate.
 
 The cause is breakpoint placement. Caching matches a byte prefix ending at a `cache_control` breakpoint, and the harness sets one after the system prompt and one at the end of each message. The Agent tool takes a single prompt string, so the shared snapshot and the per-agent assignment land inside the same cached unit and can never match across agents. Sharing would require the shared half in its own content block with a breakpoint at that boundary; the Agent tool exposes no way to ask for one.
 
 - **The `---` divider is a section divider, not a cache boundary.** Shared placeholders (`{string_inventory}`, `{path}`, `{render_layers}`, `{focus}`, `{known_issues}`) still resolve once and stay identical across agents, and per-agent placeholders still go below the line — that keeps the template readable and the resolve step cheap. No cost depends on it.
-- **Snapshot size is the lever that does matter.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves money; launch order does not.
+- **Snapshot size is the bigger lever.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves more than launch order does, and both are worth taking.
 
 **Build the shared prefix once:**
 1. Read `agent.md` from this skill's directory
@@ -223,7 +223,7 @@ The resolved template is **frozen once the first agent launches** — do not edi
 
 When you find the brief is wrong mid-run — a prescan claim an agent contradicts, a mis-stated invariant, a file that does not exist — record the correction instead of applying it:
 
-1. **Append to an errata list** for this run. One entry per correction: what the brief claimed, what is actually true, and a `file:line` citation for the correction.
+1. **Append to an errata list** for this run. One entry per correction: what the brief claimed, what is true, and a `file:line` citation for the correction.
 2. **Append the errata to the per-agent half** (below `---`) of every agent launched from then on, under a `## Errata` heading introduced by: "The brief contains errors. The entries below are authoritative wherever they contradict it."
 3. **Pass the errata to distill**, noting which agents ran before each entry was added. Distill drops or annotates any earlier finding that rests on a corrected claim.
 

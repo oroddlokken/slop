@@ -29,7 +29,7 @@ The worst version, because the user's conclusion is wrong. "Nothing to show" und
 - "Nice work, nothing left to do!"
 - "You're all set."
 
-Celebration in place of information. If the state is genuinely terminal and there is nothing to do, one short line is fine — but it should still say what would appear here.
+Celebration in place of information. If the state is terminal and there is nothing to do, one short line is fine — but it should still say what would appear here.
 
 ### The error that opens on a mood
 
@@ -74,12 +74,12 @@ An empty table with no empty state, a failed fetch with a blank panel, a `{% els
 ## What NOT to Flag
 
 - **A one-word empty cell in a dense table.** A dash in a cell is correct; a paragraph in every empty cell is not.
-- **An error that genuinely has one honest remedy of "retry".** Transient network failures exist. The finding is only when retry is offered as a substitute for diagnosis. If the string names the service and the transience, it is doing its job.
+- **An error that has one honest remedy of "retry".** Transient network failures exist. The finding is only when retry is offered as a substitute for diagnosis. If the string names the service and the transience, it is doing its job.
 - **A short, plain empty state on a screen where the next action is a visible button.** "No items yet." above a large "Add item" button is complete. The action is on the screen.
 - **Deliberately vague authentication errors.** "That username or password is wrong" is intentionally non-specific for security. Never propose narrowing it.
 - **Error text constrained by a framework's format** where the app cannot supply the wording. Note the constraint rather than proposing an impossible fix.
 - **Terse strings in an expert tool.** A CLI-adjacent admin panel may correctly say "409 conflict". Calibrate to the app's audience.
-- **An error that is simply worded badly but is complete.** Hand register problems to `llm-slop`; you own missing information.
+- **An error that is worded badly but is complete.** Hand register problems to `llm-slop`; you own missing information.
 
 The test, for every string on these two paths: **can the user name their next action after reading it?** If not, say which of where/why/what-now is missing.
 

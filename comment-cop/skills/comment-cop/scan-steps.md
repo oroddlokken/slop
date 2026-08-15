@@ -2,7 +2,7 @@
 
 This file is executed by the **orchestrator** (the main Claude Code session), NOT by individual review agents. The orchestrator reads files once and passes the results to all agents as a snapshot. Your role is selection (which files to include) and faithful reproduction (each file verbatim); the agents do the analysis.
 
-**Critical for this skill:** reproduce files **byte-for-byte, comments and docstrings intact**. Comment Cop reviews the prose *in* the code — never strip, summarize, or reflow comments during the scan. A snapshot with comments removed is useless here.
+Reproduce files **byte-for-byte, comments and docstrings intact**. Comment Cop reviews the prose *in* the code — never strip, summarize, or reflow comments during the scan. A snapshot with comments removed is useless here.
 
 ### Scan Procedure
 
@@ -12,7 +12,7 @@ Read broadly — the goal is to capture enough code and docs across all language
 2. Read the README **in full** (not just the first N lines — doc-drift needs the whole thing) and any architecture/design docs, `docs/*.md`, `.rst` files.
 3. **Languages in scope:** {languages}. Review comments in all of these — do not skip any. Markdown/rST docs count and must be included for the doc-drift lens.
 4. Detect the framework and any conventions doc (CONTRIBUTING, a style guide) — these tell you the project's own comment/docstring norms.
-5. Read key source files **across all in-scope languages**, comments intact. Distribute effort proportionally to file count but ensure every language gets meaningful coverage (at least 3–5 files each). Prioritize files most likely to carry heavy prose: module entry points, public API modules, config/loading modules, anything with a large module-level docstring. For each language, read 10–15% of files or at least 5, whichever is greater. Stop when additional files show no new comment patterns.
+5. Read source files **across all in-scope languages**, comments intact. Distribute effort proportionally to file count but give every language at least 3–5 files. Prioritize files most likely to carry heavy prose: module entry points, public API modules, config/loading modules, anything with a large module-level docstring. For each language, read 10–15% of files or at least 5, whichever is greater. Stop when additional files show no new comment patterns.
 6. Prefer files with dense comment/docstring content — a file that is 40% prose is higher-value for this review than a 200-line file with no comments. When skimming to select, favor files where docstrings and block comments are visibly long.
 7. Include prose docs: `README*`, `docs/**/*.md`, `*.rst`, `CHANGELOG*` (only if referenced as living docs), and any usage-example files. doc-drift compares these against actual signatures.
 8. Git history snapshot: run `git log --oneline -20` — recent activity areas are where comments are most likely to have drifted from code.

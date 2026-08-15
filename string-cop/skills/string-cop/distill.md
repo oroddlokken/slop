@@ -21,7 +21,7 @@ Build a canonical list as an internal scratchpad. The user does not see this.
 
 ### 1.0 Apply errata
 
-You may receive an **errata list** — corrections the orchestrator made to the shared brief after some agents had already run. Each entry states what the brief claimed, what is actually true with a `file:line` citation, and which agents ran before it was added. Skip this step when no errata were passed.
+You may receive an **errata list** — corrections the orchestrator made to the shared brief after some agents had already run. Each entry states what the brief claimed, what is true with a `file:line` citation, and which agents ran before it was added. Skip this step when no errata were passed.
 
 Errata override the brief. For every finding from an agent that ran *before* an entry was added:
 
@@ -34,7 +34,7 @@ Findings from agents launched after an entry already had it, so leave them alone
 
 For each finding, read the cited file:line. Confirm three things:
 
-1. The string quoted actually exists there, verbatim. Reviewers paraphrase under pressure; a paraphrase that drifted is a hallucination for your purposes, because the user will search for the quoted text and not find it. Mark `hallucinated` and exclude.
+1. The string quoted exists there, verbatim. Reviewers paraphrase under pressure; a paraphrase that drifted is a hallucination for your purposes, because the user will search for the quoted text and not find it. Mark `hallucinated` and exclude.
 2. It is a real copy problem, not a hint carrying a **unit, a source, a limit, or a consequence the screen cannot show**. This is the check that matters most. A tooltip defining "webhook" against "poll" so a user knows how much to trust a timestamp is long, and it stays. If the string carries such a fact, mark the finding `false-positive` and exclude it — protecting working hints is part of the job.
 3. A `Critical` came from `contradicts-view`. Any other lens reporting Critical is remapped to High before tier assignment.
 
@@ -49,7 +49,7 @@ Assign each surviving finding to one impact category:
 - **Already said** — the control, the number, the heading, or another screen already carries it. (widget-narration, redundancy, cross-screen)
 - **Unfinished** — generator boilerplate, placeholder copy, an empty state or error naming no next action. (scaffold-filler, empty-and-error)
 - **Register** — the words are wrong for a user even though the claim holds. (llm-slop)
-- **Noise (drop)** — subjective preference, or a string that is actually fine → drop.
+- **Noise (drop)** — subjective preference, or a string that is fine → drop.
 
 ### 1.3 Deduplicate
 

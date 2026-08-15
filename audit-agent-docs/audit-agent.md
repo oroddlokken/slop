@@ -102,7 +102,7 @@ Then end with a summary table:
 - **Write the findings in plain prose.** A report about hollow phrasing that is itself full of hollow phrasing is worthless. No em-dash strings, no "not just X but Y", no present-participle tails, no closing summary paragraph. The findings table is the summary.
 - **Every finding names the replacement.** "Too vague" is not a finding; the rewritten line is. If the fix is deletion, say "delete" and say what is lost by deleting it.
 
-## Self-Verification
+## Output Contract
 
 Before submitting:
 

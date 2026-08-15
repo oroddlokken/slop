@@ -116,9 +116,11 @@ Reserve all three for rules where slippage has real cost. A CLAUDE.md full of lo
 
 Before adding a rule, ask: "What incident is this rule the memorial for?" Rules without a ghost tend toward generic best-practice — exactly the kind the agent rationalizes past first. When an agent produces a slip, capture the self-justification verbatim ("I thought the test was redundant", "the file looked safe to reformat") and feed that phrase into the next rule's loophole list or Red Flags. The rule that names the rationalization survives; the one that doesn't gets re-invented.
 
-## Enable Self-Verification
+## Give the Agent a Way to Check Its Work
 
-Tell the agent how to check its own work — the command to run, the file to diff against, the output to expect. Agents that can verify catch their own mistakes; agents that cannot, ship them. Anthropic's guidance flags this as one of the highest-leverage additions to CLAUDE.md.
+Name the command to run, the file to diff against, and the output to expect. Anthropic's guidance flags naming these affordances as one of the highest-leverage additions to CLAUDE.md — it is environment knowledge the agent cannot guess.
+
+An instruction *to* verify is separate and does not belong here. Current models already check their own work, so it costs tokens and changes nothing.
 
 - Name the test and lint commands, and the preview/diff variant of any destructive action (`ansible-playbook --check --diff`, `terraform plan`, `dns_records.py diff`)
 - Point at a canonical example file rather than describing the pattern in prose

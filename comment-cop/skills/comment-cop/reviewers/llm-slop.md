@@ -65,6 +65,7 @@ Stated from the other side: repeating the technical term is the human move. Cons
 ### Editorial and didactic filler
 
 - `Note that…`, `It's worth noting that…`, `It's important to note…`, `Importantly,…`, `Keep in mind…`, `Bear in mind…`
+- Reveal openers that promise a turn the sentence never takes: `Here's the thing`, `Here's what…`, `Here's why…`, `The truth is`, `It turns out`. The run-up implies the reader believed something else a moment ago. Cut it and open on the fact: `It turns out the lock is held across the retry` → `The lock is held across the retry`
 - `In other words,…` restating a sentence that was already clear
 - `In summary,` / `In conclusion,` / `Overall,` closing a comment or a document under one screen long
 - `This ensures that…` / `This allows us to…` / `This means that…` opening a sentence that then restates the code

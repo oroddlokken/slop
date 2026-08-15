@@ -184,16 +184,16 @@ Each lens is a specific critical angle. The user picks a scope (standard, full, 
     - Do any examples contradict the written rules? Flag as high-severity — examples win over rules silently.
     - Are examples teaching *shape* (tone, structure, length) or teaching *knowledge* (facts)? Teaching knowledge via examples is a code smell — facts belong in the knowledge base, examples should model structure.
 
-19. **Self-Verification** — Are soft-check instructions named? Examples:
+19. **Self-Verification** — Which direction counts as a finding depends on the target model from Step 1. A model that already checks its own work turns a named soft-check into the finding, because it adds cost and can trigger over-verification. A model that skips the check makes absence the finding. The instructions at issue:
     - "Before sending, check that every factual claim has a cited source."
     - "Before refusing, check whether a scoped partial answer is possible."
     - "If your response is longer than 3 paragraphs, check whether the user asked for that much."
 
-    These are cheap to add and measurably improve compliance.
+    Naming *how* to verify — the test command, the file to diff against — is a separate thing and always stays. It is environment knowledge the model cannot guess.
 
 20. **Cold Start** — Pretend to be a fresh LLM with zero context outside the prompt. What assumptions does the prompt make? (Product knowledge, jargon, workflow steps, user profile fields, tool semantics.) Flag anything the prompt references but doesn't define. Agents without this context hallucinate definitions or fail silently; undefined references are a common source of behavior that looks random to users.
 
-21. **Reasoning-Model Fit** — If the target prompt deploys on a reasoning-capable model (Claude with extended thinking, o3, DeepSeek R1, Gemini thinking), flag patterns that degrade on these models:
+21. **Reasoning-Model Fit** — When the target model from Step 1 is reasoning-capable (Claude with extended thinking, o3, DeepSeek R1, Gemini thinking), flag patterns that degrade on these models:
     - Redundant meta-instructions ("think step by step", "reason carefully") — native to the thinking trace; compete with it.
     - Heavy few-shot blocks on reasoning-heavy tasks — anchor the trace and suppress exploration.
     - Prescribed reasoning structure ("first analyze X, then Y") — often beats the model's native strategy in the wrong direction.
@@ -212,6 +212,8 @@ Ask the user for target path and scope before launching agents — running on as
   - Or the user can name specific areas (e.g., "just check framing and weak language")
 
 Present as a simple choice — do NOT list lens numbers or internal names.
+
+If the chosen scope includes the self-verification or reasoning-model lens, ask which model the prompt runs on. Claude Opus 5 and its generation check their own work unprompted; older models often do not.
 
 **Out-of-scope targets**: If the user points at a `CLAUDE.md`, `AGENTS.md`, or `copilot-instructions.md` file, respond verbatim: *"This looks like coding-agent documentation, not an agent prompt. Use the `audit-agent-docs` skill instead — it's tailored to framework docs. If you want to audit just the prompt text inside this file, point me at that section and I'll treat it as a standalone prompt."* Then stop and wait for the user to redirect.
 

@@ -56,10 +56,10 @@ Five empty states across the app, each with its own tone and structure. Consiste
 
 ## What NOT to Flag
 
-- **A fact repeated where each instance is genuinely local.** A unit on each column header is not duplication; it is labelling. The finding is only when the *sentence* is copied.
-- **Two words that are different concepts.** "Session" and "stream" may be genuinely distinct. Read enough to know before calling it drift; a wrong terminology finding sends the user renaming things that were correct.
+- **A fact repeated where each instance is local.** A unit on each column header is not duplication; it is labelling. The finding is only when the *sentence* is copied.
+- **Two words that are different concepts.** "Session" and "stream" may be distinct. Read enough to know before calling it drift; a wrong terminology finding sends the user renaming things that were correct.
 - **House synonyms that carry register.** A heading may say "Photos" while a technical tooltip says "media items" for a reason. If the mapping is stable and obvious, leave it.
-- **Different labels for genuinely different operations.** "Remove" (from this list) and "Delete" (everywhere) is a correct distinction if the code makes it. Verify before flagging.
+- **Different labels for different operations.** "Remove" (from this list) and "Delete" (everywhere) is a correct distinction if the code makes it. Verify before flagging.
 - **Duplication already centralised.** If all five copies come from one macro or one constant rendered five times, there is one string and no drift risk. Check the inventory's partial mapping before counting.
 - **Translated strings** that differ because the languages differ.
 - **Two copies that disagree about behaviour.** Route to `contradicts-view`. You may note it, but the severity belongs there.

@@ -1,6 +1,6 @@
 # Find Comments That Contradict the Code
 
-Scan for in-source comments and docstrings that disagree with what the code actually does — whether they drifted over time or were wrong from birth. This is the most dangerous lens: a maintainer trusts the comment, and the comment lies. A stale comment is worse than no comment.
+Scan for in-source comments and docstrings that disagree with what the code does — whether they drifted over time or were wrong from birth. This is the most dangerous lens: a maintainer trusts the comment, and the comment lies. A stale comment is worse than no comment.
 
 ## What to Look For
 
@@ -18,7 +18,7 @@ Scan for in-source comments and docstrings that disagree with what the code actu
 
 ### Behavioral guarantees that no longer hold
 - "thread-safe" / "idempotent" / "no external calls" / "best-effort, never raises" comments contradicted by the code below them (a lock removed, a network call added, a bare `raise`)
-- "resolved relative to the package, not CWD" when the path logic actually uses CWD
+- "resolved relative to the package, not CWD" when the path logic uses CWD
 - Comments promising an invariant the code doesn't enforce
 
 ### Cross-reference lies
@@ -46,7 +46,7 @@ For each contradiction:
 |-------|---------|
 | **Location** | file:line of the comment/docstring |
 | **Comment says** | The claim in the prose |
-| **Code does** | What the code actually does |
+| **Code does** | What the code does |
 | **Harm** | How a maintainer trusting the comment gets misled |
 | **Suggestion** | Correct the prose to match the code (never change the code — that's out of scope) |
 

@@ -153,6 +153,8 @@ State each rule in one canonical section. Duplicated rules compete for the model
 ### Cut What the Base Model Already Does
 The single biggest quality issue in real system prompts is restating defaults: "be polite", "answer the user's question", "don't be offensive", "use proper grammar". All noise. If a rule would still be true with the word "not" inserted somewhere, it's not a rule — it's a platitude, and it dilutes the rules that carry information.
 
+The default set moves with each model generation, so recheck it at every migration. Self-verification is the current example: frontier models check their own work, and instructing it again costs tokens without improving the result.
+
 ### Structure the Prompt
 XML tags are the cross-vendor consensus for delimiting inputs, examples, and sections inside prompts. Anthropic trained Claude on XML; OpenAI's o3 guide recommends XML plus section headings; Google's Gemini docs concur. Reserve Markdown for prose narration; use XML tags for anything the model must parse or separate.
 
@@ -289,11 +291,13 @@ On reasoning-capable models (Claude with extended thinking, o3, DeepSeek R1, Gem
 
 ## Self-Verification Without a Test Suite
 
-Coding agents can "run the tests". General agents have weaker equivalents, but naming them improves compliance materially:
+Coding agents can "run the tests". General agents have weaker equivalents, and on a model that does not already self-check, naming them improves compliance:
 
 - "Before sending, check that every factual claim has a cited source."
 - "Before refusing, check whether a scoped partial answer is possible."
 - "If your response is longer than 3 paragraphs, check whether the user asked for that much."
+
+Check the target model first: Claude Opus 5 and its generation verify their own work unprompted, so these instructions add cost and can trigger over-verification. Delete them for such a target rather than rewording, and keep them only where the model demonstrably skips the check.
 
 **Self-checks for prompt writers, before shipping:**
 
@@ -304,4 +308,4 @@ Coding agents can "run the tests". General agents have weaker equivalents, but n
 - Every Iron Law is hardened (loopholes enumerated, rationalization table if it recurs, Red Flags) — and every rule that *isn't* an Iron Law is stripped of hardening so the signal stays legible.
 - No rule was reworded without checking it is still true. Polish ranks below correctness: a smoothly phrased wrong constraint is worse than a plainly phrased right one, because the polish makes it more convincing.
 
-These are soft checks, but naming them outperforms omitting them.
+The list above is yours as the writer; none of it ships inside the prompt.

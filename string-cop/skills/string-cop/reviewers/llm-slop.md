@@ -46,6 +46,7 @@ Triads where one item carries the meaning: "fast, simple and reliable"; "track, 
 ### Editorial and didactic filler
 
 - "Note that…", "It's worth noting that…", "Keep in mind…", "Please be aware that…"
+- Reveal openers that promise a turn the string never takes: "Here's the thing", "Here's what…", "Here's why…", "The truth is", "It turns out". On a screen the run-up costs the user the width the fact needed: "Here's why your import failed" → "Your import failed: row 4 has no email column"
 - "In other words,…" restating a sentence that was already clear
 - "This ensures that…" / "This allows us to…" / "This means that…" opening a sentence that then restates the control
 - Present-participle tails: "…, ensuring your data stays in sync", "…, giving you full visibility". These almost never carry a checkable claim

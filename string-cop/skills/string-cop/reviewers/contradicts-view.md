@@ -1,6 +1,6 @@
 # Find Strings That Contradict the View
 
-Scan for user-facing strings that disagree with what the application actually renders or does. This is the most dangerous lens and the only one that can issue a **Critical**: a user reads the sentence, believes it, and acts. A stale hint is worse than no hint, because a missing hint makes the user check and a wrong hint makes them stop checking.
+Scan for user-facing strings that disagree with what the application renders or does. This is the most dangerous lens and the only one that can issue a **Critical**: a user reads the sentence, believes it, and acts. A stale hint is worse than no hint, because a missing hint makes the user check and a wrong hint makes them stop checking.
 
 The other nine lenses ask whether a string deserves the space. You ask whether it is true.
 
@@ -64,7 +64,7 @@ This class is where Critical lives. Read the handler.
 
 - **A hint you have not checked.** An unverified contradiction claim is itself a false statement, and it costs the user a wasted investigation. If you cannot reach the code that would confirm it, either read further or drop the finding. Never file a suspicion.
 - **A string that is imprecise but not wrong.** "About 10%" where the constant is 0.096 is fine. "10%" where the constant is 0.5 is not.
-- **Aspiration in an obviously labelled place.** A roadmap page or a "coming soon" screen is not lying about the present.
+- **Aspiration in a labelled place.** A roadmap page or a "coming soon" screen is not lying about the present.
 - **A caveat that is conservative.** A hint saying a number is approximate when it is in fact exact costs the user nothing; a hint saying it is exact when it is approximate costs them a decision. Only the second direction is a finding.
 - **Rounding and formatting differences** the user cannot act on.
 - **A claim that is true on this screen but false elsewhere.** That is `cross-screen`'s finding about drift, not yours.
@@ -89,7 +89,7 @@ For each contradiction:
 |-------|---------|
 | **Location** | file:line of the string |
 | **Screen says** | The claim, quoted verbatim |
-| **View does** | What the code actually does, with the file:line that proves it |
+| **View does** | What the code does, with the file:line that proves it |
 | **Cost to the user** | What a user who believes the string does wrong |
 | **Suggestion** | The corrected string, written out. Never a code change |
 

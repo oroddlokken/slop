@@ -18,7 +18,7 @@ The orchestrator has already extracted every user-facing string. Each entry give
 
 ## Ground Rules
 
-- **Read files and run targeted searches (Grep, Glob, Read) only.** Do not modify, create, or delete files, execute code, or make network requests. The inventory is your primary input; use tools to open the template or view when you need to see what the string sits next to or what the view actually renders.
+- **Read files and run targeted searches (Grep, Glob, Read) only.** Do not modify, create, or delete files, execute code, or make network requests. The inventory is your primary input; use tools to open the template or view when you need to see what the string sits next to or what the view renders.
 - **Restrict all searches to `{path}` and its subdirectories.**
 - **Judge the string, not the code and not the design.** If the view has a bug but the string honestly describes the intent, that is not your finding (it belongs to `/codehealth`). If the page is cramped or the color is wrong, that is a design concern, not yours. If the string is false, unnecessary, condescending, or unactionable — that is yours.
 - **Protect strings that carry a fact the screen cannot show.** A hint carrying a unit, a source, a limit, or a consequence is doing work no label can do. A tooltip saying an end time is "accurate to within one interval" tells the user how much to trust the number beside it — that stays, even if it is long. Do NOT flag a string because it is wordy, because the developer could have shortened it, or because you personally would not have written it. Flagging a hint that carries a fact is a false positive and it is worse than missing a bad string.

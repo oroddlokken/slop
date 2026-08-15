@@ -55,7 +55,7 @@ These sit between narration and a real state fact. Apply the test below carefull
 - **A hint naming a constraint on input.** "Max 20 MB", "one URL per line", "numbers only", "kcal per 100 g". Format and limit hints are the reason placeholder text exists. Protect them.
 - **A hint that resolves an ambiguous control.** If a toggle's two states are not obvious from the label ("Strict" — strict about what?), a clarifying sentence is doing real work. The finding, if any, is that the label should be better; say so rather than proposing deletion.
 - **Keyboard shortcuts and non-obvious affordances.** "Shift-click to select a range", "drag to reorder". These are invisible without the hint.
-- **Instructions for a genuinely multi-step flow** with state between steps, where the user needs to know what comes after this screen.
+- **Instructions for a multi-step flow** with state between steps, where the user needs to know what comes after this screen.
 - **First-run and onboarding surfaces** where nothing on screen has context yet.
 - **Accessibility text that duplicates a visual label on purpose.** An `aria-label` restating a button's icon is correct; that is what it is for. Only flag an `aria-label` whose *wording* is wrong for a screen reader, and even then say so precisely.
 
@@ -104,5 +104,5 @@ After scanning, output your `## Findings Summary` table:
 - **Cover test in every finding.** State what the control communicates without the sentence.
 - **Keep constraints and consequences.** Format limits, size caps, irreversibility, and hidden affordances are hints, not narration. When a narration string contains one, propose keeping that clause alone.
 - **Batch per screen at four or more.** One Medium finding with locations beats six Lows that the cap will discard.
-- **Do not propose adding text.** If a control is genuinely unclear, the fix is a better label — say that in one clause and move on. This lens removes; it does not commission copy.
+- **Do not propose adding text.** If a control is unclear, the fix is a better label — say that in one clause and move on. This lens removes; it does not commission copy.
 - **A better label is not a code change.** Renaming a button's text is copy. Adding, removing, or rewiring a control is not — that is out of scope.
