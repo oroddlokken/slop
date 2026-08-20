@@ -2,7 +2,9 @@
 
 Various slop I have made for use with Claude Code or OpenCode.
 
-[claude](claude) is the tooling I run inside Claude Code itself: model launchers, a memory browser, and a hook that blocks `git stash` and `git worktree`. The status line and cost reporting moved to [oroddlokken/ccreport](https://github.com/oroddlokken/ccreport). The rest below are skills.
+[claude](claude) is the tooling I run inside Claude Code itself: model launchers, a memory browser, and a hook that blocks `git stash` and `git worktree`. The status line and cost reporting moved to [oroddlokken/ccreport](https://github.com/oroddlokken/ccreport).
+
+[slop-trifecta](slop-trifecta) is the anti-slop set, three pieces over three places slop shows up: an output style for replies, a skill for the prose that lands in files and on screens, and a `PostToolUse` hook that checks each write against the same word list. Each works alone. The rest below are skills.
 
 [audit-agent-docs](audit-agent-docs) and [codehealth](codehealth) are skills I use often to keep vibe coded projects somewhat maintainable.
 
