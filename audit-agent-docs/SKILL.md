@@ -341,6 +341,8 @@ Before presenting the distilled report to the user, check it against its output 
 
 If any of the above fails, fix it before returning the report. Do not ship a half-formed audit.
 
+### Step 6: Present and Apply
+
 After the checks pass, present the report and ask the user: "Want me to apply these changes?"
 
 **If the user declines**, offer: "Would you like to adjust the scope or pick a subset of lenses and re-run, or drop the audit?" Do not re-apply changes, do not re-run silently, and do not nag. The report stays in the conversation for reference.

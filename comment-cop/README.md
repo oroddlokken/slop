@@ -23,7 +23,7 @@ Every action item includes a file path and line number.
 |------|-------|
 | contradicts-code | Comments and docstrings that disagree with what the code does |
 | rambling | Five paragraphs where one line belongs |
-| llm-slop | AI-chatbot prose tics, filler vocabulary, leftover chat residue |
+| machine-prose | Machine-written prose tics: "load-bearing", "robust", "simply", "it's not X — it's Y", em-dash spray, `# Load the config` narration |
 | missing-why | Code that needs rationale and has none |
 | dead-comments | Commented-out code, debug leftovers, abandoned TODO/FIXME |
 | restates-code | Comments that narrate the line below them |
@@ -39,7 +39,7 @@ Every action item includes a file path and line number.
 | Mode | What runs |
 |------|-----------|
 | Full | Every lens (default) |
-| Quick | 5 high-signal lenses: contradicts-code, rambling, llm-slop, missing-why, dead-comments |
+| Quick | 5 high-signal lenses: contradicts-code, rambling, machine-prose, missing-why, dead-comments |
 | Pick | You choose which lenses to run |
 
 Agents run sequentially by default — it spreads token spend across the run instead of bursting it. Either way one agent runs alone first: it writes the cache entry for the system prompt and tool definitions, and every agent after it reads that entry. The rolling window costs the same and finishes sooner.

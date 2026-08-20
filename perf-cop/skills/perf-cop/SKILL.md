@@ -1,6 +1,6 @@
 ---
 name: perf-cop
-description: "Performance sweep over a whole codebase. Use when asked what's slow, for a performance review, to optimize or speed something up, to hunt latency, memory growth, or find hot spots — and after a feature lands, to catch the cost it added. Spins up parallel agents (hot-loops, allocations, io-batching, blocking, startup, payloads, caching-wins), each of which must name the workload a finding costs, then distills findings into prioritized action points. For maintainability use codehealth, for SQL depth use dba."
+description: "Performance sweep over a whole codebase. Use when asked what's slow, for a performance review, to optimize or speed something up, to hunt latency, memory growth, or find hot spots — and after a feature lands, to catch the cost it added. Spins up parallel agents (hot-loops, allocations, io-batching, blocking, startup, payloads, caching-wins, tail-latency), each of which must name the workload a finding costs, then distills findings into prioritized action points. For maintainability use codehealth, for SQL depth use dba."
 argument-hint: "[area]"
 disable-model-invocation: true
 ---
@@ -31,7 +31,7 @@ Every finding here has to earn its place by naming the workload it costs — see
 
 Ask the user which mode they want:
 
-- **Full** — Run all 7 reviewers, then distill (hot-loops, allocations, io-batching, blocking, startup, payloads, caching-wins).
+- **Full** — Run all 8 reviewers, then distill (hot-loops, allocations, io-batching, blocking, startup, payloads, caching-wins, tail-latency).
 - **Quick** — Run 3 high-yield reviewers (hot-loops, io-batching, blocking), then distill. These three cover where measured time usually goes: CPU in the loop, round trips across a boundary, and waiting. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
@@ -55,6 +55,7 @@ Available reviewers:
 | startup | Import-time work, eager loading, cold-start cost |
 | payloads | Over-fetching, oversized responses, missing pagination or streaming |
 | caching-wins | Hot recomputation that memoization would remove |
+| tail-latency | The spread between median and p99 — per-caller size, miss paths, queueing |
 
 Skip the question only when the user's invocation already named a mode (e.g. "run perf-cop quick" → Quick). A bare `/perf-cop` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
 
@@ -72,6 +73,7 @@ Skip the question only when the user's invocation already named a mode (e.g. "ru
 - **caching-wins defers to io-batching** when the right fix is batching rather than memoizing. Memoization helps when the same inputs recur; batching helps when different inputs are fetched one at a time. If it is the second, it is an io-batching finding.
 - **startup owns anything that runs before the first request or first command** — import-time work, module-level initialization, eager loading, connection setup, cold-start cost. Every other reviewer owns steady state. A regex compiled at import is startup's; the same regex compiled inside a request handler is hot-loops'.
 - **allocations owns memory volume and copies**; **payloads owns the size of data crossing a boundary** (rows fetched, bytes returned, pages not paginated). A copy of an over-fetched list is two findings only if both the fetch and the copy are separately fixable.
+- **The other seven lenses cost the average call; tail-latency owns the spread around it.** `blocking` owns whether a wait exists and how the resource is sized — pool starvation, lock scope, missing timeouts. `tail-latency` owns what the distribution across that resource looks like under normal load: which callers sit at p99, and what the mean hides. One serialized path can produce a finding from each. A finding whose fix speeds up every request equally is not this lens's; hand it back to the lens that owns the work.
 
 ### Step 1.5: Language Prescan
 
@@ -202,7 +204,7 @@ Concentrate your analysis primarily on **{area}**. During the scan, go deeper on
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reviewer criteria files** are in this skill's `reviewers/` directory: `hot-loops.md`, `allocations.md`, `io-batching.md`, `blocking.md`, `startup.md`, `payloads.md`, `caching-wins.md`.
+**Reviewer criteria files** are in this skill's `reviewers/` directory: `hot-loops.md`, `allocations.md`, `io-batching.md`, `blocking.md`, `startup.md`, `payloads.md`, `caching-wins.md`, `tail-latency.md`.
 
 ### Amending the Brief Mid-Run
 

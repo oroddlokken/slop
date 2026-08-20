@@ -30,6 +30,7 @@ Every action item includes a file path, line number, and concrete fix.
 | raw-perf | Full table scans, leading wildcard LIKE, offset pagination, functions on indexed columns |
 | data-integrity | Missing FK constraints, nullable gaps, orphan-producing deletes, missing CHECK |
 | privilege-scope | Superuser connections, overly broad GRANT, missing row-level security |
+| write-durability | Settings that lose an acknowledged write on power loss — `fsync=off`, SQLite `synchronous=OFF`, UNLOGGED tables, a data directory on ephemeral storage |
 
 ## Modes
 

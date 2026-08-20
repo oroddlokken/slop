@@ -1,6 +1,6 @@
 ---
 name: codehealth
-description: "Broad code-quality sweep over a whole codebase. Use when asked to review code health, find technical debt, clean up a codebase, hunt duplication or dead code, or answer what should we refactor — and after a structural change settles, to catch what the refactor left behind. Spins up parallel agents (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs), then distills findings into prioritized action points. For SQL depth use dba."
+description: "Broad code-quality sweep over a whole codebase. Use when asked to review code health, find technical debt, clean up a codebase, hunt duplication or dead code, or answer what should we refactor — and after a structural change settles, to catch what the refactor left behind. Spins up parallel agents (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs, optional-discipline, failure-cleanup), then distills findings into prioritized action points. For whether an abstraction should exist use should-i-abstract, for SQL depth use dba."
 argument-hint: "[area]"
 disable-model-invocation: true
 ---
@@ -27,7 +27,7 @@ Launch parallel code-quality agents, each analyzing the codebase through a diffe
 
 Ask the user which mode they want:
 
-- **Full** — Run all 13 reviewers, then distill (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs).
+- **Full** — Run all 15 reviewers, then distill (duplicates, extract-logic, simplify-code, hardcoded, error-gaps, complexity, query-smells, caching, dead-code, naming, dep-hygiene, test-gaps, type-structs, optional-discipline, failure-cleanup).
 - **Quick** — Run 5 high-risk reviewers (duplicates, complexity, error-gaps, hardcoded, type-structs), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
@@ -57,6 +57,8 @@ Available reviewers:
 | dep-hygiene | Unused imports, unnecessary dependencies, outdated deps |
 | test-gaps | Critical code paths lacking test coverage |
 | type-structs | Raw dicts/lists/tuples that should be dataclasses or typed structures |
+| optional-discipline | Absent values consumed unchecked, truthiness presence tests, boundary `Any`, type suppressions |
+| failure-cleanup | State left half-written when one call raises partway through |
 
 Skip the question only when the user's invocation already named a mode (e.g. "run codehealth quick" → Quick). A bare `/codehealth` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
 
@@ -68,6 +70,15 @@ Some reviewers examine similar code from different angles. When findings overlap
 - **dep-hygiene** owns package-level dependency issues (unused entries in manifests). dead-code owns file-level unused imports.
 - **complexity** targets mechanical metrics (length, nesting, branches). extract-logic targets logical boundaries (multi-step operations in wrong layer). Both may flag the same long function — complexity measures the shape, extract-logic measures responsibility.
 - **duplicates** flags copied code. extract-logic flags inline operations. If code is both duplicated AND inline, duplicates takes precedence.
+- **error-gaps** owns the producer of an absence — a function that catches and returns `None`, so callers cannot tell it failed. **optional-discipline** owns the consumer: the call site that spends that `None` without a check. When both are wrong, optional-discipline reports the call site and names the producer.
+- **type-structs** owns the shape of a value — a raw dict standing in for an object, fixed by naming the fields. **optional-discipline** owns the type layer around it: an `Any` at an external boundary that ends checking, and the `type: ignore` or `as any` on the line the checker objected to.
+- **error-gaps** owns whether an error is handled. **failure-cleanup** owns what a raise left behind after it propagated correctly — a lock still held, a status flag still set, one write committed and its pair missing. A swallowed exception is error-gaps; a correct exception over half-written state is failure-cleanup.
+
+**Against sibling skills.** This skill reads source as source — one process, one call, no deploy shape:
+
+- **`should-i-abstract` owns whether an abstraction should exist at all.** `duplicates` and `extract-logic` start from written code and report copies and inline operations; the reverse case — a helper with one caller, cheaper inlined than followed — is `should-i-abstract`'s, and a consolidation it declined at step 1 of the review order is not reopened here at step 11.
+- **`test-my-tests`'s `coverage-gaps` owns "no test exists at all".** This skill owns the source, `test-my-tests` owns the suite over it. When both skills run, `test-gaps` reports nothing and hands its list over. The review order runs this skill at step 11 and `test-my-tests` at step 21, so the same untested handler would otherwise file twice. Run alone, `test-gaps` keeps the lens.
+- **`failure-cleanup` owns the half-write one call leaves behind; the wider failures belong elsewhere.** Out of scope: cleanup that only runs on the happy path at process exit, the unclean paths of `kill -9` and power loss, item 50 of 100 in a batch, and teardown of running async work. The lens lives here because one call raising over local state names no deploy shape, and a deploy shape is what those wider failures are graded on.
 
 ### Step 1.5: Language Prescan
 
@@ -137,7 +148,7 @@ The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a fil
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 
-Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 13 agents each independently scanning the same files.
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 15 agents each independently scanning the same files.
 
 1. Replace `{languages}` and `{focus}` in `scan-steps.md`
 2. Follow the scan procedure — read manifests, source files, CI/CD, git log, etc.
@@ -194,7 +205,7 @@ Concentrate your analysis primarily on **{area}**. During the scan, go deeper on
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reviewer criteria files** are in this skill's `reviewers/` directory: `duplicates.md`, `extract-logic.md`, `simplify-code.md`, `hardcoded.md`, `error-gaps.md`, `complexity.md`, `query-smells.md`, `caching.md`, `dead-code.md`, `naming.md`, `dep-hygiene.md`, `test-gaps.md`, `type-structs.md`.
+**Reviewer criteria files** are in this skill's `reviewers/` directory: `duplicates.md`, `extract-logic.md`, `simplify-code.md`, `hardcoded.md`, `error-gaps.md`, `complexity.md`, `query-smells.md`, `caching.md`, `dead-code.md`, `naming.md`, `dep-hygiene.md`, `test-gaps.md`, `type-structs.md`, `optional-discipline.md`, `failure-cleanup.md`.
 
 ### Amending the Brief Mid-Run
 
@@ -221,4 +232,3 @@ Spawn a fresh sub-agent for distillation:
 Paste the distill agent's output into your own reply, verbatim and in full.
 
 Only your reply is rendered to the user — the agent's report is not. Never point at it with "the findings are above", "see the report", or similar. Length is not a reason to summarize instead: if the list is long, your reply is long.
-

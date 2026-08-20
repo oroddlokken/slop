@@ -30,6 +30,8 @@ Every action item includes a file path and line number.
 | dep-hygiene | Unused imports, unnecessary dependencies, outdated deps |
 | test-gaps | Critical code paths lacking test coverage |
 | type-structs | Raw dicts/lists/tuples that should be typed structures |
+| optional-discipline | Absent values consumed unchecked, truthiness presence tests, boundary `Any`, type suppressions |
+| failure-cleanup | State left half-written when one call raises partway through |
 
 ## Modes
 

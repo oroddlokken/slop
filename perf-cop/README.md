@@ -38,6 +38,7 @@ Every action item includes a file path and line number.
 | startup | Import-time work, eager loading, cold-start cost |
 | payloads | Over-fetching, oversized responses, missing pagination or streaming |
 | caching-wins | Hot recomputation that memoization would remove |
+| tail-latency | The spread between median and p99 — per-caller size, miss paths, queueing |
 
 ## Modes
 

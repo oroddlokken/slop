@@ -85,7 +85,7 @@ Drop findings that overlap an existing dcat tracked issue.
 
 ### 2.4 Cap and format
 
-Cap at 25 action points across all tiers. Drop the lowest-impact items if over.
+Cap at 35 action points across all tiers. Drop the lowest-impact items if over, and list what went in a `Below the cap` section: one line per theme, with a count and one example path, never one line per dropped finding. Omit that section when nothing was dropped.
 
 ```
 ## Test Quality Results
@@ -115,6 +115,10 @@ Valid improvements, not urgent.
 
 4. [ ] **{title}** — {one-line description}
    `{file_path}:{line}` — {what to change} | Lens: `{reviewer}`
+
+### Below the cap
+Valid findings that ranked below the 35-item cap. Themes, not actions.
+- {theme} — {N} findings, {tiers}, e.g. `{file_path}:{line}`
 
 ### Skipped
 - {N} findings dropped as minor pedantry or noise.

@@ -80,7 +80,7 @@ Operate only on the Pass 1 list — not raw reviewer prose.
 
 When `severity_votes` disagree, take the highest, then sanity-check against the universal severity definitions: a "Critical" vote on a rambling docstring maps down to Green. Resolve any `[CONFLICT]` using this hierarchy: is-it-misleading > will-it-rot > is-it-missing > is-it-clutter.
 
-Style ranks below truth. When an `llm-slop` finding lands on the same prose as a `contradicts-code` or `doc-drift` finding, the truth finding leads the merged action point and the style note becomes a clause inside it — never its own row. An action point must never read as "reword this" when the underlying statement is wrong; fixing the wording alone would leave a false claim behind, better dressed. If a comment is both clutter AND carries a real fact to any degree, resolve toward "shorten, don't delete." Append the resolution to the finding's note.
+Style ranks below truth. When a `machine-prose` finding lands on the same prose as a `contradicts-code` or `doc-drift` finding, the truth finding leads the merged action point and the style note becomes a clause inside it — never its own row. An action point must never read as "reword this" when the underlying statement is wrong; fixing the wording alone would leave a false claim behind, better dressed. If a comment is both clutter AND carries a real fact to any degree, resolve toward "shorten, don't delete." Append the resolution to the finding's note.
 
 ### 2.2 Rank within each tier
 
@@ -92,7 +92,7 @@ Drop findings that overlap an existing dcat tracked issue (same file + same kind
 
 ### 2.4 Cap and format
 
-Cap at 25 action points across all tiers. Drop the lowest-impact clutter first if over. Prefer collapsing systemic habits into a single action point ("Strip inlined ticket ids from 14 docstrings") over listing each instance.
+Cap at 35 action points across all tiers. Prefer collapsing systemic habits into a single action point ("Strip inlined ticket ids from 14 docstrings") over listing each instance. Drop the lowest-impact items if over, and list what went in a `Below the cap` section: one line per theme, with a count and one example path, never one line per dropped finding. Omit that section when nothing was dropped.
 
 ```
 ## Comment Cop Results
@@ -114,6 +114,10 @@ Rambling, restatements, decorative noise, dead comments.
 
 3. [ ] **{title}** — {one-line description}
    `{file_path}:{line}` — {what to change} | Lens: `{reviewer}`
+
+### Below the cap
+Valid findings that ranked below the 35-item cap. Themes, not actions.
+- {theme} — {N} findings, {tiers}, e.g. `{file_path}:{line}`
 
 ### Skipped
 - {N} findings dropped as noise or subjective preference.

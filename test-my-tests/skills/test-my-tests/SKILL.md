@@ -1,6 +1,6 @@
 ---
 name: test-my-tests
-description: "Test-suite quality deep-dive: not whether tests exist, but whether they would catch a real bug. Use when asked to review tests, check coverage gaps, judge whether a suite is trustworthy, investigate flaky tests, or work out why a bug shipped past green tests. Spins up parallel agents (coverage-gaps, happy-path-only, user-flows, mock-debt, assertion-quality, fragile-tests, data-realism, error-paths, boundary-values, flaky-risks), then distills findings into prioritized action points. Reads the tests; never runs them."
+description: "Test-suite quality deep-dive: not whether tests exist, but whether they would catch a real bug. Use when asked to review tests, check coverage gaps, judge whether a suite is trustworthy, investigate flaky tests, or work out why a bug shipped past green tests. Spins up parallel agents (coverage-gaps, happy-path-only, user-flows, mock-debt, assertion-quality, fragile-tests, data-realism, error-paths, boundary-values, flaky-risks), then distills findings into prioritized action points. Reads the tests; never runs them. The source under the tests is codehealth's."
 argument-hint: "[area]"
 disable-model-invocation: true
 ---
@@ -67,6 +67,11 @@ Some reviewers examine similar code from different angles. When findings overlap
 - **mock-debt** owns mock/stub concerns. **fragile-tests** owns coupling to implementation. If a mock is both unrealistic AND makes the test fragile, mock-debt takes it.
 - **data-realism** owns fixture/factory data quality. **boundary-values** owns specific edge values. If test data is both simplistic AND misses boundaries, data-realism takes the systemic issue, boundary-values takes specific missing values.
 
+**Against sibling skills.** This skill owns the suite; the source under it belongs elsewhere:
+
+- **`codehealth`'s `test-gaps` runs the same zero-coverage sweep as `coverage-gaps`.** When both skills run, this one owns it and `test-gaps` defers. Where the fix is to the source rather than to a test — dead code, a name that misleads, a function too tangled to test — it is `codehealth`'s.
+- **A clock bug that also breaks production is out of scope.** This skill's `flaky-risks` owns one confined to the suite: a fixed sleep, a hardcoded date, a test that fails at year end.
+
 ### Step 1.5: Language Prescan
 
 Detect which languages are in scope so agents review tests for all of them:
@@ -128,7 +133,7 @@ Read `scan-steps.md` from this skill's directory and follow its scan procedure. 
 
 ### Step 3: Launch Agents
 
-Use the agent template (`test-agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
+Use the agent template (`agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
 
 **Spawn contract** — how you call the Agent tool, in every launch mode:
 
@@ -153,7 +158,7 @@ The cause is breakpoint placement. Caching matches a byte prefix ending at a `ca
 - **Snapshot size is the bigger lever.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves more than launch order does, and both are worth taking.
 
 **Build the shared prefix once:**
-1. Read `test-agent.md` from this skill's directory
+1. Read `agent.md` from this skill's directory
 2. Replace `{path}` with the target path
 3. Replace `{codebase_snapshot}` with the snapshot from Step 2.5
 4. Replace `{languages}` with the confirmed language list
@@ -208,4 +213,3 @@ Only your reply is rendered to the user — the agent's report is not. Never poi
 - If a reviewer's criteria file does not exist, skip that reviewer and warn the user.
 - If all agents return zero findings, output "Test suite looks solid — no significant gaps found" and skip the distill step.
 - If some agents fail or timeout, distill with available results and note which reviewers were skipped.
-

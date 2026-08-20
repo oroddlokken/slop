@@ -1,6 +1,6 @@
 ---
 name: comment-cop
-description: "Reviews what the comments and docs SAY, not what the code does. Use when asked to clean up comments, docstrings, or README prose; when a codebase feels buried under stale or self-indulgent explanation; when checking whether docstrings still match their signatures; or when hunting machine-written filler. Protects why-comments that carry a real gotcha and flags the rest. Spins up parallel agents (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, counting, settled-history, noise, llm-slop), then distills findings into prioritized action points. For user-facing strings use string-cop; for the logic itself use codehealth."
+description: "Reviews what the comments and docs SAY, not what the code does. Use when asked to clean up comments, docstrings, or README prose; when a codebase feels buried under stale or self-indulgent explanation; when checking whether docstrings still match their signatures; or when hunting machine-written filler. Protects why-comments that carry a real gotcha and flags the rest. Spins up parallel agents (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, counting, settled-history, noise, machine-prose), then distills findings into prioritized action points. For user-facing strings use string-cop; for the logic itself use codehealth."
 argument-hint: "[area]"
 disable-model-invocation: true
 ---
@@ -32,8 +32,8 @@ This skill reviews the *documentation layer*, not the logic. It asks: does this 
 
 Ask the user which mode they want:
 
-- **Full** — Run every reviewer, then distill (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, counting, settled-history, noise, llm-slop).
-- **Quick** — Run the high-signal subset (contradicts-code, rambling, llm-slop, missing-why, dead-comments), then distill. Faster.
+- **Full** — Run every reviewer, then distill (rambling, transient, contradicts-code, restates-code, missing-why, dead-comments, docstring-gaps, doc-drift, counting, settled-history, noise, machine-prose).
+- **Quick** — Run the high-signal subset (contradicts-code, rambling, machine-prose, missing-why, dead-comments), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
 Skip the question only when the user's invocation already named a mode (e.g. "run comment-cop quick" → Quick). A bare `/comment-cop` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
@@ -64,21 +64,21 @@ Available reviewers:
 | counting | Counts of a set the prose does not own, lead-ins numbering their own list, "step 5"-style positional references |
 | settled-history | True prose about the past — removals, migrations, fixed hazards, rejected alternatives, edit annotations |
 | noise | Banner comments, decorative dividers, redundant type restatements, section theater |
-| llm-slop | Machine-written prose tics: "load-bearing", "robust", "simply", "it's not X — it's Y", em-dash spray, `# Load the config` narration |
+| machine-prose | Machine-written prose tics: "load-bearing", "robust", "simply", "it's not X — it's Y", em-dash spray, `# Load the config` narration |
 
 ### Scope Boundaries
 
 Some reviewers examine the same comment from different angles. When findings overlap:
 - **contradicts-code** owns all *in-source* comments and docstrings that disagree with code. **doc-drift** owns *external* prose (README, `.md`, docs sites). If a docstring is stale, contradicts-code owns it; if the README is stale, doc-drift owns it.
-- **settled-history owns prose that is true and about the past; contradicts-code and doc-drift own prose that is false about the present.** "The old parser choked on tabs, so this pre-splits" is accurate and theirs to skip, settled-history's to cut. Where a removal note is also wrong — the thing came back, or never left — contradicts-code leads and settled-history rides along. **transient** owns a phrase that *will* rot ("recently", "for now", a live instance name); settled-history owns one that already has nothing to act on. **dead-comments** keeps commented-out code and TODO graveyards exclusively; a paragraph *about* deleted code is settled-history. **llm-slop** keeps `# Changed from X to Y` when the tell is the assistant's changelog voice; in the author's own voice it is settled-history. One action point either way.
+- **settled-history owns prose that is true and about the past; contradicts-code and doc-drift own prose that is false about the present.** "The old parser choked on tabs, so this pre-splits" is accurate and theirs to skip, settled-history's to cut. Where a removal note is also wrong — the thing came back, or never left — contradicts-code leads and settled-history rides along. **transient** owns a phrase that *will* rot ("recently", "for now", a live instance name); settled-history owns one that already has nothing to act on. **dead-comments** keeps commented-out code and TODO graveyards exclusively; a paragraph *about* deleted code is settled-history. **machine-prose** keeps `# Changed from X to Y` when the tell is the assistant's changelog voice; in the author's own voice it is settled-history. One action point either way.
 - **counting owns count-shaped claims; doc-drift and contradicts-code own claims that are already false.** A doc promising "all 10 lenses" beside a directory of 11 trips both: doc-drift has the drift, counting has the number itself. Merge to one action point whose fix is the count-free rewrite, not the corrected number. A count that is still accurate today belongs to counting alone, in docs and in-source comments alike. Positional references ("step 5 of the protocol", "the second branch below") are counting's exclusively — no other lens flags them.
 - **rambling** owns multi-sentence narrative regardless of content. **restates-code** owns short comments that mirror a single adjacent statement. A one-liner echoing the code → restates-code; a three-paragraph essay → rambling even if partly redundant.
 - **transient** owns the rot-prone *specifics* (an instance name, a ticket id, a date). **rambling** owns the surrounding verbosity. In one bloated docstring, transient flags the anecdote, rambling flags the length — but coordinate so it is one action point in distill.
 - **docstring-gaps** owns the *presence and structural quality* of API docstrings (missing, wrong params/returns/raises). **missing-why** owns inline rationale for non-obvious code that has no comment at all. A public function with no docstring → docstring-gaps; a magic constant with no explanation → missing-why.
 - **noise** owns purely decorative/structural comments (banners, dividers, type restatements). **restates-code** owns prose that narrates logic. A `# ===== SECTION =====` divider → noise; a `# increment i` over `i += 1` → restates-code.
 - **dead-comments** owns commented-out code and TODO/FIXME graveyards exclusively — no other reviewer flags these.
-- **llm-slop ranks below contradicts-code and doc-drift.** Whether prose tells the truth matters more than whether it sounds machine-written, and the two are independent — a comment can be flawlessly written and false. When the same text trips both, the truth finding leads and the style note rides along. A style rewrite must never make an unverified claim more convincing.
-- **llm-slop** owns *word choice and sentence shape*: the vocabulary tics, the antithesis flourish, em-dash density, and the specific assistant narration idioms (`# Load the config`, `Helper function that…`). **rambling** owns volume, **restates-code** owns redundancy, **noise** owns decoration. One narration comment in the assistant's idiom → llm-slop; a redundant one-liner in the author's own voice → restates-code. A three-paragraph docstring stuffed with "robust" and "seamless" → rambling flags the length, llm-slop flags the vocabulary; coordinate so distill emits one action point.
+- **machine-prose ranks below contradicts-code and doc-drift.** Whether prose tells the truth matters more than whether it sounds machine-written, and the two are independent — a comment can be flawlessly written and false. When the same text trips both, the truth finding leads and the style note rides along. A style rewrite must never make an unverified claim more convincing.
+- **machine-prose** owns *word choice and sentence shape*: the vocabulary tics, the antithesis flourish, em-dash density, and the specific assistant narration idioms (`# Load the config`, `Helper function that…`). **rambling** owns volume, **restates-code** owns redundancy, **noise** owns decoration. One narration comment in the assistant's idiom → machine-prose; a redundant one-liner in the author's own voice → restates-code. A three-paragraph docstring stuffed with "robust" and "seamless" → rambling flags the length, machine-prose flags the vocabulary; coordinate so distill emits one action point.
 
 ### Step 1.5: Language Prescan
 
@@ -205,7 +205,7 @@ Concentrate your analysis primarily on **{area}**. During the review, go deeper 
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reviewer criteria files** are in this skill's `reviewers/` directory: `rambling.md`, `transient.md`, `contradicts-code.md`, `restates-code.md`, `missing-why.md`, `dead-comments.md`, `docstring-gaps.md`, `doc-drift.md`, `counting.md`, `settled-history.md`, `noise.md`, `llm-slop.md`.
+**Reviewer criteria files** are in this skill's `reviewers/` directory: `rambling.md`, `transient.md`, `contradicts-code.md`, `restates-code.md`, `missing-why.md`, `dead-comments.md`, `docstring-gaps.md`, `doc-drift.md`, `counting.md`, `settled-history.md`, `noise.md`, `machine-prose.md`.
 
 ### Amending the Brief Mid-Run
 

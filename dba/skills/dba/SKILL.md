@@ -1,13 +1,13 @@
 ---
 name: dba
-description: "Deep database and SQL audit for relational codebases. Use when asked to review queries, schema, migrations, or indexes; when pages are slow and the database is the suspect; before shipping a migration; or when checking for SQL injection and missing constraints. Twelve specialized lenses instead of codehealth's single query-smells reviewer. Spins up parallel agents (injection, n-plus-one, schema-drift, index-coverage, transaction-gaps, query-scatter, connection-mgmt, migration-safety, orm-antipatterns, raw-perf, data-integrity, privilege-scope), then distills findings into prioritized action points. Relational only — NoSQL is out of scope."
+description: "Deep database and SQL audit for relational codebases. Use when asked to review queries, schema, migrations, or indexes; when pages are slow and the database is the suspect; before shipping a migration; or when checking for SQL injection and missing constraints. Thirteen specialized lenses instead of codehealth's single query-smells reviewer. Spins up parallel agents (injection, n-plus-one, schema-drift, index-coverage, transaction-gaps, query-scatter, connection-mgmt, migration-safety, orm-antipatterns, raw-perf, data-integrity, privilege-scope, write-durability), then distills findings into prioritized action points. Relational only — NoSQL is out of scope."
 argument-hint: "[area]"
 disable-model-invocation: true
 ---
 
 # SQL Health
 
-Deep database audit for codebases with SQL/relational databases. Use this instead of codehealth's query-smells reviewer when you want 12 specialized database lenses rather than one. Use instead of fuzz-my-stuff-up's injection fuzzer when you want a full DBA-style review, not just adversarial probing.
+Deep database audit for codebases with SQL/relational databases. Use this instead of codehealth's query-smells reviewer when you want 13 specialized database lenses rather than one. Use instead of fuzz-my-stuff-up's injection fuzzer when you want a full DBA-style review, not just adversarial probing.
 
 Launch parallel database-focused agents, each analyzing the codebase through a different SQL/database lens, then distill all findings into unified, prioritized action points.
 
@@ -31,8 +31,8 @@ Launch parallel database-focused agents, each analyzing the codebase through a d
 
 Ask the user which mode they want:
 
-- **Full** — Run all 12 reviewers, then distill (injection, n-plus-one, schema-drift, index-coverage, transaction-gaps, query-scatter, connection-mgmt, migration-safety, orm-antipatterns, raw-perf, data-integrity, privilege-scope). Most thorough.
-- **Quick** — Run 5 high-risk reviewers (injection, n-plus-one, transaction-gaps, schema-drift, data-integrity), then distill. Faster.
+- **Full** — Run all 13 reviewers, then distill (injection, n-plus-one, schema-drift, index-coverage, transaction-gaps, query-scatter, connection-mgmt, migration-safety, orm-antipatterns, raw-perf, data-integrity, privilege-scope, write-durability). Most thorough.
+- **Quick** — Run 6 high-risk reviewers (injection, n-plus-one, transaction-gaps, schema-drift, data-integrity, write-durability), then distill. Faster.
 - **Pick** — Let the user choose which reviewers to run.
 
 ### Severity Definitions (all reviewers)
@@ -60,6 +60,7 @@ Available reviewers:
 | raw-perf | Full table scans, LIKE '%prefix', functions on indexed columns, implicit casts |
 | data-integrity | Missing FK constraints, nullable columns that shouldn't be, orphan-producing deletes |
 | privilege-scope | Queries running as superuser, overly broad GRANT, missing row-level security |
+| write-durability | Settings that lose an acknowledged write on power loss — `fsync=off`, SQLite `synchronous=OFF`, UNLOGGED tables, a data directory on ephemeral storage |
 
 Skip the question only when the user's invocation already named a mode (e.g. "run dba quick" → Quick). A bare `/dba` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
 
@@ -73,6 +74,7 @@ Some reviewers examine similar code from different angles. When findings overlap
 - **transaction-gaps** owns missing transaction boundaries. data-integrity owns missing constraints at the schema level. If a multi-step write has no transaction AND no FK constraint, transaction-gaps takes the finding (the transaction is the immediate fix).
 - **connection-mgmt** owns connection lifecycle issues. orm-antipatterns owns ORM-level query patterns. If an ORM misconfiguration causes connection leaks, connection-mgmt takes it.
 - **data-integrity** owns missing constraints (FK, UNIQUE, NOT NULL, CHECK, ON DELETE). **privilege-scope** owns DB user permissions, GRANT scope, and RLS policies. If both could flag the same table access pattern, data-integrity takes schema constraints, privilege-scope takes access control.
+- **transaction-gaps** owns whether a write is wrapped in a transaction. **write-durability** owns whether a committed transaction survives the machine losing power — flush settings, journal modes, UNLOGGED tables, ephemeral data directories, asynchronous replicas read as committed. A multi-step write with neither a transaction nor durable settings goes to transaction-gaps. The process's own files after `kill -9` are outside this skill; write-durability stops at the database's acknowledgement.
 
 ### Step 1.5: Language & Database Stack Detection
 
@@ -159,7 +161,7 @@ The 1-hour TTL is a staleness backstop, not a prompt-cache window: editing a fil
 
 ### Step 2.5: Prescan the Codebase (orchestrator does this once)
 
-Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 12 agents each independently scanning the same files.
+Read `scan-steps.md` from this skill's directory and follow its scan procedure. The orchestrator (you) reads all files once, then builds a single `{codebase_snapshot}` block that gets passed to every agent. This avoids 13 agents each independently scanning the same files.
 
 1. Replace `{languages}` and `{focus}` in `scan-steps.md`
 2. Follow the scan procedure — read manifests, source files, migrations, schema definitions, etc.
@@ -216,7 +218,7 @@ Concentrate your analysis primarily on **{area}**. During the scan, go deeper on
 Other issues are still worth mentioning but give {area} roughly 3x the attention and depth.
 ```
 
-**Reviewer criteria files** are in this skill's `reviewers/` directory: `injection.md`, `n-plus-one.md`, `schema-drift.md`, `index-coverage.md`, `transaction-gaps.md`, `query-scatter.md`, `connection-mgmt.md`, `migration-safety.md`, `orm-antipatterns.md`, `raw-perf.md`, `data-integrity.md`, `privilege-scope.md`.
+**Reviewer criteria files** are in this skill's `reviewers/` directory: `injection.md`, `n-plus-one.md`, `schema-drift.md`, `index-coverage.md`, `transaction-gaps.md`, `query-scatter.md`, `connection-mgmt.md`, `migration-safety.md`, `orm-antipatterns.md`, `raw-perf.md`, `data-integrity.md`, `privilege-scope.md`, `write-durability.md`.
 
 ### Amending the Brief Mid-Run
 

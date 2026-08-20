@@ -120,7 +120,7 @@ Drop findings that overlap an existing dcat tracked issue (same file + same kind
 
 ### 2.4 Cap and format
 
-Cap at 25 action points across all tiers. Drop the lowest-impact items if over.
+Cap at 35 action points across all tiers. Drop the lowest-impact items if over, and list what went in a `Below the cap` section: one line per theme, with a count and one example path, never one line per dropped finding. Omit that section when nothing was dropped.
 
 ```
 ## Performance Results
@@ -145,6 +145,10 @@ Small, cold-path, or unmeasured. Fix when nearby.
 3. [ ] **{title}** — {one-line description}
    `{file_path}:{line}` — {what to change}
    Workload: {path, cadence, size — or "unmeasured: no hot path identified"} | Lens: `{reviewer}`
+
+### Below the cap
+Valid findings that ranked below the 35-item cap. Themes, not actions.
+- {theme} — {N} findings, {tiers}, e.g. `{file_path}:{line}`
 
 ### Skipped
 - {N} findings dropped as noise (micro-optimization on a path nobody enters).

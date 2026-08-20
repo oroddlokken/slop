@@ -22,7 +22,7 @@ This is a database-focused scan. Read broadly but prioritize database-related co
 5. **Read ALL migration files** — migrations are usually small and schema-critical. Read every file in directories matching: `migrations/`, `alembic/versions/`, `db/migrate/`, `prisma/migrations/`, `flyway/`, `sql/`, `db/migrations/`. These define the ground truth schema.
 6. **Read ALL model/schema definition files** — ORM model files, Prisma schema, Django models.py, SQLAlchemy models, etc. Read exhaustively — these are the other half of the schema picture.
 7. **Read ALL .sql files** — seed data, stored procedures, views, functions, triggers. These are often missed but contain critical database logic.
-8. Read database configuration: connection pooling config, database URLs (redact credentials), timeout settings, replica config
+8. Read database configuration: connection pooling config, database URLs (redact credentials), timeout settings, replica config. Include server config the repo carries (`postgresql.conf`, `my.cnf`, `*.conf` under `docker/`) and the compose or Kubernetes manifests that set the server's flags and mount its data directory
 9. Read key source files **across all in-scope languages** that contain database operations. Distribute effort proportionally to file count but ensure every language gets meaningful coverage (at least 3-5 files each). Prioritize:
    - Repository/DAO/query modules — the data access layer
    - API routes/controllers that touch the database

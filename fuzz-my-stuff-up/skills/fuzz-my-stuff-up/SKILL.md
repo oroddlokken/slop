@@ -59,7 +59,7 @@ Available fuzzers:
 
 Skip the question only when the user's invocation already named a mode (e.g. "run fuzz-my-stuff-up quick" → Quick). A bare `/fuzz-my-stuff-up` names none: ask and wait for the answer. Silence is not a mode choice — never fall back to Full without one.
 
-**Why fuzzers share one methodology:** Unlike the sibling review skills (dba, codehealth), which give each lens its own criteria file, the fuzzers intentionally share a single generic attack methodology defined in `fuzzer-agent.md` rather than per-fuzzer criteria files — fuzzing is open-ended, and a fixed checklist would narrow it. Each fuzzer differs only by its attack angle. Ground every finding in the actual snapshot code with a concrete, reproducible scenario — never a hypothetical.
+**Why fuzzers share one methodology:** Unlike the sibling review skills (dba, codehealth), which give each lens its own criteria file, the fuzzers intentionally share a single generic attack methodology defined in `agent.md` rather than per-fuzzer criteria files — fuzzing is open-ended, and a fixed checklist would narrow it. Each fuzzer differs only by its attack angle. Ground every finding in the actual snapshot code with a concrete, reproducible scenario — never a hypothetical.
 
 ### Severity Definitions (all fuzzers)
 
@@ -68,7 +68,7 @@ Skip the question only when the user's invocation already named a mode (e.g. "ru
 - **Medium**: Edge case that produces wrong results or confusing errors
 - **Low**: Unusual behavior that's unlikely but worth hardening against
 
-Individual fuzzers report findings against these levels (see the severity guide in `fuzzer-agent.md`). When the distill step resolves cross-fuzzer conflicts, use these universal definitions as the baseline. During distillation, easy exploitability bumps a finding up one tier, and any fuzzer-reported "Critical" that requires implausible conditions or is already fully mitigated is remapped to "High" before tier assignment. See distill.md for the full mapping algorithm.
+Individual fuzzers report findings against these levels (see the severity guide in `agent.md`). When the distill step resolves cross-fuzzer conflicts, use these universal definitions as the baseline. During distillation, easy exploitability bumps a finding up one tier, and any fuzzer-reported "Critical" that requires implausible conditions or is already fully mitigated is remapped to "High" before tier assignment. See distill.md for the full mapping algorithm.
 
 ### Scope Boundaries
 
@@ -142,7 +142,7 @@ Read `scan-steps.md` from this skill's directory and follow its scan procedure. 
 
 ### Step 5: Launch Agents
 
-Use the agent template (`fuzzer-agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
+Use the agent template (`agent.md`). The template places shared content (codebase snapshot, languages, ground rules, output format) before the `---` divider to form a common prompt prefix for API caching.
 
 **Spawn contract** — how you call the Agent tool, in every launch mode:
 
@@ -167,7 +167,7 @@ The cause is breakpoint placement. Caching matches a byte prefix ending at a `ca
 - **Snapshot size is the bigger lever.** Each agent writes the whole snapshot to cache once at 1.25× input price. An 11K-token snapshot across 16 agents is ~176K write-priced tokens every run. Trimming the snapshot saves more than launch order does, and both are worth taking.
 
 **Build the shared prefix once:**
-1. Read `fuzzer-agent.md` from this skill's directory
+1. Read `agent.md` from this skill's directory
 2. Replace `{path}` with the target path
 3. Replace `{codebase_snapshot}` with the snapshot from Step 4.5
 4. Replace `{languages}` with the confirmed language list
@@ -221,4 +221,3 @@ Only your reply is rendered to the user — the agent's report is not. Never poi
 - If `git ls-files` fails (not a git repo, permissions), use the Glob tool (`**/*.{py,ts,...}` patterns) to enumerate files.
 - If an agent returns zero findings, that is a valid result — note "{fuzzer}: no issues found" in the distill summary.
 - If some agents fail or timeout, distill with available results and note which fuzzers were skipped.
-
